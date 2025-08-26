@@ -1,0 +1,1044 @@
+/* XODDOCODE 2025
+   KIKUBEAN CODE FOR CORE 1
+   RECEIVE READINGS
+   RUN FANS
+   UPDATE DISPLAY
+   SHARE READINGS BY UART SERIAL
+
+*/
+#include <esp_now.h>
+#include <WiFi.h>
+#include <ArduinoJson.h>
+#include "Wire.h"
+#include "SPI.h"
+#include "RTClib.h"
+#include "math.h"
+
+#include "Adafruit_GFX.h"
+#include <GxEPD2_BW.h>
+#include <GxEPD2_3C.h>
+
+
+#include <Fonts/FreeSans9pt7b.h>
+#include <Fonts/FreeSerif9pt7b.h>
+#include <Fonts/FreeMono9pt7b.h>
+#include <Fonts/FreeMonoBold9pt7b.h>
+#include <Fonts/FreeSansBold24pt7b.h> 
+#include <Fonts/FreeSerifBold24pt7b.h>
+#include <Fonts/FreeSansBoldOblique24pt7b.h>
+#include <Fonts/FreeSansOblique24pt7b.h>
+
+#include <Fonts/FreeSans12pt7b.h>
+#include <Fonts/FreeSansBold12pt7b.h>
+#include <Fonts/FreeSans18pt7b.h>
+#include <Fonts/FreeMono12pt7b.h>
+#include <Fonts/FreeMonoBold12pt7b.h>
+#include <Fonts/FreeMonoBold18pt7b.h>
+
+
+ extern const uint8_t  humidity_fan[]; // 50px x 70px
+ extern const uint8_t fanious[]; // 50px x 50px
+
+
+// ESP32 CS(SS)=5,SCL(SCK)=18,SDA(MOSI)=23,BUSY=15,RES(RST)=2,DC=0
+  uint8_t CS_ = 5,  DC_ = 15, RES_ = 13, BUSY_ = 4;
+
+
+// 4.2'' EPD Module
+     GxEPD2_BW<GxEPD2_420_GDEY042T81, GxEPD2_420_GDEY042T81::HEIGHT> LCD(GxEPD2_420_GDEY042T81(CS_, DC_, RES_, BUSY_)); // 400x300, SSD1683
+ //  GxEPD2_3C<GxEPD2_420c_GDEY042Z98, GxEPD2_420c_GDEY042Z98::HEIGHT> LCD(GxEPD2_420c_GDEY042Z98(CS_, DC_, RES_, BUSY_)); // 400x300, SSD1683
+
+uint32_t sent_bytes = 0;
+
+uint8_t DISP_MODE = 0;
+bool wifi_state = false;
+
+const char Manufacturer[20] = "IntelliSys UG";
+const char Slogan[32] = "Home of Smart Innovations";
+
+const char Parameters[24] = "Temp, Humi, Air Speed";
+const char DeviceID[50] = "Temperature and Humidity Controller";
+
+const char what_it_does[100] = "Temperature and Humidity Sensor Logger and Ventilation Fans Controller!";
+uint8_t currentScreen = 1;
+
+//High-Risk / Potential Bug: Without specifying JsonDocument size, compilation will fail (unless this is pseudocode). 
+//JsonDocument JSON_data;
+StaticJsonDocument<200> JSON_data;
+//JsonDocument JSON_sendable;
+StaticJsonDocument<2048> JSON_sendable;
+
+typedef struct dryerData{ // all stringified
+      char received_data_bundle[200] = ""; // Payload is limited to 250 bytes.
+   }  dryerData; 
+
+dryerData fetch;
+
+
+uint8_t active_sensors = 0;
+float temperature_readings[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+float humidity_readings[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+
+
+//REALTIME CLOCK
+RTC_DS3231 real_time;
+
+uint8_t priority_index = 1; uint8_t dryer_1_fanning_level = 0; uint8_t dryer_2_fanning_level = 0;
+ // dryer_2_cool_fan_ON = false, dryer_2_humi_fan_ON = false;
+
+const uint8_t no_of_batts = 1;
+uint8_t Battery_Level_Counter = 0;
+float voltage = 0.0f; 
+bool inner_fan_status = false;
+float cabin_temperature = 0.0f;
+
+
+char dataPack[200] = ""; // receivable
+void extract_readings();
+void monitor_battery();
+void monitor_readings();
+void format_into_json();
+void send_to_wifi_core();
+void initialize_RTC();
+void query_rtc();
+void monitor_internal_temp();
+void monitor_fans();
+
+void beep(uint8_t times, uint8_t delay_setting);
+
+void OnSensorData_received(const uint8_t * mac, const uint8_t *incomingData, int len){
+     //   memcpy(&fetch, incomingData, min(len, sizeof(dryerData))); // no matching function for call to 'min(int&, unsigned int)'
+        // The compiler will complain because len is an int, while sizeof(dryerData) is an unsigned int (size_t).
+// The template deduction for std::min() fails when the two arguments are of different signedness.
+
+        //Since memcpy length must be size_t, it’s best to cast explicitly: ... no template fights.
+        size_t weight_of_packet = (len < (int)sizeof(dryerData)) ? (size_t)len : sizeof(dryerData);
+        memcpy(&fetch, incomingData, weight_of_packet);
+
+        uint32_t size_of_packet = sizeof(dataPack);
+
+  //   memcpy(&fetch, incomingData, sizeof(dryerData)); //If len < sizeof(dryerData), memcpy will copy beyond valid incomingData.
+ //    strcpy(dataPack, fetch.received_data_bundle); // If the buffer is not null-terminated, strcpy() will read past the end.
+        strncpy(dataPack, fetch.received_data_bundle, size_of_packet-1);
+        dataPack[size_of_packet-1] = '\0';
+     // Serial.print("Size of received BUFF: "); Serial.println(size_of_packet);
+
+      //Serial.print("Received => "); Serial.println(dataPack);  delay(50);
+      
+      extract_readings();
+      beep(1, 0); //flash();
+     
+}
+
+
+bool humi_fan_state = false;
+bool coolin_fan_state = false;
+uint64_t humi_fans_duration = 0;
+uint64_t cooling_fans_duration = 0;
+uint8_t re_run_attempts = 0;
+
+
+//peripherals
+const uint8_t buzzer = 14;
+const uint8_t batteryPin = 36;//39; //26;
+const uint8_t internal_fan = 19; // AVOID SPI pins when there are ongoing SPI transactions
+const uint8_t cooling_fan_pin = 27;
+const uint8_t humidity_fan_pin = 25;
+const uint8_t cooling_fan_btn = 39;
+const uint8_t humidity_fan_button = 33;
+
+void setup() { delay(100);
+  Serial.begin(115200); // for debugging
+  Serial2.begin(115200, SERIAL_8N1, 16, 17); //the WiFi core
+ // Serial2.setRxBufferSize(2048);            // increase RX buffer to 2048 bytes
+  Serial.println("Serial2 buffer initialized and set to 2048 bytes");
+  pinMode(buzzer, OUTPUT);  digitalWrite(buzzer, HIGH); delay(50); digitalWrite(buzzer, LOW);
+  pinMode(batteryPin, INPUT);
+  pinMode(internal_fan, OUTPUT); digitalWrite(internal_fan,  HIGH);
+
+
+  pinMode(cooling_fan_pin, OUTPUT);  digitalWrite(cooling_fan_pin, LOW); delay(1000); // ACTIVE LOW
+  pinMode(humidity_fan_pin, OUTPUT); digitalWrite(humidity_fan_pin, LOW); 
+  pinMode(cooling_fan_btn,  INPUT);
+  pinMode(humidity_fan_button, INPUT);
+
+   LCD.init(115200,true,50,false);
+      LCD.setRotation(2); 
+   // bootScreen(); delay(1000);
+ //     Boot();
+
+  WiFi.mode(WIFI_STA);    
+      
+  // Initilize ESP-NOW
+      if(esp_now_init() != ESP_OK) {
+          Serial.println("Error initializing ESP-NOW");
+          return;
+      }
+
+      else {
+        Serial.println("ESPNOW successfully initialized");
+        
+        // Register callback function
+          esp_err_t result = esp_now_register_recv_cb(esp_now_recv_cb_t(OnSensorData_received)); // Serial.print("CALLBACK: ");Serial.println(result);
+          if(result == ESP_OK) Serial.println("Call Back of Call Back successfully set!"); 
+      }
+
+      initialize_RTC();
+      query_rtc(); // query RTC but do not hang in there long if no response
+
+       
+       digitalWrite(cooling_fan_pin, HIGH); delay(200);
+       digitalWrite(humidity_fan_pin, HIGH);
+       update_display();
+      LCD.hibernate();
+
+      Serial.println("Done Booting!");
+      
+      
+     // beep(3, 0);
+
+}
+
+char SystemTime[50] = "13:45:21"; 
+char ShortTime[32] = "12:45pm";
+
+char SystemDate[32] = "Mon 18th August, 2025";; 
+char ShortDate[24] = "Mon 18 Aug, 2025"; // long short characters
+
+bool set_24_hour = false;
+
+
+float average_temp = 0.0f; char average_temp_str[8] = "..."; // 35.855
+float average_humi = 0.0f; char average_humi_str[8] = "..."; // 75.695
+
+uint32_t PAGE_REFRESH = 2*60*1000ULL; // PREFERABLE TO REFRESH ONCE EVERY 5 MINS 
+
+uint64_t now_now = 0, prev_prev_prev = 0, prev_prev = 0, prev = 0;
+void loop() {
+     now_now = esp_timer_get_time()/1000ULL; // convert to milliseconds
+     if((now_now - prev_prev) >= (10*1000ULL)){ // since sensor readings change after 10 secs on each
+            check_buzzer();
+            monitor_readings(); 
+            monitor_battery();
+            monitor_internal_temp();
+            format_into_json();
+            send_to_wifi_core();
+            monitor_fans();
+            Serial.println();
+            prev_prev = now_now;
+     }
+
+     if((now_now - prev) >= 5){ // check on buzzer every 5 milliseconds... since it runs for multiples of 50
+          check_buzzer();
+          button_scan();
+          prev = now_now;
+     }
+
+     if((now_now - prev_prev_prev) >= PAGE_REFRESH){ // refresh page once every 5 minutes
+       check_buzzer();
+       update_display();
+       prev_prev_prev = now_now;
+     }
+
+}
+
+void update_display(){
+    switch(currentScreen){
+        case 1: homepage(); // shows 2 readings
+                break;
+
+        case 2: sensor_grid(); //  6 readings of temperatures or of humidities
+                break;
+
+        case 3: fan_page();
+                break;
+
+    }
+
+      LCD.hibernate();
+
+}
+
+void sensor_grid(){
+
+}
+void fan_page(){
+
+}
+
+char humi_units[10] = "%";    char temp_units[5] = "o";
+
+const uint16_t box_width = 160;
+const uint16_t box_height = 135;
+
+char humi_str[7] = "";
+char temp_str[7] = "";
+
+
+void homepage(){
+      Serial.print("Average Temp: "); Serial.println(average_temp);
+      Serial.print("Average Humi: "); Serial.println();
+
+      dtostrf(average_humi, 3, 1, average_humi_str);
+      dtostrf(average_temp, 3, 1, average_temp_str);
+
+ // LCD.setPartialWindow(28, 70, 150, 120); // to update only thr readings and nothing else
+  LCD.firstPage(); //FULLY CENTERED TEXTS
+  do{
+          //BOUNDARY AROUND THE 400 X 300px
+        LCD.fillScreen(GxEPD_WHITE); LCD.drawRect(0, 0, 400, 300, GxEPD_BLACK); 
+        LCD.fillRect(1, 1, 398, 30, GxEPD_BLACK); // GxEPD_red
+
+/*
+        //HEADER
+        LCD.setFont(&FreeMonoBold9pt7b); LCD.setTextColor(GxEPD_WHITE);
+        LCD.setCursor(5, 20);    LCD.print(DeviceID);
+
+         //BOTTOM SCROLL BAR
+        LCD.drawRoundRect(10, 242, 365, 13, 5, GxEPD_BLACK);
+        LCD.fillTriangle(25, 243, 16, 248, 25, 253, GxEPD_BLACK); // left arrow
+        LCD.fillTriangle(360, 243, 370, 248, 360, 253, GxEPD_BLACK); //  right arrow
+
+  */  
+
+    
+       // ACTIVE MENU PANES
+       LCD.fillRect(1, 1, 397, 27, GxEPD_BLACK);
+       LCD.fillRoundRect(8, 4, 100, 30, 5, GxEPD_WHITE);
+
+      LCD.setFont(&FreeSans12pt7b); // LCD.setFont(&FreeSans9pt7b);
+      LCD.setTextColor(GxEPD_BLACK);
+      LCD.setCursor(14, 25);  LCD.print("Sensors");
+     
+
+            //HOME TAB
+            // 
+      LCD.setFont(&FreeSans9pt7b);
+      LCD.setTextColor(GxEPD_WHITE);
+      LCD.setCursor(140, 22);  LCD.print("Data Grid");
+      LCD.fillRect(250, 5, 2, 20, GxEPD_WHITE); // divider
+      LCD.setCursor(290, 22);  LCD.print("Settings");
+
+
+        footer();
+
+
+
+       // BODY
+
+       show_temperatures();
+
+       
+      
+
+   //   Serial.print("Body Display Mode: "); Serial.println(currentScreen);
+
+      
+
+    }  while (LCD.nextPage());
+
+
+}
+
+void show_temperatures(){
+        LCD.setTextColor(GxEPD_BLACK);
+        
+  //  DRYER 1 TEMPERATURE SECTION
+        LCD.drawRoundRect(25, 70, box_width, box_height, 10, GxEPD_BLACK);
+
+        LCD.fillRoundRect(25, 70, box_width, 25, 10, GxEPD_BLACK); //BLACK RIBBON
+        LCD.fillRect(25, 80, box_width, 17, GxEPD_BLACK); // the thin slit
+
+        LCD.setTextColor(GxEPD_WHITE); LCD.setFont(&FreeSans9pt7b);
+        LCD.setCursor(28, 90); LCD.print("Average Temperatures"); //AREA HEADING
+
+
+
+  // DRYER 2 TEMPERATURE SECTION
+        LCD.drawRoundRect((70+box_width), 70, box_width, box_height, 10, GxEPD_BLACK);
+        LCD.fillRoundRect((70+box_width), 70, box_width, 25, 10, GxEPD_BLACK); //BLACK RIBBON
+        LCD.fillRect((70+box_width), 80, box_width, 17, GxEPD_BLACK); // the thin slit
+
+        LCD.setTextColor(GxEPD_WHITE); LCD.setFont(&FreeSans9pt7b);
+        LCD.setCursor(20+(60+box_width), 90); LCD.print("Average Humidity"); //AREA HEADING
+
+
+  //DRYER 1 TEMPERATURE DATA
+         LCD.setTextColor(GxEPD_BLACK);
+         LCD.setFont(&FreeSansBold24pt7b); 
+         LCD.setCursor(50, (160));    LCD.print(average_temp_str);
+
+         LCD.setFont(&FreeMono9pt7b); //FreeMono9pt7b
+         LCD.setCursor(150, 135); LCD.print(temp_units);
+
+         LCD.setFont(&FreeMonoBold12pt7b); LCD.setCursor(160, 150); LCD.print("C");
+         LCD.setFont(); LCD.setCursor((50), 190); LCD.setTextColor(GxEPD_BLACK); LCD.print("DRYING TEMPERATURE");
+
+ // HUMIDITY 
+         LCD.setTextColor(GxEPD_BLACK);
+         LCD.setFont(&FreeSansBold24pt7b); 
+         LCD.setCursor(35+(60+box_width), 160);    LCD.print(average_humi_str); 
+
+         LCD.setFont(&FreeMono9pt7b); //FreeMono9pt7b
+         LCD.setCursor(185+(box_width), 135); LCD.print(humi_units); 
+         LCD.setFont(&FreeMonoBold12pt7b); LCD.setCursor((195+box_width), 150); //LCD.print("C");
+         LCD.setFont(); LCD.setCursor((110+box_width), 190); LCD.setTextColor(GxEPD_BLACK); LCD.print("DRYING HUMIDITY"); 
+
+
+       // LCD.setFont(&FreeMonoBold18pt7b); 
+        //LCD.setCursor(20, 245);    LCD.print("Drying Conditions");  
+         LCD.setFont(&FreeMonoBold12pt7b); 
+      LCD.setCursor(30, 243); LCD.print("Optimal Range: 35-45");
+      
+         // how many sensors
+        LCD.setFont();
+        LCD.setCursor(150,260); LCD.print(active_sensors); LCD.print(" sensors");
+           
+
+
+   // SCROLL BAR
+  //      LCD.drawRect(30, 240, 340, 12, GxEPD_BLACK);
+   //     LCD.fillRoundRect(40, 246, 100, 5, 2, GxEPD_BLACK);
+    //    LCD.fillTriangle(25, 240, 15, 245, 25, 250, GxEPD_BLACK); // left arrow
+    //    LCD.fillTriangle(375, 240, 385, 245, 375, 250, GxEPD_BLACK); //  right arrow
+}
+
+void  show_humidities(){
+        LCD.setFont(&FreeMonoBold18pt7b); LCD.setTextColor(GxEPD_BLACK);
+        LCD.setCursor(145, 65);    LCD.print("Sensors");  
+
+  //  DRYER 1 HUMIDITY BOX
+        LCD.drawRoundRect(30, 80, box_width, box_height, 10, GxEPD_BLACK);
+
+        LCD.fillRoundRect(30, 80, box_width, 25, 10, GxEPD_BLACK); //BLACK RIBBON
+        LCD.fillRect(30, 90, box_width, 17, GxEPD_BLACK); // the thin slit
+
+        LCD.setTextColor(GxEPD_WHITE); LCD.setFont(&FreeMonoBold12pt7b);
+        LCD.setCursor(60, 100); LCD.print("Dryer 1"); //AREA HEADING
+
+
+
+  // DRYER 2 HUMIDITY BOX
+        LCD.drawRoundRect((70+box_width), 80, box_width, box_height, 10, GxEPD_BLACK);
+        LCD.fillRoundRect((70+box_width), 80, box_width, 25, 10, GxEPD_BLACK); //BLACK RIBBON
+        LCD.fillRect((70+box_width), 90, box_width, 17, GxEPD_BLACK); // the thin slit
+
+        LCD.setTextColor(GxEPD_WHITE); LCD.setFont(&FreeMonoBold12pt7b);
+        LCD.setCursor(40+(60+box_width), 100); LCD.print("Dryer 2"); //AREA HEADING
+
+
+
+  //DRYER 1 HUMIDITY DATA
+         LCD.setTextColor(GxEPD_BLACK);
+         LCD.setFont(&FreeSansBoldOblique24pt7b); 
+         LCD.setCursor(45, (170));    LCD.print(average_humi_str);
+
+         LCD.setFont(&FreeSans12pt7b); //FreeMono9pt7b
+         LCD.setCursor(150, 160); LCD.print(humi_units);
+
+       
+         LCD.setFont(); LCD.setCursor((60), 200); LCD.setTextColor(GxEPD_BLACK); LCD.print("DRYING HUMIDITY");
+
+ // DRYER 2 HUMIDITY DATA 
+         LCD.setTextColor(GxEPD_BLACK);
+         LCD.setFont(&FreeSansBoldOblique24pt7b); 
+         LCD.setCursor(30+(60+box_width), 170);    LCD.print(humi_str); 
+
+         LCD.setFont(&FreeSans12pt7b); //FreeMono9pt7b
+         LCD.setCursor(190+(box_width), 160); LCD.print(humi_units); 
+        
+         LCD.setFont(); LCD.setCursor((100+box_width), 200); LCD.setTextColor(GxEPD_BLACK); LCD.print("DRYING HUMIDITY"); 
+
+   // SCROLL BAR
+  //      LCD.drawRect(30, 240, 340, 12, GxEPD_BLACK);
+     //   LCD.fillRoundRect(130, 246, 120, 5, 2, GxEPD_BLACK); // scroll
+   //     LCD.fillTriangle(25, 240, 15, 245, 25, 250, GxEPD_BLACK); // left arrow
+    //    LCD.fillTriangle(375, 240, 385, 245, 375, 250, GxEPD_BLACK); //  right arrow
+}
+
+
+void show_fans(){
+
+        LCD.setFont(&FreeMonoBold18pt7b); LCD.setTextColor(GxEPD_BLACK);
+        LCD.setCursor(160, 55);    LCD.print("Fans");  
+
+        LCD.fillRect(10, 65, 380, 3, GxEPD_BLACK); // HORIZONTAL LNE
+        LCD.fillRect(10, 95, 380, 3, GxEPD_BLACK); // HORIZONTAL LNE
+        LCD.fillRect(198, 65, 4, 160, GxEPD_BLACK); // VERTICAL LINE
+
+        LCD.setFont(&FreeMonoBold12pt7b);
+        LCD.setTextColor(GxEPD_BLACK); 
+      
+        LCD.setCursor(50, 90);  LCD.print("Dryer 1");
+        LCD.setCursor(250, 90); LCD.print("Dryer 2");
+
+        //LCD.fillRoundRect(90, 90, 200, 80, 2, GxEPD_BLACK); // THE DRYER
+/*
+        LCD.drawInvertedBitmap(50, 120, fan_1, 50, 50,  GxEPD_BLACK); 
+
+        LCD.drawInvertedBitmap(120, 120, humidity_fan, 50, 70,  GxEPD_WHITE); 
+
+        LCD.drawInvertedBitmap(200, 120, humidity_fan, 70, 50,  GxEPD_BLACK); 
+
+         LCD.drawInvertedBitmap(270, 120, fanious, 50, 50,  GxEPD_BLACK); 
+*/
+   
+   // FAN CLUSTERING
+          LCD.setFont(&FreeSans9pt7b); LCD.setTextColor(GxEPD_BLACK); //FreeMonoBold9pt7b
+          LCD.fillRoundRect(30, 140, 80, 4, 5, GxEPD_BLACK);     LCD.fillRoundRect(140, 140, 40, 4, 5, GxEPD_BLACK);
+          LCD.setCursor(35, 130);  LCD.print("Moisture");   LCD.setCursor(130, 130);    LCD.print("Cooling");
+
+          LCD.fillRoundRect(230, 140, 80, 3, 5, GxEPD_BLACK);     LCD.fillRoundRect(340, 140, 40, 3, 5, GxEPD_BLACK);
+          LCD.setCursor(235, 130);  LCD.print("Moisture");   LCD.setCursor(330, 130);  LCD.print("Cooling");
+
+    //  THE FAN ICONS
+          //drawFan(x0, y0, radius, blades);
+          LCD.fillCircle(40, 180, 25, GxEPD_BLACK);   LCD.fillCircle(40, 180, 20, GxEPD_WHITE);  LCD.fillCircle(40, 180, 15, GxEPD_BLACK); //LCD.fillRect(30, 130, 10, 45, GxEPD_BLACK);  LCD.fillRect(20, 150, 45, 10, GxEPD_BLACK);  //  LCD.fillTriangle(15, 140, 15, 160, 50, 150, GxEPD_BLACK);
+          LCD.fillCircle(100, 180, 25, GxEPD_BLACK);  LCD.fillCircle(100, 180, 20, GxEPD_WHITE);  LCD.fillCircle(100, 180, 15, GxEPD_BLACK);
+          LCD.fillCircle(160, 180, 25, GxEPD_BLACK);  LCD.fillCircle(160, 180, 20, GxEPD_WHITE); LCD.fillCircle(160, 180, 15, GxEPD_BLACK); 
+
+          LCD.fillCircle(240, 180, 25, GxEPD_BLACK); LCD.fillCircle(240, 180, 20, GxEPD_WHITE); LCD.fillCircle(240, 180, 15, GxEPD_BLACK);
+          LCD.fillCircle(300, 180, 25, GxEPD_BLACK); LCD.fillCircle(300, 180, 20, GxEPD_WHITE); LCD.fillCircle(300, 180, 15, GxEPD_BLACK);
+          LCD.fillCircle(360, 180, 25, GxEPD_BLACK); LCD.fillCircle(360, 180, 20, GxEPD_WHITE); LCD.fillCircle(360, 180, 15, GxEPD_BLACK);
+
+
+   //THE FAN STATES
+    // if(!fan_2_ON)
+      //   LCD.fillRoundRect(50, 210, 50, 20, 20, GxEPD_BLACK); // LCD.fillCircle(70, 220, 5, GxEPD_WHITE);
+         LCD.fillRoundRect(230, 140, 80, 3, 5, GxEPD_BLACK);     LCD.fillRoundRect(340, 140, 40, 3, 5, GxEPD_BLACK);
+       
+         LCD.setFont(&FreeSansBold12pt7b); 
+       if(humi_fan_state == false){
+          LCD.setCursor(46, 230);  LCD.print("OFF");
+       } //else LCD.setCursor(50, 230);  LCD.print("ON");
+
+
+
+
+        if(coolin_fan_state == false){
+            LCD.setCursor(133, 230);  LCD.print("OFF");
+        } //else LCD.setCursor(135, 230);  LCD.print("ON");
+
+     // BOTTOM SCROLL BAR
+     //   LCD.fillRoundRect(230, 246, 120, 5, 2, GxEPD_BLACK); // scroll
+
+       
+}
+
+bool minute_count_passed = false;
+char voltage_string[7] = "";
+char bytes_char[10] = "";
+
+void footer(){
+        //upward curve
+            LCD.fillRect(0, 260, 400, 40, GxEPD_BLACK); // GxEPD_BLACK
+            LCD.fillRoundRect(2, 255, 396, 15, 8, GxEPD_WHITE);
+            // LCD.fillCircle(0, 295, 2, GxEPD_BLACK);
+            
+            LCD.setFont(&FreeSans9pt7b); // LCD.setFont(&FreeSans9pt7b);
+            LCD.setTextColor(GxEPD_WHITE);
+    
+            //HOME TAB
+          //  LCD.fillRoundRect(5, 275, 62, 20, 10, GxEPD_WHITE); 
+            //LCD.setCursor(12, 290);  LCD.print("Home"); 
+            
+            //DATE
+            LCD.setCursor(2, 290);  LCD.print(SystemDate); 
+
+            
+            // WIFI & UPLOADS
+            
+            //NETWORK BARS
+            LCD.fillRect(210, 293, 6, 5, GxEPD_WHITE); LCD.fillRect(220, 283, 6, 15, GxEPD_WHITE); LCD.fillRect(230, 274, 6, 25, GxEPD_WHITE);
+            LCD.setFont();
+            //LCD.setCursor(200, 290); LCD.print("WiFi: "); 
+            LCD.setCursor(202, 280);  LCD.print(wifi_state?"ON":"OFF"); 
+            ltoa(sent_bytes, bytes_char, 10);
+            if(sent_bytes > 0) {      LCD.setCursor(245, 280); LCD.print("(");LCD.print(bytes_char);LCD.print(")"); }
+            
+              
+  //do this in the update display
+      
+            
+  /*
+        dtostrf((voltage), -4, 3, voltage_string);
+        strcat(voltage_string, "V");
+  */
+      
+     dtostrf(voltage, 4, 2, voltage_string); strncat(voltage_string, "V", 2);
+ 
+    Serial.print("Voltage: "); Serial.println(voltage_string);
+    Serial.print("Voltage Level:"); Serial.println(Battery_Level_Counter);
+
+
+
+
+            //BATTERY
+            LCD.drawRoundRect(270, 277, 32, 16, 3, GxEPD_WHITE); LCD.fillRect(267, 282, 3, 6, GxEPD_WHITE);
+          if(voltage >= 6.00) { LCD.setFont(); LCD.setCursor(280, 285); LCD.print(voltage_string); LCD.print("V"); }
+            
+            //SEPARATOR
+           // LCD.fillRect(295, 275, 7, 20, GxEPD_WHITE);
+
+            //TIME
+            LCD.setFont(&FreeSans9pt7b); //FreeMono12pt7b
+            LCD.setCursor(340, 290); LCD.print(ShortTime);
+
+          //  LCD.setFont(&FreeMono9pt7b);
+          //  LCD.setCursor(385, 292); LCD.print(DISP_MODE);
+ }
+
+
+void button_scan(){
+  uint8_t fan1_active = digitalRead(cooling_fan_btn);
+  uint8_t fan2_active = digitalRead(humidity_fan_button);
+    
+  if(fan1_active) { Serial.print("Fan 1 Line:"); Serial.println(fan1_active); }
+  if(fan2_active) { Serial.print("Fan 2 Line:"); Serial.println(fan2_active); }
+
+}
+
+void monitor_fans(){ // ALL DRYER FANS ARE ACTIVE LOW
+Serial.println("Monitoring Fans...");
+uint64_t humi_fans_started = 0, cooling_fans_started = 0;
+      if(Battery_Level_Counter <= 1){ // < 11.5V ... power is too low
+          if(humi_fan_state){   digitalWrite(humidity_fan_pin, HIGH); humi_fan_state = false; re_run_attempts++; }
+          if(coolin_fan_state) {digitalWrite(cooling_fan_pin, HIGH); coolin_fan_state = false; re_run_attempts++;}    
+      }
+      else { // START FANS ONLY IF BATTERY IS SUFFICIENT
+         re_run_attempts = 0; 
+        if(average_humi >= 50.0){ // high humidity, toggle extractive fans
+          if(!humi_fan_state){digitalWrite(humidity_fan_pin, LOW); humi_fan_state = true;  humi_fans_started = now_now; }
+          if(humi_fan_state) {humi_fans_duration = (now_now - humi_fans_started)/1000; }
+        } else { // if humidity has lowered, jako ezo fan
+          if(humi_fan_state){digitalWrite(humidity_fan_pin, HIGH); humi_fan_state = false; }
+        }
+        if(average_temp > 45.0){ // turn em ON at high temperatures
+          if(!coolin_fan_state) {digitalWrite(cooling_fan_pin, LOW); coolin_fan_state = true;  cooling_fans_started = now_now;}
+          if(coolin_fan_state) {cooling_fans_duration = (now_now - cooling_fans_started)/1000;}
+          
+        }
+        else if(average_temp <= 35.0){ // turn em OFF at low temperatures
+            if(coolin_fan_state) {digitalWrite(cooling_fan_pin, HIGH); coolin_fan_state = false; } 
+        }
+        else { // in between 35 - 45 ... do nothing... just monitor the time
+             if(coolin_fan_state) {cooling_fans_duration = (now_now - cooling_fans_started)/1000;}
+        }
+      }
+}
+
+void monitor_internal_temp(){
+  
+  Serial.print("MCU TEMP: "); Serial.println(cabin_temperature);
+
+  if(cabin_temperature <= 30.0) {
+    digitalWrite(internal_fan, LOW); inner_fan_status = false;
+  }
+  else {digitalWrite(internal_fan, HIGH); inner_fan_status = true; }
+
+  Serial.print("Inner Fan: "); Serial.println(inner_fan_status?"ON":"OFF");
+  
+}
+
+uint64_t last_seen[6] = {0, 0, 0, 0, 0, 0};
+
+void monitor_readings(){
+  average_temp = 0.00;
+  average_humi = 0.00;
+  active_sensors = 0;
+
+    //  Serial.print("Readings Stored: [");
+      for(int i=0; i<6; i++){
+        if(temperature_readings[i] >= 5.00){ // !is_nan and is not unexplainably cold
+            
+            average_temp += temperature_readings[i];
+            average_humi += humidity_readings[i];
+            active_sensors++;
+        }
+        // Serial.print(temperature_readings[i]); if(i<5) Serial.print(", ");
+      }
+    //  Serial.print("] :: Active Sensors: ");   
+      Serial.print("Active Sensors: "); Serial.println(active_sensors);
+      if(active_sensors <= 0) { average_temp = 0.00; average_humi = 0.00; }
+      else {
+        average_temp /= (active_sensors);
+        average_humi /= (active_sensors);
+      }
+
+      Serial.print("Average Temp: "); Serial.println(average_temp);
+      Serial.print("Average Humi: "); Serial.println(average_humi);
+}
+
+// { "SensorIDX":"T_X", "MoistureX":XX.XX, "TemperatureX":YY.YY, "DeliveredsX":"X"}
+char sendable_to_wifi_core[320] = "";
+char sendable_to_wifi_core2[500] = "";
+/*{
+  "sensor": "gps",
+  "time": 1351824120,
+  "data": [
+    48.756080,
+    2.302038
+  ]
+}
+*/
+
+char DateTime_str[32] = "24/8/25, 11:52:00";
+char apiKeyValue[20] = "DRYER2025_002"; //KIKUBE TOKEN
+
+void format_into_json(){
+        JSON_sendable["PassKey"] = apiKeyValue;
+        JSON_sendable["Active_Sensors"] = active_sensors;
+        JSON_sendable["Average_Temperature"] = average_temp;
+        JSON_sendable["Average_Humidity"] = average_humi;
+        JSON_sendable["Voltage"] = voltage;
+    for(int i = 0; i < active_sensors; i++){ // do we keep the arrangement of S1-S6 or we only fill in 4 those talking?
+        JSON_sendable["Temperature_Readings"][i] = temperature_readings[i];
+        JSON_sendable["Humidity_Readings"][i] = humidity_readings[i];
+    }   JSON_sendable["Humidity_Fans"] = humi_fan_state;
+        JSON_sendable["Humidity_Fans_ON_Duration"] = humi_fans_duration;
+        JSON_sendable["Cooling_Fans_ON_Duration"] = cooling_fans_duration;
+        JSON_sendable["Cooling_Fans"] = coolin_fan_state;
+        JSON_sendable["Internal_Temp"] = cabin_temperature;
+        JSON_sendable["Internal_Fan"] = inner_fan_status;
+        JSON_sendable["Date"] = SystemDate;
+        JSON_sendable["Time"] = SystemTime;
+        JSON_sendable["ON_TIME:"] = now_now/1000;
+           
+    serializeJson(JSON_sendable, sendable_to_wifi_core);  
+    serializeJsonPretty(JSON_sendable, sendable_to_wifi_core2);
+
+    if (serializeJson(JSON_sendable, sendable_to_wifi_core, sizeof(sendable_to_wifi_core)) == 0) {
+        Serial.println("Serialization failed");
+    }
+}
+
+//ArduinoJson can easily exceed 1024 bytes with arrays.
+void send_to_wifi_core(){ // Avoid Serial2 send buffer overflow
+    //check if there is something on that serial line before sending data into Deep Space
+
+    Serial.println("JSON File to send: "); Serial.println(sendable_to_wifi_core);
+
+    Serial.println("JSON File to send(Pretty): "); Serial.println(sendable_to_wifi_core2);
+
+// But UART TX buffer is small (~256 bytes by default). 
+//If your JSON >256 bytes and the other side isn’t reading fast, you’ll block.
+
+  //  Serial2.write((uint8_t*)sendable_to_wifi_core, strlen(sendable_to_wifi_core));
+
+      uint64_t starting_send = esp_timer_get_time();
+  //    sent_bytes = Serial2.print(sendable_to_wifi_core);  // this ~320B takes 20 milliseconds 
+        sent_bytes = Serial2.print(sendable_to_wifi_core2); // this 490B takes about 40 milliseconds
+      uint64_t stopped_sending = esp_timer_get_time();
+
+      Serial.print("UART send Duration: "); Serial.print((stopped_sending - starting_send)/1000); Serial.println("milliseconds");
+      Serial.print(sent_bytes); Serial.println(" Bytes pushed your into the UART TX ring buffer.");
+    //Serial2.flush();   // blocks until UART TX buffer is empty
+
+ /*
+        if (sent_bytes > 0) {
+            Serial.println("Data queued for transmission.");
+        } else {
+            Serial.println("Failed to queue data.");
+        }
+ */
+
+      //Use print() for strings, JSON, numbers as text.
+     // Use write() for raw binary data, byte arrays, or when efficiency really matters.
+}
+
+//deserialize to assign char[] and floats accordingly
+void extract_readings(){
+
+    // serializeJson(JSON_data, dataPack); // serialize again
+       deserializeJson(JSON_data, dataPack);
+          
+    const char * sensor_1_ID = JSON_data["SensorID1"] | "unknown"; 
+    const char * sensor_2_ID = JSON_data["SensorID2"] | "unknown";
+    const char * sensor_3_ID = JSON_data["SensorID3"] | "unknown";
+    const char * sensor_4_ID = JSON_data["SensorID4"] | "unknown";
+    const char * sensor_5_ID = JSON_data["SensorID5"] | "unknown";
+    const char * sensor_6_ID = JSON_data["SensorID6"] | "unknown";
+
+    float sensor_1_temp = JSON_data["Temperature1"];
+    float sensor_1_humidity = JSON_data["Moisture1"]; // humidity ... moisture in the air
+    //uint32_t sensor_1_transmissions = JSON_data["Delivereds1"];
+
+    float sensor_2_temp = JSON_data["Temperature2"];
+    float sensor_2_humidity = JSON_data["Moisture2"];
+    //uint32_t sensor_2_transmissions = JSON_data["Delivereds2"];
+
+    float sensor_3_temp = JSON_data["Temperature3"];
+    float sensor_3_humidity = JSON_data["Moisture3"];
+    //uint32_t sensor_3_transmissions = JSON_data["Delivereds3"];
+
+    float sensor_4_temp = JSON_data["Temperature4"];
+    float sensor_4_humidity = JSON_data["Moisture4"];
+    //uint32_t sensor_4_transmissions = JSON_data["Delivereds4"];
+
+    float sensor_5_temp = JSON_data["Temperature5"];
+    float sensor_5_humidity = JSON_data["Moisture5"];
+    //uint32_t sensor_5_transmissions = JSON_data["Delivereds5"];
+
+    float sensor_6_temp = JSON_data["Temperature6"];
+    float sensor_6_humidity = JSON_data["Moisture6"];
+    //uint32_t sensor_6_transmissions = JSON_data["Delivereds6"];
+
+
+    //// the temp and humidity readings are swapped
+
+    if(sensor_1_temp > 5.00) {  last_seen[0] = now_now; humidity_readings[0] = sensor_1_temp; temperature_readings[0] =  sensor_1_humidity; }
+    if(sensor_2_temp > 5.00) {  last_seen[1] = now_now; humidity_readings[1] = sensor_2_temp; temperature_readings[1] =  sensor_2_humidity; }
+    if(sensor_3_temp > 5.00) {  last_seen[2] = now_now; humidity_readings[2] = sensor_3_temp; temperature_readings[2] =  sensor_3_humidity; }
+    if(sensor_4_temp > 5.00) {  last_seen[3] = now_now; humidity_readings[3] = sensor_4_temp; temperature_readings[3] =  sensor_4_humidity; }
+    if(sensor_5_temp > 5.00) {  last_seen[4] = now_now; humidity_readings[4] = sensor_5_temp; temperature_readings[4] =  sensor_5_humidity; }
+    if(sensor_6_temp > 5.00) {  last_seen[5] = now_now; humidity_readings[5] = sensor_6_temp; temperature_readings[5] =  sensor_6_humidity; }
+
+}
+
+bool buzzer_ON = false;
+uint64_t buzzing_started = 0;
+uint64_t buzzing_paused = 0;
+
+uint8_t delay_level = 0;
+uint8_t no_of_beeps = 0;
+
+void beep(uint8_t times, uint8_t delay_setting){
+  if(!buzzer_ON){
+      digitalWrite(buzzer, HIGH);
+      buzzer_ON = true; //Serial.println("asynchronous beep started");
+      buzzing_started = now_now;
+  }
+    no_of_beeps = times;
+    delay_level = delay_setting;
+    check_buzzer();
+}
+
+
+void check_buzzer(){
+  uint64_t beep_duration = (now_now - buzzing_started);
+
+  if(delay_level <= 1){ // buzzing duration limited to 50ms
+     if(buzzer_ON){
+      if(beep_duration >= 50) { 
+                        
+              digitalWrite(buzzer, LOW); 
+              buzzer_ON = false; 
+             // Serial.print("beep stopped after: "); Serial.print(beep_duration); Serial.println("milliseconds");
+          
+            } //else buzzing_started = now_now;
+         } // //else Serial.println("Buzzer Teliiko!");   
+     
+      } 
+      else { // delay level prolonged to 100ms ON and 50 OFF
+
+      }
+  
+}
+
+
+void check_async_buzzer(){
+   uint64_t beep_duration = (now_now - buzzing_started);
+
+  if(delay_level <= 1){
+     if(buzzer_ON){
+      if(beep_duration >= 50) { 
+                    
+          if(no_of_beeps <= 1) {
+              digitalWrite(buzzer, LOW); 
+              buzzer_ON = false; 
+              Serial.print("beep stopped after: "); Serial.print(beep_duration); Serial.println("milliseconds");
+
+          }
+          else if(no_of_beeps >= 2){
+              if(beep_duration >= 50 && beep_duration < 100){
+                digitalWrite(buzzer, LOW); 
+                buzzing_paused = now_now;
+                Serial.print("beep paused: "); // Serial.print(beep_duration); Serial.println("milliseconds");
+               }
+                else if(beep_duration >= 100 && beep_duration < 150){ // put it back ON
+                    digitalWrite(buzzer, HIGH);
+                    Serial.print("beep resumed after waiting for: "); Serial.print(beep_duration-50); Serial.println("milliseconds");
+                }
+                else if(beep_duration >= 150){
+                    digitalWrite(buzzer, LOW); 
+                    buzzer_ON = false; 
+                    Serial.print("beep stopped after: "); Serial.print(beep_duration); Serial.println("milliseconds");
+                }
+          }
+        }//else buzzing_started = now_now;
+    
+     
+      } //else Serial.println("Buzzer Teliiko!");
+  } 
+
+}
+/*
+
+void beep(uint8_t times, uint8_t delay_setting){
+  
+  
+        for(int xy=0; xy<times; xy++){
+            digitalWrite(buzzer, HIGH);
+            
+     //          if(Battery_Level_Counter <= 1) delay(100);
+    //           else delay(50);
+
+            if(delay_setting == 0)  delay(50); 
+            else if(delay_setting == 1) delay(100);
+            else if(delay_setting == 2) delay(500);
+            
+            digitalWrite(buzzer, LOW);
+            if(times > 1) delay(50);
+      }
+    
+}
+
+
+*/
+
+char initializer[72] = "";
+void initialize_RTC(){
+  uint8_t trial = 0;
+  while(!real_time.begin()) {
+         strcpy(initializer, "Couldn't find RTC");   Serial.flush();
+         trial++; delay(50);
+      if (trial >= 3)break;  
+    } //vTaskDelay(500 / portTICK_PERIOD_MS);
+
+    if (real_time.lostPower()) {
+              strcpy(initializer, "RTC lost power, let's set the time!"); // When time needs to be set on a new device, or after a power loss, the
+              
+              real_time.adjust(DateTime(F(__DATE__), F(__TIME__)));  // This line sets the RTC with an explicit date & time, for example to set // rtc.adjust(DateTime(2014, 1, 21, 3, 0, 0));
+              
+              strcpy(initializer, "Clock Started and time set!");
+    }
+}
+
+// first instance of hr: to make hourly notifications....
+
+uint32_t running_ticks = 0;
+
+void query_rtc(){ //Serial.println("Time Check!"); Serial.println();
+  running_ticks++;
+
+  char root[5] = "th";
+  uint8_t reminder = 0; // for correcting 24 hour clock
+
+  uint8_t hr = 0, mint = 0, sec = 0, day_ = 0, mth = 0, yr = 0; uint16_t mwaka = 2000; uint64_t screen_timeout = 0; 
+  uint8_t datey = 0;
+  const char daysOfTheWeek[7][12] = {"Sun", "Mon", "Tue", "Wed", "Thur", "Fri", "Sat"};
+  const char Moonth[12][12] = {"January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"};
+  const char Mon_th[12][10] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sept", "Oct", "Nov", "Dec"};
+
+  char hr_str[5] = ""; char min_str[5] = ""; char sec_str[5] = ""; 
+  char day_str[15] = ""; char date_str[10] = ""; char mth_str[15] = ""; char yr_str[7] = ""; 
+  char zero_holder[4] = "0"; char bucket[4] = ""; 
+
+  // if(running_ticks%10 == 0){ //query for time once every 10 seconds
+
+            DateTime time_now = real_time.now();
+
+              hr = time_now.hour(); mint = time_now.minute();  sec = time_now.second();
+              datey = time_now.day(); mth = time_now.month();  mwaka = time_now.year(); day_ = time_now.dayOfTheWeek();
+              cabin_temperature = real_time.getTemperature();
+            if(hr > 24){ 
+                // DateTime now = real_time.now();
+              // while(recursive_counter < 5){ query_rtc(); recursive_counter++;}
+
+                hr = 0; mint = 0; sec = 0;  /*beep(2);*/ Serial.println("Time Chip Failed!");
+
+              }
+
+              if(!set_24_hour){ // if 12 hour is preferred
+                    reminder = (hr%12);
+                  if(hr<=12) itoa(hr, hr_str, 10);  // 00: - 12:
+                  else   itoa(reminder, hr_str, 10); // 13: - 23:
+              } itoa(hr, hr_str, 10); 
+
+                itoa(mint, min_str, 10); 
+                itoa(sec, sec_str, 10);  
+                itoa(datey, date_str, 10); 
+                strcpy(day_str, daysOfTheWeek[day_]);
+                strcpy(mth_str, Moonth[mth-1]);  
+                itoa(mwaka, yr_str, 10);
+
+                  
+              //construct the time sequences
+        if(hr<=9){  strcpy(ShortTime, zero_holder); strcat(ShortTime, hr_str);} 
+        else {
+             strcpy(ShortTime, hr_str); 
+        }
+        strcat(ShortTime, ":"); 
+        if(mint<=9){strcat(ShortTime, zero_holder);} 
+                    strcat(ShortTime, min_str); // HH:MM
+
+                    strcpy(SystemTime, ShortTime);  strcat(SystemTime, ":"); strcat(SystemTime, sec_str); // HH:MM:SS
+
+          strcat(ShortTime, (hr<12)?" am":" pm");
+          //construct the date sequence
+        //      strcpy(SystemDate, day_str); strcat(SystemDate, " "); strcat(SystemDate, mth_str); strcat(SystemDate, ", "); strcat(SystemDate, yr_str);
+         strcpy(SystemDate, day_str); strcat(SystemDate, " "); strcat(SystemDate, date_str);
+         if(datey == 1 || datey == 21 || datey == 31) strcpy(root, "st");
+         if(datey == 2 || datey == 22 ) strcpy(root, "nd");
+         if(datey == 3 || datey == 23 ) strcpy(root, "rd");
+         else strcpy(root, "th");
+         strcat(SystemDate, root); strcat(SystemDate, " ");
+         strcat(SystemDate, mth_str); strcat(SystemDate, ", "); strcat(SystemDate, yr_str);
+
+                  Serial.println();
+                  Serial.print("Internal Temperature: "); Serial.println(cabin_temperature);
+                  Serial.print("Short Time: ");  Serial.println(ShortTime);
+                  Serial.print("Full System Time: "); Serial.print(SystemTime); 
+                  Serial.print("\tSystem Date: "); Serial.println(SystemDate); Serial.println();
+                  Serial.println();
+    //    }
+
+
+
+}
+
+
+void monitor_battery(){
+ 
+ uint16_t readBattery = 0;
+ float summation = 0.00;
+
+  for(int i=0; i<10; i++){ ////also make the reading less jumpy
+       readBattery = analogRead(batteryPin);
+       summation += float(readBattery);
+  }
+    summation /= 10.0f;
+    //assuming linear mapping, but ESP32 ADC is nonlinear above ~1.1V (unless using attenuation).
+    //analogSetAttenuation(ADC_11db); // allows up to ~3.6V input
+
+
+    //voltage = 15.00 * (summation/3095.0);
+    //voltage = 14.50 * (summation/3095.0);
+    //  voltage = no_of_batts * 14.868 * (summation/3095.0f);
+        voltage = no_of_batts * summation * (14.75/3095.0f); 
+ 
+      if(voltage <= 11.0){ // battery volktage is miserable: 3.5V on each cell
+        Battery_Level_Counter = 0;
+      }
+
+      else if(voltage <= 11.5){ // battery voltage is okayish but low (3.8V on each cell)
+         Battery_Level_Counter = 1;
+      }
+
+      else if(voltage <= 13.0){ // battery voltage is Good .. beyond 4V on each cell
+          Battery_Level_Counter = 2;
+      }
+
+      else{ // battery voltage excellent!!! beyond 4.2V on each Li ion Cell 
+        Battery_Level_Counter = 3;
+      }
+      
+  //    PRINT READINGS //
+ //     Serial.print("Raw Reading: "); Serial.println(readBattery);
+//      Serial.print("Voltage: "); Serial.println(voltage, 3);
+     
+ 
+
+}
+
+
