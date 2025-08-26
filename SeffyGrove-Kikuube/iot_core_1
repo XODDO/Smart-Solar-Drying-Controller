@@ -1,0 +1,463 @@
+/* XODDOCODE 2025
+   KIKUBEAN CODE FOR CORE 1
+   RECEIVE READINGS
+   RUN FANS
+   UPDATE DISPLAY
+   SHARE READINGS BY UART SERIAL
+
+*/
+#include <stdlib.h>
+#include <Arduino.h>
+#include <WiFi.h>
+#include <math.h>
+#include <ArduinoJson.h>
+
+#include <credentials.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include "ThingSpeak.h"
+
+#define JSON_BUFFER_SIZE  2048
+//JsonDocument JSON_received;
+StaticJsonDocument<JSON_BUFFER_SIZE> JSON_received;
+
+
+  bool wifi_connected = false;
+ int32_t WiFi_Strength = 0;
+
+const uint8_t internal_fan = 27; // AVOID strapping and SPI pins when there are ongoing SPI transactions
+
+uint8_t wifi_connect_attempts = 0; uint16_t attempts = 0;
+uint16_t upload_fails = 0;
+
+const int32_t things_upload_frequency = int32_t(5 * 60 * 1000); // 5 minutes
+const int32_t wiot_upload_frequency   = int32_t(10 * 60 * 1000); // 10 minutes
+
+uint64_t last_upload = 0;
+char error_code[50] = "";
+
+unsigned long Channel_ID = SECRET_CH_ID;
+const char * WriteAPIKey= SECRET_WRITE_APIKEY;
+
+int keyIndex = 0;            // your network key Index number (needed only for WEP)
+WiFiClient  client;
+
+//const char* serverName = "https://webofiot.com/dryers/server.php";
+const char* serverName = "http://webofiot.com/dryers/server.php";
+
+  char apiKeyValue[20] = "DRYER2025_002"; //KIKUBE TOKEN
+//char apiKeyValue[20] = "WEATHER_002"; // OTHER TOKEN
+ char ADDRESS[25] = "KIKUBE";
+
+     uint8_t active_sensors = 0;
+      float average_humi = 0.00, average_temp = 0.00;
+      float voltage = 0.00;
+      float cabin_temp = 0.00;
+      bool inner_fan_status = false;
+
+bool wifi_state = false;
+
+uint8_t wifi_led = 2;
+uint8_t server_led = 14; // GPIO12 has boot strapping implications on some ESP32 modules; driving it high at boot can cause issues.
+uint8_t things_led = 13;
+uint8_t sensors_led = 26;
+
+uint blinker = 26;
+uint8_t data_uploading = 2, reading_data = 26; // in the ON button
+
+void receive_serial_data();
+void check_connection();
+void upload_to_thingsPeak();
+void upload_to_web_of_iot();
+void monitor_internal_temp();
+void flash(int times);
+
+void setup() { delay(500);
+
+    Serial.begin(115200); Serial.println("Botting..."); // for debugging
+    Serial2.begin(115200, SERIAL_8N1, 16, 17); //the WiFi core
+    Serial2.setRxBufferSize(4096);            // Prefer constexpr size_t (typed constants) for buffer sizes and make RX > JSON by a margin.
+    Serial.println("Serial2 buffer initialized and set to 2048 bytes");
+
+  pinMode(internal_fan, OUTPUT); digitalWrite(internal_fan,  HIGH);
+
+    
+    //WiFi.begin();
+    WiFi.mode(WIFI_STA);    pinMode(wifi_led, OUTPUT); digitalWrite(wifi_led, HIGH);
+    ThingSpeak.begin(client);  
+  
+    pinMode(blinker, OUTPUT); digitalWrite(blinker, HIGH);
+    pinMode(server_led, OUTPUT);  digitalWrite(server_led, HIGH);
+    pinMode(things_led, high);  digitalWrite(things_led, HIGH);
+    
+
+    delay(1000);
+
+   digitalWrite(blinker, LOW);
+
+    WiFi.begin(SECRET_SSID, SECRET_PASS);
+    Serial.print("Connecting to '"); Serial.print(SECRET_SSID); Serial.println("' WiFi Provider...");
+
+    check_connection();  
+    digitalWrite(wifi_led, LOW);
+    digitalWrite(server_led, LOW);
+    digitalWrite(things_led, LOW);
+    digitalWrite(internal_fan,  LOW);
+
+}
+
+size_t bufferIndex = 0;
+int braceLevel = 0;
+char dataPack[JSON_BUFFER_SIZE] = ""; // JSON_received ... up to 2048 Bytes
+
+uint64_t now_now = 0, prev_prev = 0, prev = 0;
+void loop() {
+
+
+  now_now = esp_timer_get_time()/10000ULL; // to get 1/100th of a second
+
+ if(now_now - prev >= 1) { // 100X very second
+    receive_serial_data();
+    prev = now_now;
+    flash(1);
+ }
+
+
+  if((now_now - prev_prev) >= 10*60*100ULL){ // once every 10 minutes
+    if(average_temp >= 10.00){
+        Serial.print("time check: "); Serial.println(now_now);
+        check_connection();
+        upload_to_thingsPeak();
+        upload_to_web_of_iot();
+        monitor_internal_temp();
+        prev_prev = now_now;
+      } // else temperature values are insane
+   }
+}
+
+
+
+void monitor_internal_temp(){
+  
+  Serial.print("MCU TEMP: "); Serial.println(cabin_temp);
+
+  if(cabin_temp <= 30.0) {
+    digitalWrite(internal_fan, LOW); inner_fan_status = false;
+  }
+  else {digitalWrite(internal_fan, HIGH); inner_fan_status = true; }
+
+  Serial.print("Inner Fan: "); Serial.println(inner_fan_status?"ON":"OFF");
+  
+}
+
+
+void upload_to_thingsPeak(){
+   if (!wifi_state) { Serial.println("Skipping ThingSpeak: WiFi down"); return; }
+    Serial.println("uploading to thingspeak...");
+       digitalWrite(things_led, HIGH);
+
+            ThingSpeak.setField(1, average_temp);
+            ThingSpeak.setField(2, average_humi);
+            ThingSpeak.setField(3, voltage);
+            ThingSpeak.setField(4, cabin_temp);
+        
+          
+          // pieces of information in a channel.  Here, we write to field 1.
+          int x = ThingSpeak.writeFields(Channel_ID, WriteAPIKey);
+        
+          if(x == 200){ //200 for connected successfully!
+              upload_fails = 0;
+              Serial.println("Channel Updated Successfully!");
+              //successful_uploads++;
+          }
+          else{
+            snprintf(error_code, sizeof(error_code), "%d", x);           
+            Serial.print("HTTP error code "); Serial.println(error_code);
+            Serial.println("Problem uploading data onto channel");
+
+            //send SMS every time this fails
+          } // just consider backoff after failures.
+
+      digitalWrite(things_led, LOW);
+
+}
+
+bool hasFreshJson = false;
+void receive_serial_data(){ // (no shadow, robust parse log)
+  while (Serial2.available()) {
+    char c = Serial2.read();
+
+    if (c == '{') { if (braceLevel == 0) bufferIndex = 0; braceLevel++; }
+    if (braceLevel > 0) {
+      if (bufferIndex < JSON_BUFFER_SIZE - 1) {
+        dataPack[bufferIndex++] = c;
+      } else { // if JSON HUGE
+        bufferIndex = 0; braceLevel = 0;
+        Serial.println("Buffer overflow! JSON too large. Dropping frame.");
+        continue;
+      }
+    }
+
+    if (c == '}' && braceLevel > 0) {
+      braceLevel--;
+      if (braceLevel == 0 && bufferIndex > 0) {
+        dataPack[bufferIndex] = '\0';
+        DeserializationError error = deserializeJson(JSON_received, dataPack);
+        if (!error) {
+        //  Serial.println("RECEIVED JSON:");
+        //  Serial.println(dataPack);
+
+          const char * SystemDate = JSON_received["Date"] | "";
+          const char * SystemTime = JSON_received["Time"] | "";
+          active_sensors = JSON_received["Active_Sensors"] | 0;
+          average_temp   = JSON_received["Average_Temperature"] | 0.0;
+          average_humi   = JSON_received["Average_Humidity"]    | 0.0;
+          voltage        = JSON_received["Voltage"]             | 0.0;
+          cabin_temp     = JSON_received["Internal_Temp"]       | 0.0;
+
+          Serial.printf("avg_t=%.1f, avg_h=%.1f, V=%.2f, cabin=%.1f, sensors=%u\n",
+                        average_temp, average_humi, voltage, cabin_temp, active_sensors);
+          hasFreshJson = true;
+        } else {
+          Serial.printf("JSON Error: %s\n", error.c_str());
+        }
+      }
+    }
+  }
+}
+
+/*
+void receive_serial_data(){
+    //  while (Serial2.available()) {  // Serial.println("Receiving JSON Data...");
+  while (Serial2.available() && Serial2.read() != '}') { // drain until the next {, so you can desync if noise appears.
+    char c = Serial2.read();
+
+    // Track opening and closing braces and Handle nested braces correctly if your JSON contains objects inside objects.
+    // Start collecting once '{' is seen
+        if (c == '{') {
+            if (braceLevel == 0) bufferIndex = 0; // reset buffer at start
+            braceLevel++;
+        }
+
+        if (braceLevel > 0) {
+            if (bufferIndex < JSON_BUFFER_SIZE - 1) { // leave space for null terminator
+                dataPack[bufferIndex++] = c;
+            } else {
+                // buffer overflow, reset
+                bufferIndex = 0;
+                braceLevel = 0;
+                Serial.println("Buffer overflow! JSON too large.");
+            }
+        }
+
+        if (c == '}') {
+            braceLevel--;
+            if (braceLevel == 0 && bufferIndex > 0) {
+                dataPack[bufferIndex] = '\0'; // null terminate
+
+                // Deserialize JSON
+                DeserializationError error = deserializeJson(JSON_received, dataPack);
+                if (!error) {
+                    // Access fields example
+                    Serial.println("RECEIVED:");
+                    Serial.println(dataPack);
+                    
+                      const char * SystemDate = JSON_received["Date"];
+                      const char * Systemtime = JSON_received["Time"];
+                       active_sensors = JSON_received["Active_Sensors"] | 0;
+                       average_temp = JSON_received["Average_Temperature"] | 0.00;
+                       average_humi = JSON_received["Average_Humidity"] | 0.00;
+                       voltage = JSON_received["Voltage"] | 0.00;
+                       cabin_temp = JSON_received["Internal_Temp"] | 0.00;
+
+                  
+                    Serial.println(); Serial.printf("average_temp=%.1f, average_humi=%.1f\n", average_temp, average_humi); Serial.println();
+                } else {
+                    Serial.print("JSON Error: ");
+                    Serial.println(error.c_str());
+                }
+            }
+        }
+    }
+}
+*/
+
+void check_connection(){
+  attempts = 0; // reset per call
+  while (WiFi.status() != WL_CONNECTED) {
+    digitalWrite(wifi_led, HIGH);
+    delay(500);
+    Serial.printf("%u...", attempts);
+    attempts++;
+    if(attempts >= 50) { Serial.println("WiFi Signal Lost"); digitalWrite(wifi_led, LOW); break; }
+  }
+  if(WiFi.status() == WL_CONNECTED){
+    WiFi_Strength = WiFi.RSSI(); // after connected
+    wifi_state = true;
+    Serial.printf("\nConnected with IP: %s\n", WiFi.localIP().toString().c_str());
+  } else {
+    Serial.println("Connection Failed!");
+    digitalWrite(wifi_led, LOW);
+    wifi_state = false;
+  }
+}
+
+/*
+    Consider enabling HTTP keep-alive if you post frequently: https.setReuse(true);.
+
+    Add a backoff after repeated HTTP failures to avoid hammering the server.
+*/
+
+
+char httpsData[2048] = "";
+/*
+void upload_to_web_of_iot(){ // (no leak, better status handling)
+  if (!wifi_state) { Serial.println("Skip POST: WiFi down"); return; }
+  if (!hasFreshJson) { Serial.println("Skip POST: no fresh JSON"); return; }
+
+  Serial.printf("\tPOST JSON => %s\n\tTo: %s\n", dataPack, serverName);
+  digitalWrite(things_led, HIGH);
+
+  WiFiClientSecure client;   // no heap leak
+  client.setInsecure();      // accept all certs (consider proper CA in production)
+
+  HTTPClient https;
+  if (https.begin(client, serverName)) {
+    https.setTimeout(15000); // 15s network timeout
+    https.addHeader("Content-Type", "application/json");
+
+    int httpResponse = https.POST((uint8_t*)dataPack, strlen(dataPack));
+    Serial.printf("HTTP Response: %d (%s)\n",
+                  httpResponse, https.errorToString(httpResponse).c_str());
+
+    if (httpResponse > 0 && (httpResponse/100) == 2) {
+      Serial.println("Uploaded Successfully");
+      // Optionally: String body = https.getString(); Serial.println(body);
+    } else {
+      Serial.println("Upload Failed");
+    }
+    https.end();
+  } else {
+    Serial.println("HTTP initialization failed!");
+  }
+  digitalWrite(things_led, LOW);
+  hasFreshJson = false; // mark consumed
+}
+*/
+
+void upload_to_web_of_iot(){
+   //  Serial.print("\tData to send via HTTP POST => ");    Serial.println(dataPack);    Serial.print("\tTo: "); Serial.println(serverName); 
+
+    digitalWrite(things_led, HIGH);
+    
+    // WiFiClientSecure client;
+    //client.setInsecure();
+    //HTTPClient https;
+
+   //std::unique_ptr<BearSSL::WiFiClientSecure>client(new BearSSL::WiFiClientSecure);
+    // Ignore SSL certificate validation
+    //client->setInsecure();
+    //setInsecure(); 
+    
+     //if(WiFi.status()== WL_CONNECTED){
+      WiFiClientSecure *client = new WiFiClientSecure; // must delete it once you’re done with the HTTP transaction to avoid a memory leak.
+      client->setInsecure(); //don't use SSL certificate
+    
+      HTTPClient https;
+ 
+      Serial.println("Initializing HTTP...");
+      
+    //  bool initialized = https.begin(serverName); 
+        bool initialized = https.begin(*client, serverName); // Your Domain name with URL path or IP address with path
+
+        if(initialized){ 
+           
+              Serial.println("HTTP initialized Successfully!"); //Serial.println("Adding HTTP Header: \'Application/x-www-form-urlencoded'");
+      // Specify content-type header
+              https.addHeader("Content-Type", "application/json");  
+              delay(50);
+      
+      // Send HTTP POST request
+             int httpResponse = https.POST(dataPack);
+             delay(150);
+            
+            Serial.printf("HTTP Response: %d (%s)\n", httpResponse, https.errorToString(httpResponse).c_str());  Serial.println();
+            if(httpResponse == 200){
+              Serial.println("Uploaded Successfully, YeeeeY!"); Serial.println();
+            }
+            else if(httpResponse >= 600){
+              Serial.println("Failed to upload to server!"); Serial.println();
+            }
+
+            else if(httpResponse <= 0){
+              Serial.println("Insane Response!"); Serial.println("Failed to upload to server!");
+
+            }
+            else {
+              Serial.println("rESPONSE FUNNy!"); Serial.println("Failed to upload to server!");
+            }
+
+        }
+        else Serial.println("HTTPS initialization failed!");
+             
+    
+        Serial.println("Ending HTTP");
+      // Free resources
+      https.end();
+          
+    // now free the heap allocation
+    delete client;
+    client = nullptr;  // optional safety a good habit to avoid dangling pointers.
+    //}
+    //NOTE: If you repeatedly create/destroy clients in loop(), 
+    //this will fragment the ESP32 heap over time. 
+    //Stack allocation (WiFiClientSecure client;) is usually safer and lighter on small devices.
+    
+    //lastTime = millis();
+  //}
+
+  digitalWrite(things_led, LOW);
+}
+
+     // String httpRequestData = "api_key=tPmAT5Ab3j7F9&sensor=BME280&value1=24.25&value2=49.54&value3=1005.14";           
+//      String httpRequestData = "key=12345&DryerID=1&temp=57&humi=75&outer_temp=41&outer_humi=51&WiFi=-55";           
+ //       char httpRequestData[120] = "key=12345&DryerID=1&temp=57.7&humi=75.9&outer_temp=41.3&outer_humi=51.6&WiFi=-55";           
+          //int httpResponseCode = http.POST("{\"api_key\":\"tPmAT5Ab3j7F9\",\"sensor\":\"BME280\",\"value1\":\"24.25\",\"value2\":\"49.54\",\"value3\":\"1005.14\"}");
+
+
+
+
+
+int beepCount = 0;          // total beeps requested
+int beepDone = 0;           // beeps completed
+unsigned long beepTimer = 0;
+bool buzzerOn = false;
+const unsigned long beepDuration = 100;   // ms ON
+const unsigned long beepGap = 100;        // ms OFF
+
+void flash(int times) {
+  beepCount = times;
+  beepDone = 0;
+  buzzerOn = false;
+  beepTimer = now_now;
+}
+
+void handleBeep() {
+  if (beepDone >= beepCount) return; // nothing to do
+
+  unsigned long now = now_now;
+  if (!buzzerOn && now - beepTimer >= beepGap) {
+    // turn ON buzzer
+    digitalWrite(blinker, HIGH);
+    buzzerOn = true;
+    beepTimer = now;
+  } 
+  else if (buzzerOn && now - beepTimer >= beepDuration) {
+    // turn OFF buzzer
+    digitalWrite(blinker, LOW);
+    buzzerOn = false;
+    beepTimer = now;
+    beepDone++;
+  }
+}
+
