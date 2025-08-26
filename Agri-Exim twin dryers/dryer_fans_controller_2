@@ -1,0 +1,755 @@
+/*
+    XODDOCODE 1ST JULY 2025
+    DRYER FANS CONTROLLER
+    SENSOR DTA AGGREGATOR
+    
+*/
+
+#include <stdlib.h>
+//#include <avr/dtostrf.h>
+
+// INTER-SYSTEM COM PROTOCOLS
+#include "Wire.h"
+
+#include "RTClib.h"
+
+  RTC_DS3231 real_time;
+
+
+// base class GxEPD2_GFX can be used to pass references or pointers to the display instance as parameter, uses ~1.2k more code
+// enable or disable GxEPD2_GFX base class
+#define ENABLE_GxEPD2_GFX 0
+
+#include <GxEPD2_BW.h>
+#include <GxEPD2_3C.h>
+
+#include <Fonts/FreeMonoBold9pt7b.h>
+#include <Fonts/FreeSansBold24pt7b.h> // FreeSerifBold24pt7b
+#include <Fonts/FreeSans12pt7b.h>
+#include <Fonts/FreeMono12pt7b.h>
+#include <Fonts/FreeMonoBold12pt7b.h>
+#include <Fonts/FreeMono9pt7b.h>
+
+   //4.2'' EPD Module 400x300, SSD1683
+   
+   /* ESP32 */ uint8_t CS=5, SCK_=18, MOSI_=23, BUSY=15, RES=13, DC=4; */ ///*CS=5*/ 5, /*DC=*/ 17, /*RES=*/ 16, /*BUSY=*/ 4
+//  /* DUE */ uint8_t CS = 10, DC = 24, RES = 25, BUSY = 26;
+ GxEPD2_BW<GxEPD2_420_GDEY042T81, GxEPD2_420_GDEY042T81::HEIGHT> LCD(GxEPD2_420_GDEY042T81(CS, DC, RES, BUSY)); 
+
+
+uint8_t directionPin = 39;  // VN
+uint8_t irradiancePin = 36; // VP
+
+void beep(uint8_t times, uint8_t delay_setting);
+
+
+const byte anemometer_asking_code[]  = {0x01, 0x03, 0x00, 0x00, 0x00, 0x01, 0x84, 0X0A}; // 0x0A // 8 bits
+byte anemometer_response[12]; // response has 6 or 7 bits
+
+const byte enviroment_asking_code[]  = {0x01, 0x03, 0x01, 0xF4, 0x00, 0x02, 0x85, 0XE7}; // 8 bits 
+byte ait_temp_response[12]; // response has 7 or 9 bits
+
+char initializer[100] = "Now Booting...";
+
+uint8_t buzzer = 8;
+uint8_t currentScreen = 1;
+
+void setup() { delay(100);
+  
+  pinMode(buzzer, OUTPUT); beep(1, 1);
+
+      LCD.init(115200,true,50,false);  strcpy(initializer, "Initializng display!"); Serial.println(initializer);
+
+      Boot();    delay(3000);
+     
+        Serial.begin(115200); Serial.println(initializer);
+    //  Serial2.begin(4800, SERIAL_8N1, 16, 17); // ESP32 SERIAL2 needs those damn arguments
+        Serial1.begin(4800); strcpy(initializer, "Initalizing Anemometer Serial Initialized!"); Serial.println(initializer); delay(1000);
+        Serial2.begin(4800); strcpy(initializer, "Initalizing Environmental Temp & Humi Sensor!"); Serial.println(initializer); delay(1000);
+        Serial3.begin(4800); strcpy(initializer, "Initalizing Solar irradiance Sensor!"); Serial.println(initializer); delay(1000);
+
+  //  pinMode(directionPin, INPUT);  strcpy(initializer, "Wind Vane initialized!"); Serial.println(initializer); delay(1000);
+  //  pinMode(irradiancePin, INPUT); strcpy(initializer, "Pyranometer Initialized!"); Serial.println(initializer); delay(1000);
+
+
+
+    
+
+    homepage();
+
+    
+ // helloFullScreenPartialMode();
+  delay(1000);
+
+    LCD.hibernate();
+
+    strcpy(initializer, "Display Initialized!"); Serial.println(initializer);
+
+
+  Serial.print("Starting Realtime Clock...");
+  initialize_RTC();
+ 
+
+     beep(3, 0); // END OF BOOT
+     Serial.println("Done Booting!");
+}
+
+
+
+
+float temp1 = 0.0;
+float humi1 = 0.0;
+
+float wind_bearing = 0.0f;
+float wind_speed = 0.0f;
+float solar_insolence = 0.0f;
+
+void loop() { 
+      
+      //   WIND DIRECTION AND SPEED
+    //     wind_bearing = wind_direction();    Serial.print("Wind Bearing: "); Serial.print(wind_bearing);    Serial.println("deg");
+      wind_speed = query_wind_speed();  //  Serial.print("Wind Speed: ");   Serial.print(wind_speed); Serial.println("m/s");
+
+      //AIR TEMP AND HUMIDITY - MASTER SENSOR
+      query_environmental_sensor(); // Serial.print("Air Temp: "); Serial.println(temp1); Serial.print("Air Humi: "); Serial.println(humi1);
+      
+      //AIR TEMP AND HUMIDITY - ALTERNATE SENSOR
+      //BME... OR DHT OR BOTH...
+
+     // SOLAR IRRADIANCE
+   //   solar_insolence = sun_brightness(); Serial.print("Solar Irradiance: ");     Serial.print(solar_insolence); Serial.println("W/m2");
+
+
+      Serial.println();
+      query_rtc();
+      update_display();
+     
+      
+      delay(10000); 
+
+
+
+}
+
+
+
+
+uint8_t hr = 0, mint = 0, sec = 0, day_ = 0, mth = 0, yr = 0; uint16_t mwaka = 2000; uint64_t screen_timeout = 0; 
+
+char daysOfTheWeek[7][12] = {"Sun", "Mon", "Tue", "Wed", "Thur", "Fri", "Sat"};
+char Moonth[12][6] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sept", "Oct", "Nov", "Dec"};
+
+char hr_str[7]; char min_str[7]; char sec_str[7]; char day_str[10];  char mth_str[20]; char yr_str[10]; 
+char zero_holder[4] = "0"; char bucket[4] = ""; char SystemTime[50] = "13:45:21"; char ShortTime[32] = "12:45pm"; char SystemDate[100] = "...";
+
+
+char FullDate[50] = "Wednesday 26th March, 2025";
+char ShortDate[24] = "Thur 26 Sept, 2025"; // long short characters
+char FullTime[32] = "13:28:55";
+
+
+//char SystemDate[32] = "Wed 17th Sept, 2025";; char fullDate[50] = "Wednesday 17th November, 2025";
+
+
+uint32_t running_ticks = 0;
+
+void query_rtc(){ //Serial.println("Time Check!"); Serial.println();
+  running_ticks++;
+
+  // if(running_ticks%10 == 0){ //query for time once every 10 seconds
+
+            DateTime time_now = real_time.now();
+
+              hr = time_now.hour(); mint = time_now.minute();  sec = time_now.second();
+              day_ = time_now.day(); mth = time_now.month();  mwaka = time_now.year();
+
+            if(hr > 24){ 
+                // DateTime now = real_time.now();
+              // while(recursive_counter < 5){ query_rtc(); recursive_counter++;}
+
+                hr = 24; mint = 59; sec = 59; /*beep(2);*/ Serial.println("Time Chip Failed!");
+
+              }
+            
+                itoa(hr, hr_str, 10);    itoa(mint, min_str, 10); 
+                itoa(sec, sec_str, 10);  
+                itoa(day_, day_str, 10); strcpy(mth_str, Moonth[mth-1]);  // ... strcpy(day_str, daysOfTheWeek[day]); ... //
+                itoa(mwaka, yr_str, 10);
+
+                  
+              //construct the time sequences
+        if(hr<=9){  strcpy(ShortTime, zero_holder); strcat(ShortTime, hr_str);} else strcpy(ShortTime, hr_str); strcat(ShortTime, ":"); 
+        if(mint<=9){strcat(ShortTime, zero_holder);} strcat(ShortTime, min_str); // HH:MM
+                    strcpy(SystemTime, ShortTime);  strcat(SystemTime, ":"); strcat(SystemTime, sec_str); // HH:MM:SS
+
+          //construct the date sequence
+        //      strcpy(SystemDate, day_str); strcat(SystemDate, " "); strcat(SystemDate, mth_str); strcat(SystemDate, ", "); strcat(SystemDate, yr_str);
+         strcpy(SystemDate, day_str); strcat(SystemDate, " "); strcat(SystemDate, mth_str); strcat(SystemDate, ", "); strcat(SystemDate, yr_str);
+
+                  Serial.println();
+                  Serial.print("Short Time: ");  Serial.println(ShortTime);
+                  Serial.print("Full System Time: "); Serial.print(SystemTime); 
+                  Serial.print("\tSystem Date: "); Serial.println(SystemDate); Serial.println();
+                  Serial.println();
+    //    }
+
+
+
+}
+
+
+
+
+
+void update_display(){
+  
+  if(currentScreen == 1) homepage();
+  if(currentScreen == 2) dataPage();
+
+}
+
+void dataPage(){
+  
+}
+
+ /*
+      357 - 3 ==> North
+        42 - 48=> North East
+      87 - 93 ==> East
+        
+      177-183 ==> South
+      267-273 ==> West
+  */
+
+
+float wind_direction(){ // perhaps ... take about 100 readings in 0.1 second
+      int direct_reading = 0;
+      float direction_reading = 0.0;
+
+       direct_reading = analogRead(directionPin); // 0 - 3.33V 
+       direction_reading = 360.0 * (direct_reading/4095.0); // max direction = 355
+
+      return direction_reading;
+}
+
+char printable_wind_resp[10] = ""; // 25m/s
+char wind_speed_log[320] = ""; // 0x....
+bool responded = false;
+
+float query_wind_speed(){
+  strcpy(wind_speed_log, "Sending Request for windspeed [0x01, 0x03, 0x00, 0x00, 0x00, 0x01, 0x84, 0X0A]");
+  Serial.println(wind_speed_log);  delay(500);
+
+  strcpy(wind_speed_log, "Response => "); // clear out the buffer for data
+  strcpy(printable_wind_resp, "");
+  char holding[5] = "";
+  float calculated_speed = 0.00;
+  responded = false;
+  
+    if(Serial1.write(anemometer_asking_code, sizeof(anemometer_asking_code)) == 8) {  
+    
+        if(Serial1.available() > 0 ){ responded = true;
+            for(byte i = 0; i < 8; i++) {
+                  anemometer_response[i] = Serial1.read();
+
+                  itoa(anemometer_response[i], holding, HEX); /// 16
+                  if(anemometer_response[i] <= 0) strcat(wind_speed_log, "0x0"); 
+                  else strcat(wind_speed_log, "0x"); 
+                       strcat(wind_speed_log, holding);
+                  if(i<7) strcat(wind_speed_log, ",");                  
+                   
+            } // else Serial.println("No RS485 Response Received")
+
+       } else { strcat(wind_speed_log, "Response not Received!"); strcat(printable_wind_resp, "xx"); }
+
+     } else { strcat(wind_speed_log, "Error Sending Request!"); strcat(printable_wind_resp, "!!"); }
+
+    Serial.println(wind_speed_log);
+
+     if(responded){
+        float calculated_speed = (anemometer_response[3] + (anemometer_response[4])/10.0); //then convert into DEC
+    
+        dtostrf(calculated_speed, 3,1, printable_wind_resp);
+    
+      
+        Serial.print("Air Speed: "); Serial.println(printable_wind_resp);//Serial.println((responses[3]+responses[4]), DEC);
+        Serial.println();
+        
+     }
+
+
+    return calculated_speed;
+
+}
+
+float sun_brightness(){
+       int irradiance_reading = 0;
+       float solar_radiation = 0.0;
+      
+       irradiance_reading = analogRead(irradiancePin);
+       solar_radiation = 1800.0 * (irradiance_reading/4095.0); //max irradiance = 1799
+
+      return solar_radiation;
+
+}
+
+char printable_temp_resp[10] = ""; // 0deg, 
+char printable_humi_resp[10] = ""; // 100%
+char temp_humi_log[320] = ""; // 0x....
+bool temp_responded = false;
+
+
+void query_environmental_sensor(){
+
+ strcpy(temp_humi_log, "Sending Request for air and humidity [[0x01, 0x03, 0x01, 0xF4, 0x00, 0x02, 0x85, 0XE7]");
+  Serial.println(temp_humi_log);  delay(500);
+
+  strcpy(temp_humi_log, "Response => "); // clear out the buffer for data
+  strcpy(printable_temp_resp, "");
+  char holding[5] = "";
+  float this_humidity = 0.00;
+  float this_temperature = 0.00;
+  temp_responded = false;
+
+    if (Serial2.write(enviroment_asking_code, sizeof(enviroment_asking_code)) == 8) { // 8 bytes ask
+
+      if(Serial2.available() > 0){ temp_responded = true;
+    
+          for(byte i = 0; i < 10; i++) {
+                ait_temp_response[i] = Serial2.read();
+
+                
+                if(ait_temp_response[i] <= 0) strcat(temp_humi_log, "0x0"); 
+                  else strcat(temp_humi_log, "0x");
+
+                  itoa(anemometer_response[i], holding, HEX); /// 16
+                  strcat(temp_humi_log, holding);
+                  if(i<9) strcat(temp_humi_log, ",");    
+              
+            }
+    }  else strcat(temp_humi_log, "No RS485 Response Received");
+  }  else strcat(temp_humi_log, "Error Sending Request!");
+
+    Serial.print(temp_humi_log);
+
+
+ if(responded){
+       this_humidity = (ait_temp_response[3] + (ait_temp_response[4])/10.0); humi1 = this_humidity;
+       this_temperature = ((ait_temp_response[6])/10.0); temp1 = this_temperature;
+
+        dtostrf(this_temperature, 3,1, printable_temp_resp);
+        dtostrf(this_humidity, 3,1, printable_humi_resp);
+
+
+      Serial.println(printable_temp_resp);
+      Serial.println(printable_humi_resp);
+/*
+  //Serial.println(values[4]);
+  Serial.println();
+  Serial.print("Air Humidity: "); Serial.println(this_humidity, DEC);//Serial.println((responses[3]+responses[4]), DEC);
+  Serial.print("Air Temperature: "); Serial.println(this_temperature, DEC);//Serial.println((responses[3]+responses[4]), DEC);
+  Serial.println();
+*/
+   }
+
+}
+
+
+int hexadecimalToDecimal(String hexVal){ 
+
+    int len = hexVal.length(); 
+  
+    // Initializing base value to 1, 
+    // i.e 16^0 
+    int base = 1; 
+  
+    int dec_val = 0; 
+  
+    // Extracting characters as digits 
+    // from last character 
+    for (int i = len - 1; i >= 0; i--) { 
+        // If character lies in '0'-'9', 
+        // converting it to integral 0-9 
+        // by subtracting 48 from ASCII value 
+        if (hexVal[i] >= '0' && hexVal[i] <= '9') { 
+            dec_val += (int(hexVal[i]) - 48) * base; 
+  
+            // incrementing base by power 
+            base = base * 16; 
+        } 
+  
+        // If character lies in 'A'-'F' , converting 
+        // it to integral 10 - 15 by subtracting 55 
+        // from ASCII value 
+        else if (hexVal[i] >= 'A' && hexVal[i] <= 'F') { 
+            dec_val += (int(hexVal[i]) - 55) * base; 
+  
+            // Incrementing base by power 
+            base = base * 16; 
+        } 
+    } 
+    return dec_val; 
+} 
+
+  
+void initialize_RTC(){
+  uint8_t trial = 0;
+  while(!real_time.begin()) {
+         strcpy(initializer, "Couldn't find RTC");   Serial.flush();
+         trial++; delay(50);
+      if (trial >= 3)break;  
+    } //vTaskDelay(500 / portTICK_PERIOD_MS);
+
+    if (real_time.lostPower()) {
+              strcpy(initializer, "RTC lost power, let's set the time!"); // When time needs to be set on a new device, or after a power loss, the
+              
+              real_time.adjust(DateTime(F(__DATE__), F(__TIME__)));  // This line sets the RTC with an explicit date & time, for example to set // rtc.adjust(DateTime(2014, 1, 21, 3, 0, 0));
+              
+              strcpy(initializer, "Clock Started and time set!");
+    }
+}
+
+
+
+
+const char Manufacturer[] = "IntelliSys UG";
+const char DeviceID[] = "Automated Weather STATION";
+//const char Parameter[] = "WIND, SOLAR, RAIN, etc";
+const char Parameter[] = "NARO ZARDI Rwebitaba";
+
+void Boot(){
+
+  LCD.setRotation(4);
+  LCD.setFont(&FreeSans12pt7b);
+  LCD.setTextColor(GxEPD_BLACK);
+
+  int16_t tbx, tby; uint16_t tbw, tbh;
+  LCD.getTextBounds(Manufacturer, 0, 0, &tbx, &tby, &tbw, &tbh);
+  // center the bounding box by transposition of the origin:
+  uint16_t x = ((LCD.width() - tbw) / 2) - tbx;
+  uint16_t y = ((LCD.height() - tbh) / 2) - tby;
+  LCD.setFullWindow();
+
+  LCD.firstPage(); //FULLY CENTERED TEXTS
+  do{
+  
+        LCD.fillScreen(GxEPD_WHITE);
+        LCD.setCursor(50, 50);    
+        LCD.setFont(&FreeSansBold24pt7b);
+        LCD.print(Manufacturer);
+
+        delay(4000);
+
+        LCD.setFont(&FreeMonoBold9pt7b);
+        LCD.setTextColor(LCD.epd2.hasColor ? GxEPD_RED : GxEPD_BLACK);
+        LCD.getTextBounds(DeviceID, 0, 0, &tbx, &tby, &tbw, &tbh);
+
+        x = ((LCD.width() - tbw) / 2) - tbx;
+        LCD.setCursor(x, y+tbh);    LCD.print(DeviceID);
+        
+        LCD.setCursor(100, 200); LCD.print(Parameter);
+
+        delay(2000);
+
+    }  while (LCD.nextPage());
+}
+
+
+
+char WindSpeed_str[10] = "15.2"; char WindSpeed_units[5] = "m/s";
+char sunshine_str[10] = "1500"; char sunshine_units[5] = "W/m2";
+char Wind_direction_str[10] = "090"; char Wind_direction_units[5] = "o";
+char temp1_str[10] = "25.8"; 
+char humi1_str[10] = "77.7";
+
+uint16_t box_width = 120;
+uint16_t box_height = 100;
+
+bool is_home = false;
+ void homepage(){
+
+ // if(!is_home){ 
+
+    LCD.setFont(&FreeMonoBold9pt7b); LCD.setTextColor(GxEPD_BLACK);
+  int16_t tbx, tby; uint16_t tbw, tbh;
+  LCD.getTextBounds(DeviceID, 0, 0, &tbx, &tby, &tbw, &tbh);
+
+uint16_t xx = ((LCD.width() - tbw) / 2) - tbx;
+
+ // LCD.setFullWindow();
+
+  LCD.firstPage(); //FULLY CENTERED TEXTS
+  do{
+        //BOUNDARY AROUND THE 400 X 300px
+        LCD.fillScreen(GxEPD_WHITE); LCD.drawRect(0, 0, 400, 299, GxEPD_BLACK); 
+
+        //HEADER
+        LCD.setFont(&FreeMonoBold9pt7b); LCD.setTextColor(GxEPD_BLACK);
+        LCD.setCursor(xx, 20);    LCD.print(DeviceID);
+
+
+  // BODY
+       // LCD.drawRect(10, 40, 100, 70,  GxEPD_BLACK);
+
+       //6 BOXES FOR 6 WEATHER PARAMETERS
+
+ //WIND SPEED AREA
+        LCD.drawRoundRect(10, 40, box_width, box_height, 10, GxEPD_BLACK);
+
+        LCD.fillRoundRect(10, 40, box_width, 20, 10, GxEPD_BLACK); //BLACK RIBBON
+        LCD.fillRect(10, 50, box_width, 12, GxEPD_BLACK);
+
+         LCD.setTextColor(GxEPD_WHITE); LCD.setFont(&FreeMonoBold9pt7b);
+         LCD.setCursor(15, 55); LCD.print("Wind Speed"); //AREA HEADING
+
+
+
+ //WIND DIRECTION
+        LCD.drawRoundRect((20+box_width), 40, box_width, box_height, 10, GxEPD_BLACK);
+        LCD.fillRoundRect((20+box_width), 40, box_width, 20, 10, GxEPD_BLACK); //BLACK RIBBON
+        LCD.fillRect((20+box_width), 50, box_width, 12, GxEPD_BLACK);
+
+        LCD.setTextColor(GxEPD_WHITE); LCD.setFont(&FreeMonoBold9pt7b);
+        LCD.setCursor(10+(20+box_width), 55); LCD.print("Direction"); //AREA HEADING
+
+
+
+ //SUNLIGHT INTENSITY
+        LCD.drawRoundRect((30+(2*box_width)), 40, box_width, box_height, 10, GxEPD_BLACK); 
+        LCD.fillRoundRect((30+(2*box_width)), 40, box_width, 20, 10, GxEPD_BLACK); //BLACK RIBBON
+        LCD.fillRect((30+(2*box_width)), 50, box_width, 12, GxEPD_BLACK);
+        
+        LCD.setTextColor(GxEPD_WHITE); LCD.setFont(&FreeMonoBold9pt7b);
+        LCD.setCursor(20+(30+(2*box_width)), 55); LCD.print("Sunlight"); //AREA HEADING
+
+
+
+
+//AIR TEMPERATURE
+        LCD.drawRoundRect(10, 150, box_width, box_height, 10, GxEPD_BLACK);
+
+        LCD.fillRoundRect(10, 150, box_width, 20, 10, GxEPD_BLACK); //BLACK RIBBON
+        LCD.fillRect(10, 160, box_width, 12, GxEPD_BLACK);
+
+         LCD.setTextColor(GxEPD_WHITE); LCD.setFont(&FreeMonoBold9pt7b);
+         LCD.setCursor(14, 165); LCD.print("Temperature"); //AREA HEADING
+
+
+
+         
+
+    //AIR HUMIDITY
+         LCD.drawRoundRect((20+box_width), 150, box_width, box_height, 10, GxEPD_BLACK);
+
+        LCD.fillRoundRect((20+box_width), 150, box_width, 20, 10, GxEPD_BLACK); //BLACK RIBBON
+        LCD.fillRect((20+box_width), 160, box_width, 12, GxEPD_BLACK);
+
+         LCD.setTextColor(GxEPD_WHITE); LCD.setFont(&FreeMonoBold9pt7b);
+         LCD.setCursor(15+(20+box_width), 165); LCD.print("Humidity"); //AREA HEADING
+
+ 
+
+        //RAIN
+        LCD.drawRoundRect((30+(2*box_width)), 150, box_width, box_height, 10, GxEPD_BLACK); 
+        LCD.fillRoundRect((30+(2*box_width)), 150, box_width, 20, 10, GxEPD_BLACK); //BLACK RIBBON
+        LCD.fillRect((30+(2*box_width)), 160, box_width, 12, GxEPD_BLACK);
+        
+        LCD.setTextColor(GxEPD_WHITE); LCD.setFont(&FreeMonoBold9pt7b);
+        LCD.setCursor(18+(30+(2*box_width)), 165); LCD.print("Rainfall"); //AREA HEADING
+
+
+
+        //FOOTER
+     //    footer();
+         
+
+   // }  while (LCD.nextPage());
+
+
+    //  is_home = true;
+//}
+
+
+// NOW TO THE DYNAMIC DATA
+
+ // LCD.firstPage(); //FULLY CENTERED TEXTS
+  //do{
+ //WIND SPEED DATA
+         LCD.setTextColor(GxEPD_BLACK);
+         LCD.setFont(&FreeSansBold24pt7b); 
+         LCD.setCursor(20, (55+60));    LCD.print(WindSpeed_str);
+         LCD.setFont(&FreeMono9pt7b); //FreeMono9pt7b
+         LCD.setCursor(90, 130); LCD.print(WindSpeed_units);
+ //WIND DIRECTION DATA
+         LCD.setTextColor(GxEPD_BLACK);
+         LCD.setFont(&FreeSansBold24pt7b); 
+         LCD.setCursor(22+(20+box_width), 115);    LCD.print(Wind_direction_str); 
+         LCD.setFont(&FreeMono9pt7b); //FreeMono9pt7b
+         LCD.setCursor(100+(20+box_width), 90); LCD.print(Wind_direction_units); 
+         LCD.setFont(); LCD.setCursor(5+(20+box_width), 127); LCD.print("0 degrees is North"); 
+
+ //SOLAR IRRADIANCE DATA
+         LCD.setTextColor(GxEPD_BLACK);
+         LCD.setFont(&FreeSansBold24pt7b); 
+         LCD.setCursor(15+(20+(2*box_width)), 115);    LCD.print(sunshine_str); 
+         LCD.setFont(&FreeMono9pt7b); //FreeMono9pt7b
+         LCD.setCursor(70+(20+(2*box_width)), 130); LCD.print(sunshine_units); 
+
+ //AIR TEMPERATURE DATA
+         LCD.setTextColor(GxEPD_BLACK);
+         LCD.setFont(&FreeSansBold24pt7b); 
+         LCD.setCursor(18, (165+58));LCD.print(temp1_str); 
+         LCD.setFont(&FreeMono9pt7b); //FreeMono9pt7b
+         LCD.setCursor(107, (165+30));     LCD.print(Wind_direction_units);
+         LCD.setFont(&FreeMonoBold12pt7b); LCD.setCursor(113, 165+45); LCD.print("C");
+
+ //AIR HUMIDITY DATA
+         LCD.setTextColor(GxEPD_BLACK);
+         LCD.setFont(&FreeSansBold24pt7b); 
+         LCD.setCursor(15+(20+box_width), (165+58));    LCD.print(humi1_str); 
+         LCD.setFont(&FreeMonoBold12pt7b); //FreeMono9pt7b
+         LCD.setCursor(102+(20+box_width), (165+30)); LCD.print("%"); 
+
+      footer();
+
+   }  while (LCD.nextPage());
+/*
+  if (LCD.epd2.hasFastPartialUpdate){
+  
+    showPartialUpdate();
+    delay(1000);
+  }
+*/
+
+
+
+ }
+
+
+
+void footer(){
+        //downward curve
+        /*
+        LCD.fillRect(0, 295, 400, 5, GxEPD_BLACK);
+        LCD.fillRoundRect(0, 270, 400, 30, 5, GxEPD_BLACK); 
+    */
+            //upward curve
+             LCD.fillRect(0, 260, 400, 40, GxEPD_BLACK);
+             LCD.fillRoundRect(1, 255, 398, 15, 8, GxEPD_WHITE);
+            // LCD.fillCircle(0, 295, 2, GxEPD_BLACK);
+            
+            LCD.setFont(&FreeMonoBold9pt7b); 
+            LCD.setTextColor(GxEPD_BLACK);
+    
+            //HOME TAB
+            LCD.fillRoundRect(5, 275, 62, 20, 10, GxEPD_WHITE); 
+            LCD.setCursor(12, 290);  LCD.print("Home"); 
+            
+            LCD.setTextColor(GxEPD_WHITE);
+            
+            //DATE
+            LCD.setCursor(80, 290);  LCD.print(ShortDate); 
+            //SEPARATOR
+           // LCD.fillRect(295, 275, 7, 20, GxEPD_WHITE);
+            LCD.fillTriangle(290, 277, 300, 285, 290, 293, GxEPD_WHITE);
+            //TIME
+            LCD.setFont(&FreeSans12pt7b); //FreeMono12pt7b
+            LCD.setCursor(310, 292); LCD.print(ShortTime);
+
+ }
+
+
+void helloFullScreenPartialMode(){
+
+  //Serial.println("helloFullScreenPartialMode");
+  const char fullscreen[] = "full screen update";
+  const char fpm[] = "fast partial mode";
+  const char spm[] = "slow partial mode";
+  const char npm[] = "no partial mode";
+
+  LCD.setPartialWindow(0, 0, LCD.width(), LCD.height());
+
+  LCD.setRotation(4);
+  LCD.setFont(&FreeMonoBold9pt7b);
+
+  if (LCD.epd2.WIDTH < 104) LCD.setFont(0);
+      LCD.setTextColor(GxEPD_BLACK); //  GxEPD_RED
+
+  const char* updatemode;
+  if (LCD.epd2.hasFastPartialUpdate)
+  {
+    updatemode = fpm;
+  }
+  else if (LCD.epd2.hasPartialUpdate)
+  {
+    updatemode = spm;
+  }
+  else
+  {
+    updatemode = npm;
+  }
+  // do this outside of the loop
+  int16_t tbx, tby; uint16_t tbw, tbh;
+  // center update text
+  LCD.getTextBounds(fullscreen, 0, 0, &tbx, &tby, &tbw, &tbh);
+  uint16_t utx = ((LCD.width() - tbw) / 2) - tbx;
+  uint16_t uty = ((LCD.height() / 4) - tbh / 2) - tby;
+  // center update mode
+  LCD.getTextBounds(updatemode, 0, 0, &tbx, &tby, &tbw, &tbh);
+  uint16_t umx = ((LCD.width() - tbw) / 2) - tbx;
+  uint16_t umy = ((LCD.height() * 3 / 4) - tbh / 2) - tby;
+  // center Manufacturer
+  LCD.getTextBounds(Manufacturer, 0, 0, &tbx, &tby, &tbw, &tbh);
+  uint16_t hwx = ((LCD.width() - tbw) / 2) - tbx;
+  uint16_t hwy = ((LCD.height() - tbh) / 2) - tby;
+  LCD.firstPage();
+  do{
+  
+    LCD.fillScreen(GxEPD_WHITE);
+    LCD.setCursor(hwx, hwy);
+    LCD.print(Manufacturer);
+    LCD.setCursor(utx, uty);
+    LCD.print(fullscreen);
+    LCD.setCursor(umx, umy);
+    LCD.print(updatemode);
+  }
+  while (LCD.nextPage());
+  //Serial.println("helloFullScreenPartialMode done");
+}
+
+
+
+void beep(uint8_t times, uint8_t delay_setting){
+  /*
+    for(int xy=0; xy<times; xy++){
+  
+        if(!sound_locked) { start_beeping = now_now;   sound_locked = true;  }
+  
+        if(sound_locked && !sound_started){
+            digitalWrite(sound, HIGH);
+            sound_started = true;
+        }
+  
+        if((now_now - start_beeping) > 50){
+          digitalWrite(sound, LOW);Battery_Level_Counter
+          sound_started = false;
+        }
+  
+    }
+  */
+        for(int xy=0; xy<times; xy++){
+          digitalWrite(buzzer, HIGH);
+          
+//          if(Battery_Level_Counter <= 1) delay(100);
+  //         else delay(50);
+
+          if(delay_setting == 0)  delay(50); 
+          else if(delay_setting == 1) delay(100);
+          else if(delay_setting == 2) delay(500);
+          
+          digitalWrite(buzzer, LOW);
+          if(times > 1) delay(50);
+        }
+    
+   }
+  
