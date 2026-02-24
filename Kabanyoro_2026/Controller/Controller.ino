@@ -19,8 +19,6 @@ void ESPInfo() {
 #define USE_VSPI_FOR_EPD
 // AND USE HSPI FOR SD and VSPI for E-PAPER
 
-// Combined harvester for weather data in Rwebi
-// 20th NOVEMBER 2025
 #include <Arduino.h>
 #include "Wire.h"
 #include <WiFi.h>
