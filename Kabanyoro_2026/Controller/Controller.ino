@@ -1,23 +1,22 @@
 /* WIRELESS DRYER DATALOGGING SYSTEM FOR SUSAN MBACHO, FOR THE 13mX6m DRYER IN MUARIK*/
+
+const char *OTA_PASS = "12!34";
+const char *devicename = "Dryer_Controller";
 const char *server_address = "https://webofiot.com/dryer/muarik/server.php";
 
-const char *devicename = "Dryer_Controller";
-const char *OTA_PASS = "12!34";
-bool otaModeActive = false;
+const char Manufacturer[15] = "IntelliSys UG";
+const char DeviceID[32] = "Dryer Monitoring System";
+const char DeviceClient[36] = "Susan M PhD Project, MUARIK";
+uint8_t SystemAddress[] = {0x68, 0xFE, 0x71, 0x88, 0x1A, 0x6C}; 
 
 char apiKeyValue[12] = "DRYER_006"; //MUARIK TOKEN
 
 char ESP_IDF_VER[50] = "ESP-IDF Version: ";
 char ARD_CORE_VER[50] = "Arduino Core Version: ";
+char FW_VERSION[50] "v3.3.5-Dryer_Datalogger";
 
-void ESPInfo() {
-    snprintf(ESP_IDF_VER, sizeof(ESP_IDF_VER), "ESP-IDF Version: %s", esp_get_idf_version());
-    snprintf(ARD_CORE_VER, sizeof(ARD_CORE_VER), "Arduino Core Version: %s", ESP.getSdkVersion());
-}
-
-#define FW_VERSION "v1.3.5-Dryer_Datalogger"
-#define USE_VSPI_FOR_EPD
-// AND USE HSPI FOR SD and VSPI for E-PAPER
+#define USE_VSPI_FOR_SD
+#define USE_HSPI_FOR_EPD
 
 #include <Arduino.h>
 #include "Wire.h"
@@ -352,6 +351,7 @@ char sensor_1_last_seen[12] = "--:--"; char sensor_2_last_seen[12] = "--:--"; ch
 char sensor_5_last_seen[12] = "--:--"; char sensor_6_last_seen[12] = "--:--"; char sensor_7_last_seen[12] = "--:--"; char sensor_8_last_seen[12] = "--:--";
 char sensor_9_last_seen[12] = "--:--"; char sensor_10_last_seen[12] = "--:--"; char sensor_11_last_seen[12] = "--:--"; char sensor_12_last_seen[12] = "--:--";
 
+bool otaModeActive = false;
                       
 
 //function prototypes
@@ -377,6 +377,12 @@ bool initialize_sd_card(); //USES HSPI HARDWARE SERIAL
 bool save_csv_to_sd_card();
 bool save_json_to_sd_card();
 void initialize_RTC();
+
+void ESPInfo() {
+    snprintf(ESP_IDF_VER, sizeof(ESP_IDF_VER), "ESP-IDF Version: %s", esp_get_idf_version());
+    snprintf(ARD_CORE_VER, sizeof(ARD_CORE_VER), "Arduino Core Version: %s", ESP.getSdkVersion());
+}
+
 
 bool sd_initialized = false;
 char save_log[512] = "No JSON Saved!";
@@ -5578,11 +5584,6 @@ void otaPage(){
 
 
 
-
-const char Manufacturer[15] = "IntelliSys UG";
-const char DeviceID[32] = "Dryer Monitoring System";
-const char DeviceClient[36] = "Susan M PhD Project, MUARIK";
-uint8_t SystemAddress[] = {0x68, 0xFE, 0x71, 0x88, 0x1A, 0x6C}; 
 char macAddressStr[32]; // Format: XX:XX:XX:XX:XX:XX + null terminator
 
 void Boot(){
