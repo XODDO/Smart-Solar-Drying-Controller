@@ -1,21 +1,23 @@
-const char *server_address = "https://webofiot.com/dryer/kasese/server.php";
+const char *server_address = "https://webofiot.com/dryer/muarik/server.php";
 
-const char *serverName = "https://webofiot.com/dryer/kasese/server.php";
+const char *serverName = "https://webofiot.com/dryer/muarik/server.php";
 
 const char *devicename = "Dryer_Controller";
-char *OTA_PASS = "1234";
+const char *OTA_PASS = "1234";
+bool otaModeActive = false;
+
+char apiKeyValue[12] = "DRYER_006"; //MUARIK TOKEN
+
 #define FW_VERSION "v1.3.5-Dryer_Datalogger"
+#define USE_VSPI_FOR_EPD
+// AND USE HSPI FOR SD and VSPI for E-PAPER
 
 // Combined harvester for weather data in Rwebi
 // 20th NOVEMBER 2025
 #include <Arduino.h>
-#include <stdlib.h>
+#include "Wire.h"
 #include <WiFi.h>
 #include <esp_now.h>
-#include <math.h>
-
-#include "Wire.h"
-#include "SPI.h"
 
 #include "ArduinoOTA.h"
 #include <esp_wifi.h>   // For ESP-NOW internal Wi-Fi APIs
@@ -23,22 +25,24 @@ char *OTA_PASS = "1234";
 #include <ESPmDNS.h>
 #include <WiFiUdp.h>
 
+#include <stdlib.h>
+#include <math.h>
+
+
 #include "RTClib.h"
 
-#include <Adafruit_BMP280.h>
 
 #include "Adafruit_GFX.h"
 #include <GxEPD2_BW.h>
 #include <GxEPD2_3C.h>
 
+#include "SPI.h"
 #include "FS.h"
 #include "SD.h"
-#include "SPI.h"
 
 
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
-#include "ThingSpeak.h"
 
 #include "credentials.h"
 #include "WiFi_Manager.h"
@@ -50,22 +54,18 @@ char *OTA_PASS = "1234";
 StaticJsonDocument<2000> JSON_data;
 //JsonDocument JSON_data; // for dynamic amounts of data
 StaticJsonDocument<4096> JSON_sendable;
-          char payload[4096];
 
 #include <Fonts/FreeSans9pt7b.h>
 #include <Fonts/FreeMono9pt7b.h>
 #include <Fonts/FreeMonoBold9pt7b.h>
 #include <Fonts/FreeSansBold24pt7b.h> 
+#include <Fonts/FreeSans24pt7b.h> 
 
 #include <Fonts/FreeSans12pt7b.h>
 #include <Fonts/FreeMono12pt7b.h>
 #include <Fonts/FreeMonoBold12pt7b.h>
-#include <Fonts/FreeSansBold12pt7b.h>
 #include <Fonts/FreeSansBold9pt7b.h>
 
-//SF2578908
-//PRESSURE AND TEMP SENSOR
-Adafruit_BMP280 bmp; // I2C
 
 // File system instance 
 //extern fs::FS &fs;  // Could be SD, SPIFFS, or LittleFS
@@ -99,30 +99,83 @@ uint64_t dynamic_interval = power_excellent_delay;
 //REALTIME CLOCK
 RTC_DS3231 real_time;
 
-
-char apiKeyValue[20] = "DRYER_006"; //RWEBITABA TOKEN
-char SysID[25] = "Kasese";
-
-char DateTime_str[32] = "24/8/25, 11:52:00";
-
-
-uint8_t batteryPin = 36; //27; // ADC 2 pins cannot work concurrently with WiFi
-
+static const uint16_t SCREEN_W = 400;
+static const uint16_t SCREEN_H = 300;
 
 // base class GxEPD2_GFX can be used to pass references or pointers to the LCD instance as parameter, uses ~1.2k more code
 // enable or disable GxEPD2_GFX base class
 #define ENABLE_GxEPD2_GFX 0
 
 
+//pins
+const uint8_t ota_button  = 12;
+const uint8_t buzzerpin = 14;
+const uint8_t wifi_led = 32; // this
 
-// ESP32 CS(SS)=5,SCL(SCK)=18,SDA(MOSI)=23,
-  uint8_t CS_ = 5,  DC_ = 2, RES_ = 15, BUSY_ = 4;
+const uint8_t batteryPin = 36; //27; // ADC 2 pins cannot work concurrently with WiFi
+const uint8_t wind_speed_pin = 34;
+const uint8_t solar_rad_pin = 35;
+
+const uint8_t blinker = 13;
+const uint8_t innerFAN = 32; // this
+
+/*
+const uint8_t cooling_fan_pin = ;//12; 12 is also taken
+const uint8_t humidity_fan_pin = ;// 14; 14 is taken
+const uint8_t night_Light = //27; // 27 is taken
+*/
 
 
-// 4.2'' EPD Module
+
+
+
+ //HSPI (Second hardware SPI bus)
+//SCK → GPIO 14, MISO → GPIO 12, MOSI → GPIO 13, CS → GPIO 15
+// REMAPPED TO  MOSI:25, CS:4 SCK:26
+
+#define SCREEN_SCK 26
+#define SCREEN_MISO -1 // NOT NEEDED
+#define SCREEN_MOSI 25 
+#define SCREEN_CS 4
+uint8_t  DC_ = 2, RES_ = 33, BUSY_ = 27;
+// 4.2 EPD Module
  //  GxEPD2_BW<GxEPD2_420_GDEY042T81, GxEPD2_420_GDEY042T81::HEIGHT> LCD(GxEPD2_420_GDEY042T81(CS_, DC_, RES_, BUSY_)); // 400x300, SSD1683
-     GxEPD2_3C<GxEPD2_420c_GDEY042Z98, GxEPD2_420c_GDEY042Z98::HEIGHT> LCD(GxEPD2_420c_GDEY042Z98(CS_, DC_, RES_, BUSY_)); // 400x300, SSD1683
+     GxEPD2_3C<GxEPD2_420c_GDEY042Z98, GxEPD2_420c_GDEY042Z98::HEIGHT> LCD(GxEPD2_420c_GDEY042Z98(SCREEN_CS, DC_, RES_, BUSY_)); // 400x300, SSD1683
  
+
+SPIClass EPD_SPI(HSPI);
+
+
+ //VSPI (Default SPI object = SPI)
+//SCK → GPIO 18, MISO → GPIO 19, MOSI → GPIO 23, CS → GPIO 5
+#define SD_SCK 18
+#define SD_MISO 19
+#define SD_MOSI 23
+#define SD_Chip_Select 5 // USES HW VSPI => 5, 18, 19, 23
+
+// connected to ESP32 VSPI CS(SS)=5,SCL(SCK)=18,SDA(MOSI)=23,
+SPIClass SD_SPI(VSPI);  // SD exciplitely uses the default: VSPI
+
+/*
+SD SPI max (stable): 20–25 MHz
+
+Many cards fail above 10–16 MHz Some will mount but fail writes
+
+Pins you should NEVER put SD on
+Avoid for CS / CLK / MISO / MOSI:
+
+GPIO 0
+GPIO 2
+GPIO 12
+GPIO 15
+*/
+
+
+
+
+
+bool json_bound_successfully = false;
+bool csv_bound_successfully = false;
          
 bool wifi_connected = false;
 uint32_t WiFi_Strength = 0;
@@ -130,7 +183,7 @@ char ota_log[150] = "...";
 volatile bool otaFinished = false;
 volatile bool otaStarted = false;
 volatile bool otaError = false;
-
+volatile bool otaProgress = false;
 
 uint16_t attempts = 0;
 uint16_t upload_fails = 0;
@@ -138,48 +191,61 @@ uint16_t upload_fails = 0;
 const uint64_t upload_frequency_ms   = (10ULL * 60ULL * 1000ULL); // 10 minutes
 uint64_t last_upload_time_ms = 0;
 
-char upload_error_code[500] = "";
+char last_upload_time[32] = "Never!";
 
-unsigned long Channel_ID = SECRET_CH_ID; // from credential.h
-const char * WriteAPIKey= SECRET_WRITE_APIKEY; // from credential.h
+char upload_error_code[100] = "";
+
 
 int keyIndex = 0;            // your network key Index number (needed only for WEP)
 WiFiClient  client;
 
 
-uint8_t blinker = 26;
-
-uint8_t buzzerpin = 14;
-uint8_t wifi_led = 32;
-
-uint8_t server_led = 12; // our own server
-
 // Power management pins
-uint8_t sensorsRelay = 25; // Example pin for sensor power control
 
-uint8_t cooling_fan_pin = 26;
-uint8_t humidity_fan_pin = 27;
 
 float cabin_temperature = 0.0f;
-
-uint8_t innerFAN = 33;
-uint8_t night_Light = 27;
 bool innerFan_ON = false;
 bool night_Light_ON = false;
 
-static char internals_log[250] = "NULL"; // nker relocation issue that the ESP32 toolchain sometimes throws when you put large-ish global/static arrays into flash/DRAM in a certain way.
+static char internals_log[255] = "NULL"; // nker relocation issue that the ESP32 toolchain sometimes throws when you put large-ish global/static arrays into flash/DRAM in a certain way.
 
 
-float average_temp = 0.0f; char average_temp_str[10] = "..."; // 35.855
-float average_humi = 0.0f; char average_humi_str[10] = "..."; // 75.695
-float average_press = 0.0, average_elev = 0.0;
+float average_temp = 0.0f; char average_temp_str[10] = "x.x"; // 35.855
+float average_humi = 0.0f; char average_humi_str[10] = "x.x"; // 75.695
+float average_press = 0.0f; 
+float average_elev = 0.0f;
+float new_average_temp = 0.0f;
+
+// readings for up to 10 minutes ago
+float historical_outside_temperatures[10] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+
+float historical_temperature_readings[10] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+float historical_humidity_readings[10] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+float historical_pressure_readings[10] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+char  time_stamps[10][12] = {"--:--", "--:--"}; 
+
+char last_json_save_time[32] = "JSON Never Saved!";
+char last_csv_save_time[32] = "CSV Never Saved!";
+
+char printable_temp_resp[10] = "_";
+char printable_humi_resp[10] = "_";
 
 
-upload Uploader(server_led, server_address);
+float average_wind_speed = 0.0f; char wind_speed_str[10] = ".";
+float average_solar_radiation = 0.0f; char solar_rad_str[10] = ".";
+
+
+upload Uploader(wifi_led, server_address);
 
 //example datapack
-char httpsData[2000] = "{\"PassKey\":\"Rwebi_Weather\", \"Air_Speed\":14.7, \"Air_Temperature\":35.1, \"Air_Humidity\":56.7, \"Sunlight\":1500}";
+//char httpsData[2000] = "{\"PassKey\":\"Rwebi_Weather\", \"Air_Speed\":14.7, \"Air_Temperature\":35.1, \"Air_Humidity\":56.7, \"Sunlight\":1500}";
 
+bool storage_initialized = false;
+float sd_storage_size = 0.0f;
+float freeSpace = 0.0f;
+uint64_t usedSpace = 0;
+
+char storage_size_char[64];
 
 
 
@@ -189,7 +255,6 @@ char ShortDate[24] = "26-08-2025";
 
 
 
-// Your global variables – untouched
 float temp1 = 0.00, temp2 = 0.00, temp_fara = 0.00;
 float heat_index = 0.00;
 float humidity = 0.00;
@@ -206,10 +271,7 @@ char temp_log[320] = "";
 char humi_log[320] = "";
 
 
-char printable_temp_resp[10] = "_";
-char printable_humi_resp[10] = "_";
-
-
+// time series averages
 
 uint8_t active_sensors = 0;
 float temperature_readings[12] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
@@ -223,19 +285,6 @@ float sensor_1_press_readings[30];
 
 uint64_t last_seen[12] = {0, 0, 0, 0, 0, 0};
 
-char sensor_1_last_seen[12] = "HH:MM:SS";
-char sensor_2_last_seen[12] = "HH:MM:SS";
-char sensor_3_last_seen[12] = "HH:MM:SS";
-char sensor_4_last_seen[12] = "HH:MM:SS";
-char sensor_5_last_seen[12] = "HH:MM:SS";
-char sensor_6_last_seen[12] = "HH:MM:SS";
-
-char sensor_7_last_seen[12] = "HH:MM:SS";
-char sensor_8_last_seen[12] = "HH:MM:SS";
-char sensor_9_last_seen[12] = "HH:MM:SS";
-char sensor_10_last_seen[12] = "HH:MM:SS";
-char sensor_11_last_seen[12] = "HH:MM:SS";
-char sensor_12_last_seen[12] = "HH:MM:SS";
 
 
 
@@ -252,36 +301,76 @@ uint8_t no_of_batts = 1; // 1 for 12V, 2 batts for 24V, 4 batts for 48V
 
 char initializer[100] = "Now Booting...";
 bool flipped = false;
-uint8_t currentScreen = 1;
+uint8_t currentScreen = 0; // bootscreen by default
 
 
 uint8_t DISP_MODE = 0;
 
-//BATCH 1
+// DATASET 1
 float sensor_1_temp, sensor_2_temp, sensor_3_temp, sensor_4_temp, sensor_5_temp, sensor_6_temp;
-float sensor_1_humidity, sensor_2_humidity, sensor_3_humidity, sensor_4_humidity, sensor_5_humidity, sensor_6_humidity;
-float sensor_1_pressure, sensor_2_pressure, sensor_3_pressure, sensor_4_pressure, sensor_5_pressure, sensor_6_pressure;
-float sensor_1_elevation, sensor_2_elevation, sensor_3_elevation, sensor_4_elevation, sensor_5_elevation, sensor_6_elevation;
-float sensor_1_h_index, sensor_2_h_index, sensor_3_h_index, sensor_4_h_index, sensor_5_h_index, sensor_6_h_index;
-
-// BATCH 2
 float sensor_7_temp, sensor_8_temp, sensor_9_temp, sensor_10_temp, sensor_11_temp, sensor_12_temp;
+// DATASET 2
+float sensor_1_humidity, sensor_2_humidity, sensor_3_humidity, sensor_4_humidity, sensor_5_humidity, sensor_6_humidity;
 float sensor_7_humidity, sensor_8_humidity, sensor_9_humidity, sensor_10_humidity, sensor_11_humidity, sensor_12_humidity;
+// DATASET 3
+float sensor_1_pressure, sensor_2_pressure, sensor_3_pressure, sensor_4_pressure, sensor_5_pressure, sensor_6_pressure;
 float sensor_7_pressure, sensor_8_pressure, sensor_9_pressure, sensor_10_pressure, sensor_11_pressure, sensor_12_pressure;
+// DATASET 4
+float sensor_1_elevation, sensor_2_elevation, sensor_3_elevation, sensor_4_elevation, sensor_5_elevation, sensor_6_elevation;
 float sensor_7_elevation, sensor_8_elevation, sensor_9_elevation, sensor_10_elevation, sensor_11_elevation, sensor_12_elevation;
+// DATASET 5
 float sensor_7_h_index, sensor_8_h_index, sensor_9_h_index, sensor_10_h_index, sensor_11_h_index, sensor_12_h_index;
+float sensor_1_h_index, sensor_2_h_index, sensor_3_h_index, sensor_4_h_index, sensor_5_h_index, sensor_6_h_index;
+// DATASET 6
+char  sensor_1_transmissions[16]; char  sensor_2_transmissions[16];   char  sensor_3_transmissions[16];   char  sensor_4_transmissions[16]; 
+char  sensor_5_transmissions[16]; char  sensor_6_transmissions[16];   char  sensor_7_transmissions[16];   char   sensor_8_transmissions[16]; 
+char  sensor_9_transmissions[16]; char  sensor_10_transmissions[16];  char  sensor_11_transmissions[16];  char  sensor_12_transmissions[16]; 
+// DATASET 7
+char sensor_1_CPU_freq[12]; char sensor_2_CPU_freq[12]; char sensor_3_CPU_freq[12]; char sensor_4_CPU_freq[12];
+char sensor_5_CPU_freq[12]; char sensor_6_CPU_freq[12]; char sensor_7_CPU_freq[12]; char sensor_8_CPU_freq[12];
+char sensor_9_CPU_freq[12]; char sensor_10_CPU_freq[12]; char sensor_11_CPU_freq[12]; char sensor_12_CPU_freq[12];
+// DATASET 8
+uint64_t sensor_1_running_time_ms, sensor_2_running_time_ms, sensor_3_running_time_ms, sensor_4_running_time_ms;
+uint64_t sensor_5_running_time_ms, sensor_6_running_time_ms, sensor_7_running_time_ms, sensor_8_running_time_ms;
+uint64_t sensor_9_running_time_ms, sensor_10_running_time_ms, sensor_11_running_time_ms, sensor_12_running_time_ms;
+// DATASET 9
+size_t sensor_1_packet_size = 0; size_t sensor_2_packet_size = 0; size_t sensor_3_packet_size = 0; size_t sensor_4_packet_size = 0;
+size_t sensor_5_packet_size = 0; size_t sensor_6_packet_size = 0; size_t sensor_7_packet_size = 0; size_t sensor_8_packet_size = 0;
+size_t sensor_9_packet_size = 0; size_t sensor_10_packet_size = 0; size_t sensor_11_packet_size = 0; size_t sensor_12_packet_size = 0;
+// DATASET 10
+char sensor_1_last_seen[12] = "--:--"; char sensor_2_last_seen[12] = "--:--"; char sensor_3_last_seen[12] = "--:--"; char sensor_4_last_seen[12] = "--:--";
+char sensor_5_last_seen[12] = "--:--"; char sensor_6_last_seen[12] = "--:--"; char sensor_7_last_seen[12] = "--:--"; char sensor_8_last_seen[12] = "--:--";
+char sensor_9_last_seen[12] = "--:--"; char sensor_10_last_seen[12] = "--:--"; char sensor_11_last_seen[12] = "--:--"; char sensor_12_last_seen[12] = "--:--";
 
-char  sensor_1_transmissions[32]; char  sensor_2_transmissions[32];   char  sensor_3_transmissions[32];   char  sensor_4_transmissions[32]; 
-char  sensor_5_transmissions[32]; char  sensor_6_transmissions[32];   char  sensor_7_transmissions[32];   char   sensor_8_transmissions[32]; 
-char  sensor_9_transmissions[32]; char  sensor_10_transmissions[32];  char  sensor_11_transmissions[32];  char  sensor_12_transmissions[32]; 
+                      
 
 //function prototypes
 void read_temperatures();
 void query_rtc();
 void update_display();
-void upload_to_web_of_iot();
-bool save_to_sd_card();
+void Boot();
+void homepage();
+void tablePage();
+void graphPage();
+void filesPage();
+void logsPage();
+void otaPage();
+void errorPage();
+void cloudPage();
+void footer();
 
+bool special_call = false;
+
+void upload_to_web_of_iot();
+bool initialize_sd_card(); //USES HSPI HARDWARE SERIAL
+
+bool save_csv_to_sd_card();
+bool save_json_to_sd_card();
+
+bool sd_initialized = false;
+char save_log[512] = "No JSON Saved!";
+char json_save_log[512] = "Not Saved!";
+char csv_save_log[512] = "not Saved!";
 
 char dataPack[250] = ""; // receivable
 void extract_readings();
@@ -325,18 +414,26 @@ bool humi_fan_on = false; uint32_t humi_fans_duration = 0;
 char humi_fans_start_time_str[12];  char humi_fan_stop_time_str[] = "hh:mm:ss"; char humi_fan_duration[12] = "";
 char cooling_fans_start_time_str[12];     char cooling_fan_stop_time_str[] = "HH:MM:SS"; char cooling_fan_duration[12] = "";
 
+uint8_t side_scroll = 1; // default = 1
+
 
 uint64_t humi_fans_started = 0, cooling_fans_started = 0;
 
 uint64_t now_now_ms = 0, prev = 0, last_read_time_ms = 0, last_refresh_time_ms = 0; // for DUE, millis() times out at [4.9Bn] 4,294,967.295 seconds which is 49.7 days
+uint64_t otaStartTime = 0; 
+const uint64_t OTA_TIMEOUT = 15ULL * 60ULL * 1000ULL;  // 15 minutes
+char LastOTAUpdate[60] = "27 Oct 2025 10:10";
+//char LastOTAUpdate[60] = "27 Oct 2025 10:10";
+
 uint8_t save_counter = 0;
+volatile bool packet_received = false;
 
-float solar_radiation = 0.0f;
-float wind_speed = 0.0f;
+char sendable_to_cloud_db[3000] = ""; 
+char sendable_to_sd_card[4000] = ""; // JSON ~3kiB
+char sendable_to_sd_card_csv[3000] = "";
+char storage_status_log[512] = "NO SD";
 
-char sendabe_to_cloud_db[2048] = "";
-char sendable_to_sd_card[4000] = "";
-
+#fedine PWRKEY 0
 
 void setup() { delay(50); // for OTA to fully hand over
        Serial.begin(115200); Serial.print(devicename); Serial.println(" Booting..."); // while (!Serial) delay(100);   // wait for native usb
@@ -348,17 +445,45 @@ void setup() { delay(50); // for OTA to fully hand over
   
         pinMode(blinker, OUTPUT); digitalWrite(blinker, HIGH); delay(500); buzzer.beep(1,50,0);
 
-//        Serial2.begin(4800, SERIAL_8N1, 16, 17); delay(500);
+     //   pinMode(SCREEN_CS, OUTPUT); digitalWrite(SCREEN_CS, HIGH);
+     //   pinMode(SD_Chip_Select, OUTPUT); digitalWrite(SD_Chip_Select, HIGH);
+
   //      Serial2.setTimeout(500); delay(500); // read for 500ms
           Serial2.begin(115200, SERIAL_8N1, 16, 17); //the GSM MOD
 
+         // Ensure both CS pins are HIGH
+          pinMode(SCREEN_CS, OUTPUT);
+          digitalWrite(SCREEN_CS, HIGH);
+          pinMode(SD_Chip_Select, OUTPUT);
+          digitalWrite(SD_Chip_Select, HIGH);
+          delay(100);
 
-        strcpy(initializer, "Initalizing Temperature and Humidity System..."); Serial.println(initializer); 
+        sd_initialized = initialize_sd_card(); //USES HSPI HARDWARE SERIAL
 
-        LCD.init(115200,true,50,false);  
-        strncpy(initializer, "Initializing display!", sizeof(initializer));  Serial.println(initializer);
 
-        Boot();  LCD.hibernate();  
+        if (sd_initialized) {
+            check_storage_files();
+        }
+        delay(1000);
+
+        // --- Initialize EPD on VSPI ---
+        strcpy(initializer, "Initializing E-Paper Display over VSPI...");
+        Serial.println(initializer);
+
+
+        EPD_SPI.begin(SCREEN_SCK, SCREEN_MISO, SCREEN_MOSI, SCREEN_CS); // CUSTOM SPI PINS
+        LCD.epd2.selectSPI(EPD_SPI, SPISettings(4000000, MSBFIRST, SPI_MODE0));
+        
+        LCD.init(115200, true, 50, false);  
+
+        strncpy(initializer, "Initialied display!", sizeof(initializer));  Serial.println(initializer);
+         special_call = true; // to bypass the timer
+         currentScreen = 0;
+         update_display();
+         // currentScreen = 2;
+         delay(1000);
+        
+          
 
     /*
         Perform the read operation: Use a function that respects the timeout, such as readBytes(), readString(), or parseInt(). 
@@ -366,15 +491,12 @@ void setup() { delay(50); // for OTA to fully hand over
         (e.g., 0 for readBytes(), an empty string for readString(), or 0 for parseInt() if no valid number is found).
     */
 
-    initialize_sd_card();
 
     digitalWrite(blinker, HIGH); delay(500);
     digitalWrite(blinker, LOW); delay(500);
 
 
-    pinMode(server_led, OUTPUT); digitalWrite(server_led, HIGH);
 
-   //initiate_bmp280();    // dht.begin(); Serial.println(F("DHT initiated!"));
       pinMode(batteryPin, INPUT);
 
     pinMode(innerFAN, OUTPUT); digitalWrite(innerFAN, LOW); 
@@ -386,55 +508,7 @@ void setup() { delay(50); // for OTA to fully hand over
     query_rtc(); delay(100);
 
 
-    for(int i = 0; i < 3; i++){
-        digitalWrite(innerFAN, HIGH);
-        digitalWrite(night_Light, LOW);
-        buzzer.beep(1,50,0);
-        delay(2000);
 
-        digitalWrite(innerFAN, LOW);
-        digitalWrite(night_Light, HIGH);
-        buzzer.beep(1,50,0);
-        delay(2000);
-    }
-
-    monitor_box_conditions(); // based on RTC: time n temp
-
-          // digitalWrite(innerFAN, LOW); // should be controlled by the contents of the box
-         //  digitalWrite(night_Light, LOW);
-
-
-    digitalWrite(blinker, HIGH); delay(500);
-    digitalWrite(blinker, LOW); delay(500);
-
-      
-     // pinMode(batteryPin, INPUT); delay(500); // If batteryPin is GPIO34/35/36/39, they MUST NOT use pinMode() at all
-    MonitorBattery();
-
-    digitalWrite(blinker, HIGH); delay(500);;
-    digitalWrite(blinker, LOW); delay(500);
- 
-      
-      pinMode(cooling_fan_pin, OUTPUT);
-      pinMode(humidity_fan_pin, OUTPUT);
-
-
-
-  
-       
-         digitalWrite(server_led, LOW);
-
-
-         digitalWrite(blinker, HIGH); delay(1000);
-         digitalWrite(blinker, LOW);
-
-
-
-      
- 
-  
-         digitalWrite(blinker, HIGH); delay(1000);
-         digitalWrite(blinker, LOW);
 
         // WiFi.begin();
   
@@ -455,6 +529,7 @@ void setup() { delay(50); // for OTA to fully hand over
           if(result == ESP_OK) Serial.println("Call Back of Call Back successfully set!"); 
       }
 
+        delay(1000);
 
        /*
        switch_radio_to_wifi();
@@ -467,23 +542,77 @@ void setup() { delay(50); // for OTA to fully hand over
         // Uploader.begin(); // leave it because it uses WiFi
         
 
-       digitalWrite(blinker, HIGH); delay(1000);
-       digitalWrite(blinker, LOW);
-  
+        digitalWrite(blinker, HIGH); delay(1000);
+        digitalWrite(blinker, LOW);
 
-               homepage(); delay(1000);
-
+        
     // Initialize timers AFTER hardware is ready
       last_read_time_ms = esp_timer_get_time() / 1000ULL;
       last_refresh_time_ms = esp_timer_get_time() / 1000ULL;
       last_upload_time_ms = esp_timer_get_time() / 1000ULL;
+      Serial.println("Schedulers and Timers Set");
+      delay(1000);
 
+        Serial.println("Starting Reads");
+           // pinMode(batteryPin, INPUT); delay(500); // If batteryPin is GPIO34/35/36/39, they MUST NOT use pinMode() at all
+        MonitorBattery();
+
+
+       for(int i = 0; i < 1; i++){
+        digitalWrite(innerFAN, HIGH);
+        digitalWrite(night_Light, LOW);
+       // buzzer.beep(1,50,0);
+        delay(500);
+
+        digitalWrite(innerFAN, LOW);
+        digitalWrite(night_Light, HIGH);
+        buzzer.beep(1,50,0);
+        delay(500);
+
+                
+    }
+        uint16_t poll = 0;
+        while(poll<2000){ // keep a bit here for 2 seconds
+            delay(1); poll++;
+            if(packet_received) { buzzer.beep(1,50,0);  extract_readings(); packet_received = false; }
+        }
+
+        monitor_box_conditions();
+
+        monitor_dryer_readings(); 
+
+           update_display(); // HOME SCREEN 
+               delay(1000);
+            special_call = false;
+        Serial.println("Screen set to home page");
+
+          // IF THIS SYSTEM IS EVER TO HAVE FANS
+      
+  //    pinMode(cooling_fan_pin, OUTPUT);
+   //   pinMode(humidity_fan_pin, OUTPUT);
+
+        pinMode(ota_button, INPUT_PULLUP);
+
+        powerOnSIM();
+        
          buzzer.beep(2,50,50);  // END OF BOOT
          Serial.println("Done Booting!");
     
 
 }
 
+
+void powerOnSIM() {
+  pinMode(PWRKEY, OUTPUT);
+
+  digitalWrite(PWRKEY, HIGH);
+  delay(100);
+
+  digitalWrite(PWRKEY, LOW);   // Pull LOW
+  delay(1500);                 // Hold 1–2 seconds
+  digitalWrite(PWRKEY, HIGH);  // Release
+  delay(5000);                 // Wait for boot
+}
 
 void BuzzingTask(void * pvParams) { 
   uint8_t checkin_frequency = 10; 
@@ -494,279 +623,971 @@ void BuzzingTask(void * pvParams) {
   }
 }
 
-uint8_t SD_Chip_Select = 5;
 
-void initialize_sd_card(){
-      if(!SD.begin(SD_Chip_Select)){
-        Serial.println("Card Mount Failed");
-        return;
-      }
-      uint8_t cardType = SD.cardType();
-
-      if(cardType == CARD_NONE){
-        Serial.println("No SD card attached");
-        return;
-      }
-
-      Serial.print("SD Card Type: ");
-      if(cardType == CARD_MMC){
-        Serial.println("MMC");
-      } else if(cardType == CARD_SD){
-        Serial.println("SDSC");
-      } else if(cardType == CARD_SDHC){
-        Serial.println("SDHC");
-      } else {
-        Serial.println("UNKNOWN");
-      }
-
-      uint64_t cardSize = SD.cardSize() / (1024 * 1024);
-      Serial.printf("SD Card Size: %lluMB\n", cardSize);
-
-}
-
-bool unset = false;
-
-const uint64_t refresh_rate = (5ULL*60ULL*1000ULL); // refreshing readings or entire screen once 180 seconds
-const uint64_t read_duration = 5;// how long it pauses before taking another reading
-const uint64_t upload_fequency = (10ULL*60ULL*1000ULL); // every 10 minutes
-bool posted = false, uploaded = false;
-
-
-uint64_t read_frequency = 30ULL * 1000ULL; // 30 seconds if power is good, 60 seconds when not
-
-bool fans_are_togglable = false;
-bool logged = false;
-
-uint8_t side_scroll = 1; // default = 1
-uint32_t loop_count = 0;
-
-volatile bool packet_received = false;
-
-void loop() {
-    now_now_ms = esp_timer_get_time() / 1000ULL; // us to ms
-
-    if(otaStarted)  flash(now_now_ms, blinker, 50, 50, 0, 0); // uploading
-    else flash(now_now_ms, blinker, 50, 75, 50, 1500); // normal
-
-    if(packet_received) { buzzer.beep(1,50,0);  extract_readings(); packet_received = false; }
-    
-    // Sensor readings
-    if ((now_now_ms - last_read_time_ms) >= read_frequency) { // 60 seconds if power is good for 24 hours:: 1,440 saved packets/day
-        last_read_time_ms = now_now_ms;  // Update FIRST to prevent race conditions
-          
-          
-          query_rtc();
-          MonitorBattery(); // battery voltage
-          
-          monitor_box_conditions(); // internal temp and fan state
-          monitor_dryer_readings(); 
-          monitor_fans(now_now_ms);
-          
-
-          bind_datasets_into_json();
-
-          logged = save_to_sd_card();
-        
-          Serial.printf("\nLoopCount:%lu\nUptime: %llu, Reading complete! Power mode: %d, Voltage: %.1fV\n",     loop_count, last_read_time_ms/1000, current_power, voltage);
-    }
-    
-
-    // Display update (less frequent)
-    if ((now_now_ms - last_refresh_time_ms) >= refresh_rate) { // 5ULL minutes when day & power is excellent...or...// 15 mins // 30 mins when past midnight and before 6am
-          
-          if(side_scroll > 3) side_scroll = 1;
-          else side_scroll++;
-
-          update_display();
-
-        last_refresh_time_ms = now_now_ms;                  
-    }
-
-    if((now_now_ms - last_upload_time_ms) > upload_frequency_ms){ // either every 10mins or at the tenth minute
-      if(can_send){
-        last_upload_time_ms = now_now_ms;
-       // UploadStatus st Uploader.upload_to_web_of_iot(sendabe_to_cloud_db);
-    //    Serial.printf("[Upload Task] upload status=%d; report=%s\n", (int)st, Uploader.get_upload_report());
-         snprintf(upload_error_code, sizeof(upload_error_code), 
-                        "Uploaded at %s on %s", ShortTime_am_pm, SystemDate);
-        LOG(upload_error_code);
-        can_send = false;
-
-        data_sent = true;
-       
-
-      }
-    }
-
-  /*
-    // OTA handling (only in excellent power mode)
-    if (wifi_connected) { // && current_power == POWER_LOW
-        ArduinoOTA.handle();
-    }
-
-    // Data upload
- // WiFi & OTA handling for excellent power mode
-    if (current_power == POWER_LOW || current_power == POWER_MODERATE || current_power == POWER_EXCELLENT) {
-        // Check/ensure WiFi periodically for OTA
-        static uint64_t last_wifi_check = 0;
-          if ((now_now_ms - last_wifi_check) >= 10000) { // Check every 10 seconds
-              wifi_connected = wifi_obj.ensure_wifi();
-              last_wifi_check = now_now_ms;
-          }
-     
-    }
-
-    // Data upload (only check WiFi here if not already connected from OTA section)
-    if (can_send) {
-        // If we're in excellent power mode but WiFi check hasn't run recently
-        if (current_power == POWER_EXCELLENT && !wifi_connected) {
-            wifi_connected = wifi_obj.ensure_wifi();
-        }
-        
-        if (wifi_connected) {
-                Serial.println("Uploading data...");
-                bool upload_success = post_to_thingsPeak();
-                delay(500);
-            
-            
-                prepare_JSON_file();
-                delay(500);
-               // upload_to_web_of_iot();
-               UploadStatus st = Uploader.upload_to_web_of_iot(httpsData);
-               Serial.printf("[Upload Task] upload status=%d; report=%s\n", (int)st, Uploader.get_upload_report());
-
-                
-                snprintf(upload_log, sizeof(upload_log), 
-                        "Uploaded at %s on %s", ShortTime_am_pm, SystemDate);
-           // } else {      strncpy(upload_log, "Upload failed", sizeof(upload_log)); }
-            
-            data_sent = true;
-        } else {
-            Serial.println("WiFi not available for upload");
-        }
-        
-        can_send = false;
-    }
-
- /*
-    // Enter sleep based on power state
-    if (current_power != POWER_EXCELLENT) {
-        sleep_dynamically();
-    } else {
-        // For excellent power, use delay instead of sleep
-        delay(1000); // Short delay to prevent tight loop
-    }
-  */
-    delay(2); // make the loop less tight
-        loop_count++;
-
-}
-/// loop()
-
-char save_log[300];
 
 static char *csv_file = "/data.csv";
-static char current_json_file[128] = "/data.json";
-
 char new_name[64];
+static char json_log_file[64] = "/data.json"; // primary storage file
+static char csv_log_file[64] = "/data.csv"; // secondary storage file
 
-static char json_file[64] = "/data.json"; // each data packet weighs ~2kB ... Should update this when rotating
-static const size_t MAX_FILE_SIZE = 20 * 1024 * 1024; // 20 MB per file [stores only weekly data | 20.16MB]
-static const size_t MAX_TOTAL_SIZE = 100 * 1024 * 1024;    // 100 MB total limit
-
-bool   save_to_sd_card(){
-  /*
-  *  OPEN FILE
-  *  CHECK ITS SIZE: IF < ESP FILE SYSTEM: APPEND TO IT
-  *  IF SIZE IS BIGGER, CREATE ANOTHER FILE (TIMESTAMPED) e.g. data_15_Jan_2026.json
-  *  SAVE TO THAT NEW FILE
-  *  WHEN NEED BE, SHARE THE FULL FILE  CONTENTS OVER SCREEN OR BT OR WIFI ...
-
-  */
+static const size_t MAX_FILE_SIZE = 20 * 1024 * 1024; // 20 MB per file
+static const size_t MAX_TOTAL_SIZE = 100 * 1024 * 1024; // 100 MB total limit
 
 
- if (!sendable_to_sd_card || strlen(sendable_to_sd_card) == 0) {
-        LOG("[SD] Nothing to write");
+bool initialize_sd_card() { // “Is the SD card hardware usable?”
+    LOG("-------- INITIALIZING ONSITE STORAGE ------------------");
+
+    bool status = false;
+
+    memset(storage_status_log, 0, sizeof(storage_status_log));
+    strncpy(storage_status_log, "SD: ", sizeof(storage_status_log));
+
+    // --- Initialize VSPI for SD ---
+    /*
+    SD_SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_Chip_Select);
+
+    storage_initialized = SD.begin(SD_Chip_Select, SD_SPI, 4000000);
+    */
+    storage_initialized = SD.begin(SD_Chip_Select);
+
+    if (!storage_initialized) {
+        snprintf(storage_status_log, sizeof(storage_status_log),
+                 "SD CARD failed to initialize. Check wiring/power.");
+        LOG(storage_status_log);
         return false;
     }
 
-    // --- Open or create file ---
-    File file = SD.open(json_file, FILE_APPEND);
+    uint8_t cardType = SD.cardType();
 
-    if (!file) {
-        LOG("[SD] Failed to open file for appending");
+    if (cardType == CARD_NONE) {
+        snprintf(storage_status_log, sizeof(storage_status_log),
+                 "NO SD CARD detected");
+        storage_initialized = false;
+        LOG(storage_status_log);
         return false;
     }
 
-    // --- Size check ---
-    size_t currentSize = file.size();
-    size_t incomingSize = strlen(sendable_to_sd_card);
-
-    if ((currentSize + incomingSize) > MAX_FILE_SIZE) {
-        file.close();
-        file = create_another_file();
-
-        if (!file) {
-            LOG("[SD] File rotation failed");
-            return false;
-        }
-        currentSize = 0; // new file
-    }
-
-
-    // --- Append JSON to either the old file or the new file  ---
-    bool saved = file.println(sendable_to_sd_card); // newline-delimited JSON
-    file.close();
-
-    if (!saved) {
-        Serial.println("[SD] Write failed");
+    uint64_t cardSize = SD.cardSize();
+    if (cardSize == 0) {
+        strncat(storage_status_log, "Size: Unknown",
+                sizeof(storage_status_log) - strlen(storage_status_log) - 1);
+        storage_initialized = false;
+        LOG(storage_status_log);
         return false;
     }
 
+    sd_storage_size = float(cardSize / (1024.0 * 1024.0));
+    sd_storage_size /= 1000.0;
 
-    snprintf(
-        save_log,
-        sizeof(save_log),
-        "[SD] Appended %lu bytes (file size now %lu bytes)",
-        (unsigned long)incomingSize,
-        (unsigned long)(currentSize + incomingSize)
-    );
+    snprintf(storage_size_char, sizeof(storage_size_char),
+             "%.2fGB", sd_storage_size);
 
- LOG(save_log);
+    strncat(storage_status_log, storage_size_char,
+            sizeof(storage_status_log) - strlen(storage_status_log) - 1);
 
+    LOG(storage_status_log);
 
-    return true;
-
+    status = true;
+    return status;
 }
 
 
+bool check_storage_files() {
+
+    if (!storage_initialized) {
+         strncat(storage_status_log, " SD: Init Error. Will retry later",
+                sizeof(storage_status_log) - strlen(storage_status_log) - 1);
+        return false;
+    }
+
+    bool status = false;
+        /*
+                usedSpace = (SD.usedBytes()) / (1024 * 1024);
+                //usedSpace /= 1000.0;
+                freeSpace = (sd_storage_size*1000) - (float)(usedSpace);
+                freeSpace /= 1000.0;
+        */
+
+        uint64_t totalBytes = SD.totalBytes();
+        uint64_t usedBytes  = SD.usedBytes();
+
+        float usedMB = usedBytes / 1048576.0;      // avoids intermediate rounding of  1024*1024
+        float freeMB = (totalBytes - usedBytes) / (1024.0 * 1024.0);
+
+        float freeGB = freeMB / 1024.0; // using binary units ... 1073741824.0 from 1024*1024*1024
+
+   
+
+    snprintf(storage_status_log + strlen(storage_status_log),
+             sizeof(storage_status_log) - strlen(storage_status_log),
+             ", Used: %.2fMB, Free: %.2fGB", usedMB, freeGB);
+
+    // Check/create JSON log file
+    if (!SD.exists(json_log_file)) {
+
+        strncat(storage_status_log, " | Creating new log file",
+                sizeof(storage_status_log) - strlen(storage_status_log) - 1);
+
+        File f = SD.open(json_log_file, FILE_WRITE);
+        if (!f) {
+            strncat(storage_status_log, " | FAILED to create file",
+                    sizeof(storage_status_log) - strlen(storage_status_log) - 1);
+            return false;
+        }
+        f.close();
+    }
+
+    File f = SD.open(json_log_file, FILE_READ);
+    if (!f) {
+        strncat(storage_status_log, " | Cannot open file for size check",
+                sizeof(storage_status_log) - strlen(storage_status_log) - 1);
+        return false;
+    }
+
+    size_t json_currentSize = f.size();
+
+    f.close();
+
+    
+    File f2 = SD.open(csv_log_file, FILE_READ);
+    if (!f2) {
+        strncat(storage_status_log, " | Cannot open file for size check",
+                sizeof(storage_status_log) - strlen(storage_status_log) - 1);
+        return false;
+    }
+
+    size_t csv_currentSize = f2.size();
+
+    f2.close();
+
+    if (json_currentSize <= MAX_FILE_SIZE) { // at most 20MB 
+
+            float size_of_json_file = ((float)(json_currentSize))/1048576.0; // // 1024*1024
+            float size_of_csv_file = ((float)(csv_currentSize))/1048576.0; // 1024*1024
+
+        snprintf(storage_status_log + strlen(storage_status_log),
+                 sizeof(storage_status_log) - strlen(storage_status_log), 
+                 ", JSON: %.2f MB, CSV: %.2fMB", size_of_json_file, size_of_csv_file);
+
+        status = true;
+   
+    } else {
+        
+        strncat(storage_status_log, " | File needs rotation",
+                sizeof(storage_status_log) - strlen(storage_status_log) - 1);
+
+        uint64_t totalUsed = SD.usedBytes();
+
+        if (totalUsed > MAX_TOTAL_SIZE) {
+
+            strncat(storage_status_log, " | TOTAL STORAGE LIMIT REACHED",
+                    sizeof(storage_status_log) - strlen(storage_status_log) - 1);
+
+            return false;
+        }
+
+        File newFile = create_another_file();
+
+        if (newFile) {
+            strncat(storage_status_log, " | File rotated",
+                    sizeof(storage_status_log) - strlen(storage_status_log) - 1);
+            newFile.close();
+            status = true;
+        } else {
+            strncat(storage_status_log, " | Rotation FAILED",
+                    sizeof(storage_status_log) - strlen(storage_status_log) - 1);
+        }
+
+            }
+
+    LOG(storage_status_log);
+    return status;
+}
+
 File create_another_file() {
-
-    snprintf(
-        new_name, sizeof(new_name),
-        "/data_%s_%s.json",
-        ShortDate, ShortTime
-    );
-
-    // Replace ':' for FAT compatibility
-    for (char *p = new_name; *p; p++) {
-        if (*p == ':') *p = '-';
+    // Make sure ShortDate and ShortTime are defined and valid
+    if (strlen(ShortDate) == 0 || strlen(ShortTime) == 0) {
+        // Use timestamp as fallback
+        snprintf(new_name, sizeof(new_name), "/data_%lu.json", millis());
+    } else {
+        snprintf(new_name, sizeof(new_name), "/data_%s_%s.json", 
+                 ShortDate, ShortTime);
+        
+        // Replace invalid characters for FAT compatibility
+        for (char *p = new_name; *p; p++) {
+            if (*p == ':' || *p == '/' || *p == '\\' || *p == '*' || 
+                *p == '?' || *p == '"' || *p == '<' || *p == '>' || *p == '|') {
+                *p = '-';
+            }
+        }
     }
-    char new_name_log[500];
-    snprintf(new_name_log, sizeof(new_name_log), "[SD] Rotating file → %s", new_name);
+    
+    // Log the rotation
+    char new_name_log[100];
+    snprintf(new_name_log, sizeof(new_name_log), 
+             "[SD] Rotating to: %s", new_name);
     LOG(new_name_log);
-
-    strncpy(json_file, new_name, sizeof(json_file));
-    json_file[sizeof(json_file) - 1] = '\0';
-    // or // snprintf(json_file, sizeof(json_file), "%s", new_name);
-
-
-    File newFile = SD.open(new_name, FILE_APPEND);
+    
+    // Update global filename
+    strncpy(json_log_file, new_name, sizeof(json_log_file) - 1);
+    json_log_file[sizeof(json_log_file) - 1] = '\0';
+    
+    // Create new file and write metadata
+    File newFile = SD.open(new_name, FILE_WRITE);
     if (!newFile) {
-        LOG("[SD] Failed to create rotated file");
+        LOG("[SD] ERROR: Failed to create rotated file");
+        // Fallback to original filename
+        strncpy(json_log_file, "/data.json", sizeof(json_log_file) - 1);
+        json_log_file[sizeof(json_log_file) - 1] = '\0';
+        newFile = SD.open(json_log_file, FILE_APPEND);
+    } else {
+        // Write initial metadata to the new file
+        write_json_metadata(newFile);
+    }
+    
+    return newFile;
+}
+
+
+
+bool save_json_to_sd_card() { // save json hierarchical data
+    // Clear the log message
+    memset(json_save_log, 0, sizeof(json_save_log));
+    
+    /*
+    * 1. Ensure SD card is initialized (with retry logic)
+    * 2. Validate input data
+    * 3. Check file size before writing
+    * 4. Rotate if needed
+    * 5. Write data with error handling and timeout protection
+    * 6. Verify write operation
+    * 7. Handle write interruptions
+    */
+
+    // --- Step 1: Ensure SD card is initialized ---
+    if (!storage_initialized) {
+        snprintf(json_save_log, sizeof(json_save_log), 
+                 "[SD] Storage not initialized, attempting recovery...");
+        LOG(json_save_log);
+        
+        // Exponential backoff retry (1s, 2s, 4s)
+        for (int i = 0; i < 3; i++) {
+            initialize_sd_card();
+            delay(1000 * (1 << i)); // Exponential backoff: 1s, 2s, 4s
+            
+            if (storage_initialized) {
+                snprintf(json_save_log, sizeof(json_save_log), 
+                         "[SD] Recovered after %d attempts", i + 1);
+                LOG(json_save_log);
+                break;
+            }
+        }
+        
+        if (!storage_initialized) {
+            snprintf(json_save_log, sizeof(json_save_log), 
+                     "[SD] Failed to initialize after retries");
+            LOG(json_save_log);
+            log_dummy_data();
+            return false;
+        }
     }
 
-    return newFile;
+    // --- Step 2: Validate input data ---
+    if (!sendable_to_sd_card || strlen(sendable_to_sd_card) == 0) {
+        snprintf(json_save_log, sizeof(json_save_log), 
+                 "[SD] Nothing to write (empty or null data)");
+        LOG(json_save_log);
+        log_dummy_data();
+        return false;
+    }
+
+    // --- Step 3: Validate filename ---
+    if (strlen(json_log_file) == 0) {
+        snprintf(json_save_log, sizeof(json_save_log), 
+                 "[SD] ERROR: Empty filename, resetting to default");
+        LOG(json_save_log);
+        strncpy(json_log_file, "/data.json", sizeof(json_log_file) - 1);
+        json_log_file[sizeof(json_log_file) - 1] = '\0';
+    }
+
+    // Debug output (with timeout protection)
+    #ifdef DEBUG_SERIAL
+    Serial.printf("[SD] File path: '%s'\n", json_log_file);
+    #endif
+
+    // --- Step 4: Ensure file exists ---
+    if (!SD.exists(json_log_file)) {
+        snprintf(json_save_log, sizeof(json_save_log), 
+                 "[SD] File '%s' does not exist. Creating...", json_log_file);
+        LOG(json_save_log);
+        
+        File f = SD.open(json_log_file, FILE_WRITE);
+        if (!f) {
+            snprintf(json_save_log, sizeof(json_save_log), 
+                     "[SD] Failed to create file '%s'", json_log_file);
+            LOG(json_save_log);
+            return false;
+        }
+        f.close();
+        snprintf(json_save_log + strlen(json_save_log), 
+                 sizeof(json_save_log) - strlen(json_save_log),
+                 " (created)");
+    }
+
+    // --- Step 5: Check file size BEFORE opening for append ---
+    // This prevents opening a file that's already too large
+    File sizeCheckFile = SD.open(json_log_file, FILE_READ);
+    size_t currentSize = 0;
+    
+    if (sizeCheckFile) {
+        currentSize = sizeCheckFile.size();
+        sizeCheckFile.close();
+        
+        // Check total storage usage as well
+        uint64_t totalUsed = SD.usedBytes();
+        if (totalUsed > MAX_TOTAL_SIZE) {
+            snprintf(json_save_log, sizeof(json_save_log), 
+                     "[SD] CRITICAL: Total storage limit reached (%lluMB/%lluMB). "
+                     "Consider implementing cleanup.", 
+                     totalUsed / (1024 * 1024), 
+                     MAX_TOTAL_SIZE / (1024 * 1024));
+            LOG(json_save_log);
+            // You might want to trigger cleanup or stop saving here
+        }
+    } else {
+        snprintf(json_save_log, sizeof(json_save_log), 
+                 "[SD] WARNING: Cannot check size of '%s'", json_log_file);
+        LOG(json_save_log);
+    }
+
+    // --- Step 6: Check if rotation is needed ---
+    size_t incomingSize = strlen(sendable_to_sd_card);
+    bool needsRotation = false;
+    
+    if (currentSize > MAX_FILE_SIZE) {
+        // File is already too big
+        needsRotation = true;
+        snprintf(json_save_log + strlen(json_save_log), 
+                 sizeof(json_save_log) - strlen(json_save_log),
+                 " [Rotation: current size %lu > max %lu]", 
+                 (unsigned long)currentSize, 
+                 (unsigned long)MAX_FILE_SIZE);
+    } else if ((currentSize + incomingSize) > MAX_FILE_SIZE) {
+        // File will be too big after this write
+        needsRotation = true;
+        snprintf(json_save_log + strlen(json_save_log), 
+                 sizeof(json_save_log) - strlen(json_save_log),
+                 " [Rotation: current %lu + incoming %lu > max %lu]", 
+                 (unsigned long)currentSize, 
+                 (unsigned long)incomingSize, 
+                 (unsigned long)MAX_FILE_SIZE);
+    }
+
+    // --- Step 7: Handle rotation if needed ---
+    File file;
+    if (needsRotation) {
+        LOG(json_save_log); // Log rotation reason
+        
+        file = create_another_file();
+        if (!file) {
+            snprintf(json_save_log, sizeof(json_save_log), 
+                     "[SD] CRITICAL: File rotation failed, using original");
+            LOG(json_save_log);
+            // Fallback to original file
+            file = SD.open(json_log_file, FILE_APPEND);
+            if (!file) {
+                snprintf(json_save_log, sizeof(json_save_log), 
+                         "[SD] FATAL: Cannot open any file for writing");
+                LOG(json_save_log);
+                return false;
+            }
+        } else {
+            currentSize = 0; // New file starts at 0
+        }
+    } else {
+        // Open existing file for append
+        file = SD.open(json_log_file, FILE_APPEND);
+    }
+
+    if (!file) {
+        snprintf(json_save_log, sizeof(json_save_log), 
+                 "[SD] Failed to open '%s' for appending", json_log_file);
+        LOG(json_save_log);
+        return false;
+    }
+    
+
+    // --- Step 8: Write data with timeout and interruption protection ---
+    size_t bytesWritten = 0;
+    bool writeSuccess = false;
+    
+    // Set up write timeout (critical for RTOS task)
+    const uint32_t WRITE_TIMEOUT_MS = 10000UL; // 5 second timeout for writes
+    uint32_t writeStartTime = millis();
+    bool timeoutOccurred = false;
+    
+    // Write with timeout protection
+  //  bytesWritten = file.print(sendable_to_sd_card);
+
+    // With:
+    bool saved = file.print(sendable_to_sd_card); // Write only dynamic data
+    //file.print(",\n"); // array elements are comma delimited
+     snprintf(last_json_save_time, sizeof(last_json_save_time), "%s", SystemTime);
+
+    
+    // Check for timeout during write
+    if ((millis() - writeStartTime) > WRITE_TIMEOUT_MS) {
+        timeoutOccurred = true;
+        snprintf(json_save_log, sizeof(json_save_log),
+                 "[SD] TIMEOUT: Write took >%lums (hung at %lu bytes)", 
+                 WRITE_TIMEOUT_MS, (unsigned long)bytesWritten);
+        LOG(json_save_log);
+        
+        // Emergency cleanup
+        file.close();
+        snprintf(last_json_save_time, sizeof(last_json_save_time), "%s", SystemTime);
+
+        storage_initialized = false; // Force reinitialization
+        
+        // Optional: Mark file as potentially corrupted
+        char corruptedName[70];
+        snprintf(corruptedName, sizeof(corruptedName), "%s_CORRUPTED", json_log_file);
+        SD.rename(json_log_file, corruptedName);
+        
+        log_dummy_data();
+        return false;
+    }
+    
+    // Write separator with timeout check
+    if (bytesWritten > 0 && !timeoutOccurred) {
+        size_t separatorWritten = file.print(",\n");
+        bytesWritten += separatorWritten;
+        
+        // Check for interruption/write corruption
+        if (separatorWritten != 2) { // ",\n" should be exactly 2 bytes
+            snprintf(json_save_log, sizeof(json_save_log),
+                     "[SD] WRITE CORRUPTION: Separator write incomplete (%lu/2 bytes)",
+                     (unsigned long)separatorWritten);
+            LOG(json_save_log);
+            
+            // Try to flush and close gracefully
+            file.flush();
+            file.close();
+            
+            /*
+            // Verify file still exists
+            if (!SD.exists(json_log_file)) {
+                storage_initialized = false;
+            }
+            
+            log_dummy_data();
+            */
+            return false;
+        }
+        
+        writeSuccess = (bytesWritten >= incomingSize);
+    }
+    
+    // --- Step 9: Flush with timeout protection ---
+    if (!timeoutOccurred) {
+        uint32_t flushStartTime = millis();
+        file.flush();
+        
+        if ((millis() - flushStartTime) > 1000) { // 1 second flush timeout
+            snprintf(json_save_log, sizeof(json_save_log),
+                     "[SD] WARNING: Flush took %lums (potential card issue)",
+                     (millis() - flushStartTime));
+            LOG(json_save_log);
+        }
+    }
+    
+    // Always close the file
+    file.close();
+
+    // --- Step 10: Verify write operation with interruption recovery ---
+    if (!writeSuccess || bytesWritten == 0 || timeoutOccurred) {
+        if (!timeoutOccurred) {
+            snprintf(json_save_log, sizeof(save_log), 
+                     "[SD] Write FAILED\n\r Expected %lu bytes, wrote %lu bytes", 
+                     (unsigned long)incomingSize, 
+                     (unsigned long)bytesWritten);
+            LOG(json_save_log);
+        }
+        
+        // Check SD card health on write failure
+        if (!SD.exists(json_log_file)) {
+            snprintf(json_save_log + strlen(json_save_log), 
+                     sizeof(json_save_log) - strlen(json_save_log),
+                     " (file missing!)");
+            storage_initialized = false; // Trigger re-initialization
+        }
+        
+        // Attempt recovery for partial writes
+        if (bytesWritten > 0 && bytesWritten < incomingSize) {
+            snprintf(json_save_log + strlen(json_save_log),
+                     sizeof(json_save_log) - strlen(json_save_log),
+                     " [Partial write: %lu/%lu bytes]", 
+                     (unsigned long)bytesWritten, 
+                     (unsigned long)incomingSize);
+            
+            // Try to truncate file to remove partial data
+            File repairFile = SD.open(json_log_file, FILE_WRITE);
+            if (repairFile) {
+                size_t newSize = repairFile.size();
+                repairFile.close();
+                
+                // If the file grew by less than what we tried to write, 
+                // we might have partial data corruption
+                if (newSize < (currentSize + bytesWritten)) {
+                    // Attempt to truncate to last known good size
+                    // Note: SD library doesn't support truncate directly
+                    snprintf(json_save_log + strlen(json_save_log),
+                             sizeof(json_save_log) - strlen(json_save_log),
+                             " [Size mismatch: %lu vs expected %lu]",
+                             (unsigned long)newSize,
+                             (unsigned long)(currentSize + bytesWritten));
+                }
+            }
+        }
+        
+        log_dummy_data();
+        return false;
+    }
+
+    // --- Step 11: Verify actual write succeeded ---
+    snprintf(json_save_log, sizeof(save_log),
+             "[SD] Success: %lu bytes appended to '%s' (total ~%lu bytes)",
+             (unsigned long)bytesWritten,
+             json_log_file,
+             (unsigned long)(currentSize + bytesWritten));
+    
+    // Verify actual file size after write (with timeout)
+    uint32_t verifyStartTime = millis();
+    File verifyFile = SD.open(json_log_file, FILE_READ);
+    
+    if (verifyFile) {
+        size_t actualSize = verifyFile.size();
+        verifyFile.close();
+        
+        if ((millis() - verifyStartTime) > 1000) {
+            snprintf(json_save_log + strlen(json_save_log),
+                     sizeof(json_save_log) - strlen(json_save_log),
+                     " [Verify took %lums]", (millis() - verifyStartTime));
+        }
+        
+        // Check for size discrepancies (allow for filesystem overhead)
+        long long sizeDiff = (long long)actualSize - (long long)(currentSize + bytesWritten);
+        if (abs(sizeDiff) > 100) { // Allow 100 bytes discrepancy
+            snprintf(json_save_log + strlen(json_save_log), 
+                     sizeof(json_save_log) - strlen(json_save_log),
+                     " WARNING: Size mismatch (expected ~%lu, got %lu, diff=%lld)", 
+                     (unsigned long)(currentSize + bytesWritten), 
+                     (unsigned long)actualSize,
+                     sizeDiff);
+            
+            // If size is significantly smaller, we might have lost data
+            if (sizeDiff < -1000) { // Lost more than 1KB
+                storage_initialized = false; // Force reinit on next call
+            }
+        }
+    }
+    
+    LOG(json_save_log);
+    
+    // --- Step 12: Periodic maintenance ---
+    static int writeCounter = 0;
+    writeCounter++;
+    
+    // Only do periodic maintenance if we haven't had recent errors
+    if (writeCounter >= 100 && !timeoutOccurred && writeSuccess) { 
+        uint32_t maintenanceStart = millis();
+        
+        SD.end(); // Unmount
+        storage_initialized = SD.begin(SD_Chip_Select, SPI, 4000000); // Remount
+        
+        if ((millis() - maintenanceStart) > 2000) {
+            snprintf(save_log, sizeof(save_log),
+                     "[SD] Maintenance took %lums", (millis() - maintenanceStart));
+            LOG(json_save_log);
+        }
+        
+        if (storage_initialized) {
+            #ifdef DEBUG_SERIAL
+            LOG("[SD] Periodic remount completed");
+            #endif
+        }
+        writeCounter = 0;
+    }
+
+    return true;
+}
+
+const char *file_heading = "Report,for,Hybrid,Solar,Dryer,at,Makerere,University,Agricultural,Research,Institute, Kabanyolo,(MUARIK)\n";
+char file_creation_date[64] = "File created:,,,";
+char logging_interval[52] = "Logging Interval (HH:MM:SS):,,,00:01:00"; // once every minute
+const char data_points_log[128] = "Data Points:,,Temperature, Relative Humidity, Barometric Pressure inside the Dryer (1-11) and ambient / outside the dryer (12)";
+const char units_of_data[156] = "Temperature is taken in Celcius Degrees (°C) | Relative Humidity in percent (%) | Barometric Pressure in kilopascals (kPa)";
+const char additional_entries[156] = "Microclimatic conditions measured: (2) wind speed in metres per second (m/s) and solar radiation in Watts per square metres (W/m²)";
+
+bool save_csv_to_sd_card(){
+
+    memset(csv_save_log, 0, sizeof(csv_save_log));
+
+    // ================= STEP 1: Check SD Initialization =================
+    if (!storage_initialized) {
+        snprintf(csv_save_log, sizeof(csv_save_log),
+                 "[CSV][SD] Storage not initialized");
+        LOG(csv_save_log);
+        return false;
+    }
+
+    // ================= STEP 2: Validate Data =================
+    if (!sendable_to_sd_card_csv || strlen(sendable_to_sd_card_csv) == 0) {
+        snprintf(csv_save_log, sizeof(csv_save_log),
+                 "[CSV][SD] Nothing to write (empty buffer)");
+        LOG(csv_save_log);
+        return false;
+    }
+
+    // ================= STEP 3: Ensure File Exists =================
+    bool fileExists = SD.exists(csv_log_file);
+
+    File file = SD.open(csv_log_file, FILE_APPEND);
+    if (!file) {
+        snprintf(csv_save_log, sizeof(csv_save_log),
+                 "[CSV][SD] Failed to open '%s'",
+                 csv_log_file);
+        LOG(csv_save_log);
+        return false;
+    }
+
+    // ================= STEP 4: If File Empty → Write Header =================
+    size_t currentSize = file.size();
+
+    if (currentSize <= 90) { // each entry weighs about 1kB... SO 90B is considered empty
+     snprintf(file_creation_date, sizeof(file_creation_date),
+             "Log File Created:,,,%s,%s", ShortDate, ShortTime_am_pm);
+
+    // ================= REPORT METADATA =================
+    file.println(file_heading);                  // Title
+    file.println("#########################################################");
+
+    file.println(file_creation_date);            // Creation timestamp //  in-col-spacing included
+   
+    file.println(logging_interval);
+
+    file.println(data_points_log);
+    file.println(units_of_data);
+    file.println(additional_entries);
+
+    file.println("---------------------------------------------------------");
+    file.println();   // Blank line before table
+
+    // ================= GROUP HEADER ROW =================
+
+         // Write the main header rows (two-row header for better organization)
+        // Row 1: Main sensor groups (these will span multiple columns when viewed in spreadsheet software)
+        file.print(","); // Empty cell for Date/Time column
+        file.print(","); // Empty cell for Date/Time column (second empty for the two columns)
+        file.print("Sensor 1,,,"); // S1_T, S1_H, S1_P will be under this
+        file.print("Sensor 2,,,"); // col-span-3
+        file.print("Sensor 3,,,");
+        file.print("Sensor 4,,,");
+        file.print("Sensor 5,,,");
+        file.print("Sensor 6,,,");
+        file.print("Sensor 7,,,");
+        file.print("Sensor 8,,,");
+        file.print("Sensor 9,,,");
+        file.print("Sensor 10,,,");
+        file.print("Sensor 11,,,");
+        file.print("Sensor 12,,,");
+        file.print("Environment,,"); // This will span Solar and Wind
+        file.println("System,,"); // This will span Uptime and Voltage
+
+      //   file.println();   // small separator before first data row
+
+            // ================= COLUMN HEADER ROW =================
+
+        file.println( // at row 11, column 1, col-span-1 each
+            "Date,Time,"
+            "S1_T (degC),S1_H (%),S1_P (kPa),"
+            "S2_T (degC),S2_H (%),S2_P (kPa),"
+            "S3_T (degC),S3_H (%),S3_P (kPa),"
+            "S4_T (degC),S4_H (%),S4_P (kPa),"
+            "S5_T (degC),S5_H (%),S5_P (kPa),"
+            "S6_T (degC),S6_H (%),S6_P (kPa),"
+            "S7_T (degC),S7_H (%),S7_P (kPa),"
+            "S8_T (degC),S8_H (%),S8_P (kPa),"
+            "S9_T (degC),S9_H (%),S9_P (kPa),"
+            "S10_T (degC),S10_H (%),S10_P (kPa),"
+            "S11_T (degC),S11_H (%),S11_P (kPa),"
+            "S12_T (degC),S12_H (%),S12_P (kPa),"
+            "Solar (W/sq.m),Wind(m/s),"
+            "Uptime,Voltage (V)" //AvgTemp,AvgHumi,AvgPress,"
+        ); 
+
+        snprintf(csv_save_log + strlen(csv_save_log),
+                 sizeof(csv_save_log) - strlen(csv_save_log),
+                 "[CSV] Header written. ");
+                     snprintf(last_csv_save_time, sizeof(last_csv_save_time), "%s", SystemTime);
+
+    }
+
+    // ================= STEP 5: Append CSV Row =================
+    size_t incomingSize = strlen(sendable_to_sd_card_csv);
+
+    size_t bytesWritten = file.print(sendable_to_sd_card_csv); 
+
+    file.flush();
+    file.close();
+
+    // ================= STEP 6: Verify Write =================
+    if (bytesWritten != incomingSize) {
+        snprintf(csv_save_log,
+                 sizeof(csv_save_log),
+                 "[CSV][SD] Write FAILED (%lu/%lu bytes)",
+                 (unsigned long)bytesWritten,
+                 (unsigned long)incomingSize);
+        LOG(csv_save_log);
+        return false;
+    }
+
+    snprintf(csv_save_log,
+             sizeof(csv_save_log),
+             "[CSV][SD] Success: %lu bytes appended",
+             (unsigned long)bytesWritten);
+
+    LOG(csv_save_log);
+
+    return true;
+}
+
+
+String read_complete_json_file() {
+    if (!storage_initialized || strlen(json_log_file) == 0) {
+        return "{}";
+    }
+    
+    File file = SD.open(json_log_file, FILE_READ);
+    if (!file) {
+        return "{}";
+    }
+    
+    // Read the entire file
+    String completeJson;
+    while (file.available()) {
+        completeJson += (char)file.read();
+    }
+    file.close();
+    
+    return completeJson;
+}
+
+// Function to get just the data array
+String read_json_data_only() {
+    String complete = read_complete_json_file();
+    
+    // Find the "data" array in the JSON
+    int dataStart = complete.indexOf("\"data\":[");
+    if (dataStart == -1) {
+        return "[]";
+    }
+    
+    dataStart += 7; // Move past "\"data\":["
+    
+    // Find the matching closing bracket
+    int bracketCount = 1;
+    int dataEnd = dataStart;
+    
+    for (int i = dataStart; i < complete.length(); i++) {
+        if (complete.charAt(i) == '[') bracketCount++;
+        if (complete.charAt(i) == ']') bracketCount--;
+        
+        if (bracketCount == 0) {
+            dataEnd = i;
+            break;
+        }
+    }
+    
+    return complete.substring(dataStart, dataEnd + 1);
+}
+
+// Optional: Add a watchdog reset function for RTOS integration
+void reset_sd_write_watchdog() {
+    // Could be called periodically from a high-priority task
+    // to ensure write operations don't hang indefinitely
+    static uint32_t lastWriteTime = 0;
+    static bool writeInProgress = false;
+    
+    // This would need integration with the actual write state
+    // For RTOS, consider using a semaphore or flag to track write state
+}
+
+// Correct way to create a multi-line JSON string in C/C++
+void log_dummy_data(){
+ snprintf(sendable_to_sd_card, sizeof(sendable_to_sd_card), 
+    "{"
+    "\"System\": {"
+        "\"FW_Version\": \"v1.3.2\","
+        "\"Uptime\": 45231,"
+        "\"Date\": \"2026-02-04\","
+        "\"Time\": \"14:37:19\","
+        "\"Datalog_Count\": 128,"
+        "\"Voltage\": 12.42,"
+        "\"Internal_Temp\": 36.8,"
+        "\"Internal_Fan\": true"
+    "},"
+    
+    "\"Dryer_Conditions\": {"
+        "\"Active_Sensors\": 6,"
+        "\"Average_Temperature\": 54.6,"
+        "\"Average_Humidity\": 28.3,"
+        "\"Average_Pressure\": 1007.8,"
+        
+        "\"Humidity_Fans\": true,"
+        "\"Humidity_Fans_Start_Time\": \"14:05:00\","
+        "\"Humidity_Fans_Stop_Time\": \"14:20:00\","
+        "\"Humidity_Fans_ON_Duration\": 900,"
+        
+        "\"Cooling_Fans\": false,"
+        "\"Cooling_Fans_Start_Time\": \"13:40:00\","
+        "\"Cooling_Fans_Stop_Time\": \"13:55:00\","
+        "\"Cooling_Fans_ON_Duration\": 900"
+    "},"
+    
+    "\"All_Sensors\": {"
+        "\"Temperature_Readings\": [52.4, 53.1, 55.7, 56.2, 54.8, 55.3],"
+        "\"Humidity_Readings\": [30.1, 29.4, 27.8, 26.9, 28.2, 27.6],"
+        "\"Pressure_Readings\": [1008.2, 1007.9, 1007.5, 1007.2, 1008.0, 1007.8]"
+    "},"
+    
+    "\"Sensor_1\": {"
+        "\"Position\": \"AIR INLET 1\","
+        "\"Temp\": 52.4,"
+        "\"Humi\": 30.1,"
+        "\"Pressure\": 1008.2,"
+        "\"Last_Seen\": \"14:37:17\","
+        "\"Sends\": \"1542\""
+    "},"
+    
+    "\"Sensor_2\": {"
+        "\"Position\": \"AIR INLET 2\","
+        "\"Temp\": 53.1,"
+        "\"Humi\": 29.4,"
+        "\"Pressure\": 1007.9,"
+        "\"Last_Seen\": \"14:37:16\","
+        "\"Sends\": \"1519\""
+    "},"
+    
+    "\"Sensor_3\": {"
+        "\"Position\": \"AIR OUTLET 1\","
+        "\"Temp\": 55.7,"
+        "\"Humi\": 27.8,"
+        "\"Pressure\": 1007.5,"
+        "\"Last_Seen\": \"14:37:18\","
+        "\"Sends\": \"1603\""
+    "},"
+    
+    "\"Sensor_4\": {"
+        "\"Position\": \"AIR OUTLET 2\","
+        "\"Temp\": 56.2,"
+        "\"Humi\": 26.9,"
+        "\"Pressure\": 1007.2,"
+        "\"Last_Seen\": \"14:37:18\","
+        "\"Sends\": \"1598\""
+    "},"
+    
+    "\"Sensor_5\": {"
+        "\"Position\": \"DRYING BED LOWEST\","
+        "\"Temp\": 54.8,"
+        "\"Humi\": 28.2,"
+        "\"Pressure\": 1008.0,"
+        "\"Last_Seen\": \"14:37:15\","
+        "\"Sends\": \"1489\""
+    "},"
+    
+    "\"Sensor_6\": {"
+        "\"Position\": \"DRYING BED MIDDLE\","
+        "\"Temp\": 55.3,"
+        "\"Humi\": 27.6,"
+        "\"Pressure\": 1007.8,"
+        "\"Last_Seen\": \"14:37:14\","
+        "\"Sends\": \"1472\""
+    "},"
+    
+    "\"Sensor_7\": {"
+        "\"Position\": \"DRYING BED TOP\","
+        "\"Temp\": 56.0,"
+        "\"Humi\": 26.4,"
+        "\"Pressure\": 1007.6,"
+        "\"Last_Seen\": \"14:36:58\","
+        "\"Sends\": \"1391\""
+    "},"
+    
+    "\"Sensor_8\": {"
+        "\"Position\": \"DRYING BED MIDDLE ZONE\","
+        "\"Temp\": 55.1,"
+        "\"Humi\": 27.1,"
+        "\"Pressure\": 1007.9,"
+        "\"Last_Seen\": \"14:36:55\","
+        "\"Sends\": \"1384\""
+    "},"
+    
+    "\"Sensor_9\": {"
+        "\"Position\": \"DRYING BED ENTRY ZONE\","
+        "\"Temp\": 53.9,"
+        "\"Humi\": 28.9,"
+        "\"Pressure\": 1008.3,"
+        "\"Last_Seen\": \"14:36:52\","
+        "\"Sends\": \"1378\""
+    "},"
+    
+    "\"Sensor_10\": {"
+        "\"Position\": \"DRYING BED EXIT ZONE\","
+        "\"Temp\": 56.4,"
+        "\"Humi\": 25.8,"
+        "\"Pressure\": 1007.1,"
+        "\"Last_Seen\": \"14:36:49\","
+        "\"Sends\": \"1366\""
+    "},"
+    
+    "\"Sensor_11\": {"
+        "\"Position\": \"DRYING BED RANDOM POSITION\","
+        "\"Temp\": 54.2,"
+        "\"Humi\": 29.0,"
+        "\"Pressure\": 1008.1,"
+        "\"Last_Seen\": \"14:36:44\","
+        "\"Sends\": \"1359\""
+    "},"
+    
+    "\"Sensor_12\": {"
+        "\"Position\": \"DRYING BED AMBIENT ZONE\","
+        "\"Temp\": 36.5,"
+        "\"Humi\": 41.2,"
+        "\"Pressure\": 1009.4,"
+        "\"Last_Seen\": \"14:36:40\","
+        "\"Sends\": \"1347\""
+    "},"
+    
+    "\"Environment\": {"
+        "\"Solar_Radiation\": 742.5,"
+        "\"Wind_Speed\": 2.8"
+    "}"
+    "}"
+  );
+}
+
+void enable_sd_card(){
+  
+    digitalWrite(SCREEN_CS, HIGH); delay(10);
+    digitalWrite(SD_Chip_Select, LOW);        
+
+}
+
+void enable_display(){
+    digitalWrite(SD_Chip_Select, HIGH); delay(10);
+    digitalWrite(SCREEN_CS, LOW);        
+
 }
 
 
@@ -827,6 +1648,492 @@ void sync_sd_card() {
     #endif
 }
 
+
+/*
+bool initialize_sd_card() {
+    LOG("-------- INITIALIZING ONSITE STORAGE ------------------");
+    bool status = false;
+    // Clear status log
+    memset(storage_status_log, 0, sizeof(storage_status_log));
+    strncpy(storage_status_log, "SD Init: ", sizeof(storage_status_log));
+    
+    // --- Initialize VSPI for SD ---
+    SD_SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_Chip_Select);
+    // Initialize SD card with robust settings
+    storage_initialized = SD.begin(SD_Chip_Select, SD_SPI, 4000000); // Lower frequency, better for reliability
+    
+    if (!storage_initialized) {
+        snprintf(storage_status_log, sizeof(storage_status_log), 
+                 "SD CARD failed to initialize. Check wiring/power.");
+        LOG(storage_status_log);
+        status = false;
+        
+    }
+    else {
+    
+    // Check card type and presence
+    uint8_t cardType = SD.cardType();
+    
+    if (cardType == CARD_NONE) {
+        snprintf(storage_status_log, sizeof(storage_status_log), 
+                 "NO SD CARD detected");
+        LOG(storage_status_log);
+        storage_initialized = false;
+        status = false;
+    }
+
+    else {
+    
+          // Report card type
+          const char* typeStr = "Unknown";
+          switch(cardType) {
+              case CARD_MMC: typeStr = "MMC"; break;
+              case CARD_SD: typeStr = "SDSC"; break;
+              case CARD_SDHC: typeStr = "SDHC/SDXC"; break;
+          }
+          
+          snprintf(storage_status_log + strlen(storage_status_log), 
+                  sizeof(storage_status_log) - strlen(storage_status_log),
+                  "Type: %s | ", typeStr);
+          
+          // Get and report card size
+          uint64_t cardSize = SD.cardSize();
+          if (cardSize == 0) {
+              strncat(storage_status_log, "Size: Unknown", 
+                      sizeof(storage_status_log) - strlen(storage_status_log) - 1);
+              storage_initialized = false;
+              status = false;
+              return status;
+          }
+          
+          storage = cardSize / (1024 * 1024); // Convert to MB
+          snprintf(storage_size_char, sizeof(storage_size_char), 
+                  "Size: %lluMB", storage);
+          
+          // Check if we have enough space
+          uint64_t usedSpace = SD.usedBytes() / (1024 * 1024);
+          uint64_t freeSpace = storage - usedSpace;
+          
+          strncat(storage_status_log, storage_size_char,
+                  sizeof(storage_status_log) - strlen(storage_status_log) - 1);
+          
+          snprintf(storage_status_log + strlen(storage_status_log),
+                  sizeof(storage_status_log) - strlen(storage_status_log),
+                  " | Used: %lluMB | Free: %lluMB", usedSpace, freeSpace);
+          
+          // Check/create JSON log file with proper error handling
+          if (!SD.exists(json_log_file)) {
+              strncat(storage_status_log, " | Creating new log file",
+                      sizeof(storage_status_log) - strlen(storage_status_log) - 1);
+              
+              File f = SD.open(json_log_file, FILE_WRITE);
+              if (!f) {
+                  strncat(storage_status_log, " | FAILED to create file",
+                          sizeof(storage_status_log) - strlen(storage_status_log) - 1);
+                  storage_initialized = false;
+                  status = false;
+                  return status;
+              }
+              f.close();
+          }
+          
+          // Check file size and rotate if needed
+          File f = SD.open(json_log_file, FILE_READ);
+          if (f) {
+              size_t currentSize = f.size();
+              f.close();
+              
+              if (currentSize > MAX_FILE_SIZE) {
+                  strncat(storage_status_log, " | File needs rotation",
+                          sizeof(storage_status_log) - strlen(storage_status_log) - 1);
+                  
+                  // Check total storage usage before creating new file
+                  uint64_t totalUsed = SD.usedBytes();
+                  if (totalUsed > MAX_TOTAL_SIZE) {
+                      strncat(storage_status_log, " | TOTAL STORAGE LIMIT REACHED",
+                              sizeof(storage_status_log) - strlen(storage_status_log) - 1);
+                      // Consider implementing file deletion logic here
+                  } else {
+                      // Create rotated file
+                      File newFile = create_another_file();
+                      if (newFile) {
+                          strncat(storage_status_log, " | File rotated",
+                                  sizeof(storage_status_log) - strlen(storage_status_log) - 1);
+                          newFile.close();
+                          status = true;
+                      } else {
+                          strncat(storage_status_log, " | Rotation FAILED",
+                                  sizeof(storage_status_log) - strlen(storage_status_log) - 1);
+                      }
+                  }
+              } else {
+                  snprintf(storage_status_log + strlen(storage_status_log),
+                          sizeof(storage_status_log) - strlen(storage_status_log),
+                          " | Current file: %u bytes", currentSize);
+                          status = true;
+              }
+          } else {
+                  strncat(storage_status_log, " | Cannot open file for size check",
+                          sizeof(storage_status_log) - strlen(storage_status_log) - 1);
+                  storage_initialized = false;
+                  status = false;
+              }
+
+        }
+
+    }
+    
+    return status;
+    LOG(storage_status_log);
+}
+*/
+
+
+char meta_data[1000];
+
+
+uint64_t screen_refresh_interval = (1ULL*60ULL*1000ULL); // refreshing entire screen once 5 mins daytime, else 30mins at night 180 seconds, b4 hibernating
+const uint64_t upload_fequency = (10ULL*60ULL*1000ULL); // every 10 minutes
+boolean uploaded = false;
+
+const uint64_t wifi_checK_interval = (2ULL * 1000ULL);
+uint64_t    last_wifi_check = 0; 
+
+
+uint64_t data_update_interval = 60ULL * 1000ULL; // 30 seconds if power is good, 60 seconds when not
+bool json_data_logged = false;
+bool csv_data_logged = false;
+
+bool fans_are_togglable = false; // when power is low, totawaana
+
+uint32_t loop_count = 0; // tracker for whenever loop or a RTOS task yeesibye
+
+
+char activity_log[1024];
+bool is_night_time = false;
+bool is_at_peak_sunshine = false;
+
+void loop() {
+    now_now_ms = esp_timer_get_time() / 1000ULL; // us to ms
+     update_display(); // this returns 99.9% of the time and only updates screen ever 5, or 30mins
+
+    if(packet_received) { buzzer.beep(1,50,0);  extract_readings(); packet_received = false; }
+    
+    // Sensor readings
+    if ((now_now_ms - last_read_time_ms) >= data_update_interval) { // 60 seconds if power is good for 24 hours:: 1,440 saved packets/day
+        last_read_time_ms = now_now_ms;  // Update FIRST to prevent race conditions
+        
+          //most recent parameters
+          
+          query_rtc();      
+          is_night_time = (hr >= 20 || hr < 7);  // 8pm to 7am... time for idling
+          is_at_peak_sunshine = (hr > 9 && hr < 18); // 9am to 3pm...[and if solar radiation>1000W/m2]...time for peak peformance
+        
+          if(is_night_time) screen_refresh_interval = (60ULL*60ULL*1000ULL); //  refresh once every hour...maybe between light sleeps
+          else {
+            if(is_at_peak_sunshine) screen_refresh_interval = (60ULL*1000ULL); // refresh once every minute
+            else screen_refresh_interval = (10ULL*60ULL*1000ULL); // refresh once every 10 minutes
+          }
+
+          MonitorBattery(); // battery voltage
+          
+          monitor_box_conditions(); // internal temp and fan state
+          monitor_dryer_readings(); 
+          // monitor_fans(now_now_ms);
+          
+          //check_meta_data(); // column headers for CSV
+           json_bound_successfully = bind_dynamic_data_into_json();
+           csv_bound_successfully = bind_dynamic_data_into_csv();
+
+          json_data_logged = save_json_to_sd_card(); delay(500);
+          csv_data_logged  = save_csv_to_sd_card(); delay(500);
+
+        if(json_data_logged && csv_data_logged)  buzzer.beep(2, 50, 0);
+
+          snprintf(activity_log, sizeof(activity_log), 
+              "\nLoopCount:%lu\nUptime: %llu, Reading complete! Power mode: %d, Voltage: %.1fV\njson_data_logged: %s",     
+              loop_count, last_read_time_ms/1000, current_power, voltage, json_data_logged?"YES":"NO"
+              );
+
+          LOG(activity_log);
+    }
+    
+
+  /*
+    if((now_now_ms - last_upload_time_ms) > upload_frequency_ms){ // either every 10mins or at the tenth minute
+      if(can_send){ // when using WiFi to upload
+       switch_radio_to_wifi(); 
+       UploadStatus st Uploader.upload_to_web_of_iot(sendable_to_cloud_db);
+        Serial.printf("[Upload Task] upload status=%d; report=%s\n", (int)st, Uploader.get_upload_report());
+        snprintf(last_upload_time, sizeof(last_upload_time), "%s", SystemTime);
+         snprintf(upload_error_code, sizeof(upload_error_code), 
+                        "Uploaded at %s on %s", ShortTime_am_pm, SystemDate);
+        LOG(upload_error_code);
+        can_send = false;
+
+        data_sent = true;
+        last_upload_time_ms = now_now_ms;
+
+
+      }
+    }
+ 
+ */
+
+    bool otaTrigger = read_button(ota_button, now_now_ms);
+
+ if (otaTrigger && !otaModeActive){
+
+    Serial.println("\n=== OTA Triggered ===");
+
+                buzzer.beep(3, 500, 200);
+
+    esp_err_t result = esp_now_deinit();
+    if (result != ESP_OK) {
+        Serial.printf("ESP-NOW deinit failed: %d\n", result);
+        return;
+    }
+
+    delay(300);
+
+    if (!switch_radio_to_wifi()) {
+        Serial.println("WiFi failed. Returning to ESP-NOW.");
+        switch_radio_to_espnow();
+        return;
+    }
+
+    otaModeActive = true;
+    otaStartTime = now_now_ms;
+
+    Serial.printf("OTA Mode Active for %llu minutes\n",
+                  (OTA_TIMEOUT / 60000));
+  
+            currentScreen = 10;
+            special_call = true;
+            update_display();
+            
+  }
+
+ // when activated successfully
+  
+  if (otaModeActive) { // KEEP CHECKING OTA HANDLE EVERY LOOP
+        ArduinoOTA.handle();
+        flash(now_now_ms, blinker, 50, 50, 50, 50); // uploading
+       
+     if((now_now_ms - last_wifi_check) >= wifi_checK_interval) { // CHECK WIFI STATUS ONCE EVERY 2 SECONDS, ... 
+            wifi_connected = wifi_obj.ensure_wifi(); 
+            last_wifi_check = now_now_ms;
+        }
+
+        if (otaFinished) { // let it be seen and heard
+                strcpy(ota_log, "Update complete!"); 
+                snprintf(LastOTAUpdate, sizeof(LastOTAUpdate), "On Date: %s, at %s", SystemDate, ShortTime);
+                buzzer.beep(2, 100, 50);
+                delay(50);
+                flash(now_now_ms, blinker, 1000, 100, 0, 0);
+                otaFinished = false;
+        }
+
+     if(otaStarted){
+            strcpy(ota_log, "Start updating...");
+            buzzer.beep(1, 50, 0); 
+            delay(50);
+            otaStarted = false;
+      }
+     if(otaError){
+            buzzer.beep(1, 500, 500);
+            delay(500);
+            otaError = false;
+     }
+     if(otaProgress){
+
+     }
+
+    // Timeout after 5 minutes
+    if ((now_now_ms - otaStartTime) >= OTA_TIMEOUT) {
+            Serial.println();
+            Serial.printf("OTA timeout reached!!! Started at: %llu, Ended at: %llu ", otaStartTime/1000, now_now_ms/1000);
+            Serial.println("Returning to ESP-NOW mode...");
+        
+            otaModeActive = false;
+            switch_radio_to_espnow();
+        }
+   } // !otaModeActive         
+ 
+  else  {   delay(2); // make the loop less when not polling ota
+           flash(now_now_ms, blinker, 50, 75, 50, 1500); // normal
+        }
+
+
+  /*
+    // OTA handling (only in excellent power mode)
+   // WiFi & OTA handling for excellent power mode
+    if (current_power == POWER_LOW || current_power == POWER_MODERATE || current_power == POWER_EXCELLENT) {
+        // Check/ensure WiFi periodically for OTA
+        static uint64_t last_wifi_check = 0;
+          if ((now_now_ms - last_wifi_check) >= 10000) { // Check every 10 seconds
+              wifi_connected = wifi_obj.ensure_wifi();
+              last_wifi_check = now_now_ms;
+          }
+     
+    }
+
+    // Data upload (only check WiFi here if not already connected from OTA section)
+    if (can_send) {
+        // If we're in excellent power mode but WiFi check hasn't run recently
+        if (current_power == POWER_EXCELLENT && !wifi_connected) {
+            wifi_connected = wifi_obj.ensure_wifi();
+        }
+        
+        if (wifi_connected) {
+                Serial.println("Uploading data...");
+                bool upload_success = post_to_thingsPeak();
+                delay(500);
+            
+            
+                prepare_JSON_file();
+                delay(500);
+               // upload_to_web_of_iot();
+               UploadStatus st = Uploader.upload_to_web_of_iot(httpsData);
+               Serial.printf("[Upload Task] upload status=%d; report=%s\n", (int)st, Uploader.get_upload_report());
+
+                
+                snprintf(upload_log, sizeof(upload_log), 
+                        "Uploaded at %s on %s", ShortTime_am_pm, SystemDate);
+           // } else {      strncpy(upload_log, "Upload failed", sizeof(upload_log)); }
+            
+            data_sent = true;
+        } else {
+            Serial.println("WiFi not available for upload");
+        }
+        
+        can_send = false;
+    }
+
+ /*
+    // Enter sleep based on power state
+    if (current_power != POWER_EXCELLENT) {
+        sleep_dynamically();
+    } else {
+        // For excellent power, use delay instead of sleep
+        delay(1000); // Short delay to prevent tight loop
+    }
+  */
+        loop_count++;
+
+}
+/// loop()
+
+/*
+ACTIVE LOW
+bool read_button(uint8_t pin, uint64_t time_now){
+  static uint64_t pressStart = 0;
+  static bool lastState = HIGH;
+  static bool longPressHandled = false;
+  bool pressed = false;
+
+  bool state = digitalRead(pin);
+
+  if (state == LOW && lastState == HIGH) {
+    pressStart = time_now;
+    longPressHandled = false;
+  }
+
+  if (state == LOW && !longPressHandled && (time_now - pressStart >= 3000ULL)) {
+    pressed = true;
+    longPressHandled = true;
+    buzzer.beep(1, 50, 0);
+  }
+
+  if (state == HIGH && lastState == LOW) {
+    longPressHandled = false;
+  }
+
+  lastState = state;
+  return pressed;
+}
+*/
+
+bool read_button(uint8_t pin, uint64_t time_now)
+{
+    static uint64_t pressStart = 0;
+    static bool lastState = HIGH;    // idle is HIGH with INPUT_PULLUP
+    static bool longPressHandled = false;
+
+    bool pressed = false;
+    bool state = digitalRead(pin);   // LOW = pressed (active LOW)
+
+    // Button pressed (HIGH → LOW transition)
+    if (state == LOW && lastState == HIGH) {
+        pressStart = time_now;
+        longPressHandled = false;
+    }
+
+    // Long press detected (3 seconds)
+    if (state == LOW &&
+        !longPressHandled &&
+        (time_now - pressStart >= 3000ULL))
+    {
+        pressed = true;
+        longPressHandled = true;
+        buzzer.beep(1, 50, 0);
+    }
+
+    // Button released (LOW → HIGH transition)
+    if (state == HIGH && lastState == LOW) {
+        longPressHandled = false;
+    }
+
+    lastState = state;
+    return pressed;
+}
+
+// replace switch_radio_to_espnow() with the version from the "Fix B" snippet above
+// and replace OnSensorData_received with the safer copy version above
+
+
+
+#define ESPNOW_MAX_RETRIES 3
+
+bool switch_radio_to_espnow() {
+  Serial.println("Switching radio to ESP-NOW...");
+
+  /*
+      // Proper cleanup
+    if (esp_now_deinit() != ESP_OK) {
+        Serial.println("Warning: ESP-NOW deinit had issues");
+    }
+  */  
+    WiFi.disconnect(true);
+    delay(100);
+    WiFi.mode(WIFI_OFF);
+    delay(100);
+    
+    WiFi.mode(WIFI_STA); Serial.printf("WiFi channel: %d\n", WiFi.channel());
+
+  for (uint8_t attempt = 1; attempt <= ESPNOW_MAX_RETRIES; attempt++) {
+      if (esp_now_init() == ESP_OK) { 
+            Serial.printf("✓ ESP-NOW initialized successfully (attempt %d/%d)\n", attempt, ESPNOW_MAX_RETRIES);
+      
+   // Register callback function
+          esp_err_t result = esp_now_register_recv_cb(esp_now_recv_cb_t(OnSensorData_received)); // Serial.print("CALLBACK: ");Serial.println(result);
+          if(result == ESP_OK) Serial.println("Call Back of Call Back successfully set!"); 
+           
+        } else {
+           // print that Wireless Radio is faulty
+            //return;
+            delay(100 * attempt); // Exponential backoff
+        }
+        
+    }
+    
+    
+    Serial.println("!!! ESP-NOW initialization failed after retries");
+    return false;
+}
+
+
+
 /*
 ✔ Only copy
 ✔ Set a flag
@@ -862,21 +2169,263 @@ void OnSensorData_received(const uint8_t * mac, const uint8_t *incomingData, int
      
 }
 
-
-//deserialize to assign char[] and floats accordingly
 void extract_readings(){
-  if(!packet_received) { LOG("No packet received!"); return; }  // this never runs, but just in case 
-
+      if(!packet_received) { LOG("No packet received!"); return; }  // this never runs, but just in case 
+      
        DeserializationError err = deserializeJson(JSON_data, dataPack);
 
         if (err) {
-            Serial.print("JSON error: ");
+            Serial.print("JSON Deserialization Error: ");
             Serial.println(err.c_str());
             return;
         }
+       // LOG(dataPack); // SEE WHAT HAS BEEN RECEIVED!
 
           
-    const char * sensor_ID = JSON_data["S_ID"] | "unknown"; /*const char * sensor_2_ID = JSON_data["S_ID"] | "unknown";
+    const char * sensor_ID = JSON_data["S_ID"] | "unknown";
+
+     //fastest approach... as switch is Extremely fast for consecutive integers
+
+  /*
+  📊 Direct Performance Rankings (Fastest to Slowest)
+      switch with consecutive integers ⚡ Fastest
+
+      else if chain with integer comparisons 🚀 Fast
+
+      if statements with integer comparisons 🏃 Medium
+
+      else if chain with string comparisons 🐌 Slow
+
+    if statements with string comparisons 🐌🐌 Slowest
+  */
+
+
+ int sensor_index_num = extract_sensor_number(sensor_ID); 
+  
+          switch (sensor_index_num) {
+              case 1: {
+                sensor_1_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
+                sensor_1_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
+                sensor_1_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
+                sensor_1_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
+                sensor_1_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
+                sensor_1_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
+                sensor_1_packet_size = JSON_data["PKT"] | 0;
+            
+                strncpy(sensor_1_transmissions,  JSON_data["Sends"], sizeof(sensor_1_transmissions)); // up to 11 bytes: e.g., "1234567890"
+                strncpy(sensor_1_CPU_freq,  JSON_data["CPU"], sizeof(sensor_1_CPU_freq)); // 11 bytes: "80MHz CPU"
+                
+                temperature_readings[0] = sensor_1_temp; humidity_readings[0] = sensor_1_humidity;  // arrays or indexes
+                strncpy(sensor_1_last_seen, SystemTime, sizeof(sensor_1_last_seen));      sensor_1_last_seen[sizeof(sensor_1_last_seen) - 1] = '\0'; 
+   
+              }
+                 break;
+              case 2:  {
+                    sensor_2_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
+                    sensor_2_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
+                    sensor_2_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
+                    sensor_2_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
+                    sensor_2_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
+                    sensor_2_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
+                    sensor_2_packet_size = JSON_data["PKT"] | 0;
+                
+                    strncpy(sensor_2_transmissions,  JSON_data["Sends"], sizeof(sensor_2_transmissions)); // up to 11 bytes: e.g., "1234567890"
+                    strncpy(sensor_2_CPU_freq,  JSON_data["CPU"], sizeof(sensor_2_CPU_freq)); // 11 bytes: "80MHz CPU"
+                    
+                    temperature_readings[0] = sensor_2_temp; humidity_readings[0] = sensor_2_humidity;  // arrays or indexes
+                    strncpy(sensor_2_last_seen, SystemTime, sizeof(sensor_2_last_seen));      sensor_2_last_seen[sizeof(sensor_2_last_seen) - 1] = '\0'; 
+   
+              }
+              break;
+
+                  case 3: {
+                      sensor_3_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
+                      sensor_3_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
+                      sensor_3_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
+                      sensor_3_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
+                      sensor_3_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
+                      sensor_3_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
+                      sensor_3_packet_size = JSON_data["PKT"] | 0;
+                  
+                      strncpy(sensor_3_transmissions, JSON_data["Sends"], sizeof(sensor_3_transmissions)); // up to 11 bytes: e.g., "1234567890"
+                      strncpy(sensor_3_CPU_freq, JSON_data["CPU"], sizeof(sensor_3_CPU_freq)); // 11 bytes: "80MHz CPU"
+                      
+                      temperature_readings[2] = sensor_3_temp; humidity_readings[2] = sensor_3_humidity;  // arrays or indexes
+                      strncpy(sensor_3_last_seen, SystemTime, sizeof(sensor_3_last_seen)); sensor_3_last_seen[sizeof(sensor_3_last_seen) - 1] = '\0'; 
+                  }
+                  break;
+                  
+                  case 4: {
+                      sensor_4_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
+                      sensor_4_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
+                      sensor_4_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
+                      sensor_4_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
+                      sensor_4_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
+                      sensor_4_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
+                      sensor_4_packet_size = JSON_data["PKT"] | 0;
+                  
+                      strncpy(sensor_4_transmissions, JSON_data["Sends"], sizeof(sensor_4_transmissions)); // up to 11 bytes: e.g., "1234567890"
+                      strncpy(sensor_4_CPU_freq, JSON_data["CPU"], sizeof(sensor_4_CPU_freq)); // 11 bytes: "80MHz CPU"
+                      
+                      temperature_readings[3] = sensor_4_temp; humidity_readings[3] = sensor_4_humidity;  // arrays or indexes
+                      strncpy(sensor_4_last_seen, SystemTime, sizeof(sensor_4_last_seen)); sensor_4_last_seen[sizeof(sensor_4_last_seen) - 1] = '\0'; 
+                  }
+                  break;
+                  
+                  case 5: {
+                      sensor_5_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
+                      sensor_5_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
+                      sensor_5_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
+                      sensor_5_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
+                      sensor_5_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
+                      sensor_5_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
+                      sensor_5_packet_size = JSON_data["PKT"] | 0;
+                  
+                      strncpy(sensor_5_transmissions, JSON_data["Sends"], sizeof(sensor_5_transmissions)); // up to 11 bytes: e.g., "1234567890"
+                      strncpy(sensor_5_CPU_freq, JSON_data["CPU"], sizeof(sensor_5_CPU_freq)); // 11 bytes: "80MHz CPU"
+                      
+                      temperature_readings[4] = sensor_5_temp; humidity_readings[4] = sensor_5_humidity;  // arrays or indexes
+                      strncpy(sensor_5_last_seen, SystemTime, sizeof(sensor_5_last_seen)); sensor_5_last_seen[sizeof(sensor_5_last_seen) - 1] = '\0'; 
+                  }
+                  break;
+                  
+                  case 6: {
+                      sensor_6_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
+                      sensor_6_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
+                      sensor_6_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
+                      sensor_6_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
+                      sensor_6_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
+                      sensor_6_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
+                      sensor_6_packet_size = JSON_data["PKT"] | 0;
+                  
+                      strncpy(sensor_6_transmissions, JSON_data["Sends"], sizeof(sensor_6_transmissions)); // up to 11 bytes: e.g., "1234567890"
+                      strncpy(sensor_6_CPU_freq, JSON_data["CPU"], sizeof(sensor_6_CPU_freq)); // 11 bytes: "80MHz CPU"
+                      
+                      temperature_readings[5] = sensor_6_temp; humidity_readings[5] = sensor_6_humidity;  // arrays or indexes
+                      strncpy(sensor_6_last_seen, SystemTime, sizeof(sensor_6_last_seen)); sensor_6_last_seen[sizeof(sensor_6_last_seen) - 1] = '\0'; 
+                  }
+                  break;
+                  
+                  case 7: {
+                      sensor_7_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
+                      sensor_7_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
+                      sensor_7_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
+                      sensor_7_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
+                      sensor_7_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
+                      sensor_7_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
+                      sensor_7_packet_size = JSON_data["PKT"] | 0;
+                  
+                      strncpy(sensor_7_transmissions, JSON_data["Sends"], sizeof(sensor_7_transmissions)); // up to 11 bytes: e.g., "1234567890"
+                      strncpy(sensor_7_CPU_freq, JSON_data["CPU"], sizeof(sensor_7_CPU_freq)); // 11 bytes: "80MHz CPU"
+                      
+                      temperature_readings[6] = sensor_7_temp; humidity_readings[6] = sensor_7_humidity;  // arrays or indexes
+                      strncpy(sensor_7_last_seen, SystemTime, sizeof(sensor_7_last_seen)); sensor_7_last_seen[sizeof(sensor_7_last_seen) - 1] = '\0'; 
+                  }
+                  break;
+                  
+                  case 8: {
+                      sensor_8_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
+                      sensor_8_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
+                      sensor_8_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
+                      sensor_8_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
+                      sensor_8_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
+                      sensor_8_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
+                      sensor_8_packet_size = JSON_data["PKT"] | 0;
+                  
+                      strncpy(sensor_8_transmissions, JSON_data["Sends"], sizeof(sensor_8_transmissions)); // up to 11 bytes: e.g., "1234567890"
+                      strncpy(sensor_8_CPU_freq, JSON_data["CPU"], sizeof(sensor_8_CPU_freq)); // 11 bytes: "80MHz CPU"
+                      
+                      temperature_readings[7] = sensor_8_temp; humidity_readings[7] = sensor_8_humidity;  // arrays or indexes
+                      strncpy(sensor_8_last_seen, SystemTime, sizeof(sensor_8_last_seen)); sensor_8_last_seen[sizeof(sensor_8_last_seen) - 1] = '\0'; 
+                  }
+                  break;
+                  
+                  case 9: {
+                      sensor_9_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
+                      sensor_9_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
+                      sensor_9_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
+                      sensor_9_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
+                      sensor_9_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
+                      sensor_9_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
+                      sensor_9_packet_size = JSON_data["PKT"] | 0;
+                  
+                      strncpy(sensor_9_transmissions, JSON_data["Sends"], sizeof(sensor_9_transmissions)); // up to 11 bytes: e.g., "1234567890"
+                      strncpy(sensor_9_CPU_freq, JSON_data["CPU"], sizeof(sensor_9_CPU_freq)); // 11 bytes: "80MHz CPU"
+                      
+                      temperature_readings[8] = sensor_9_temp; humidity_readings[8] = sensor_9_humidity;  // arrays or indexes
+                      strncpy(sensor_9_last_seen, SystemTime, sizeof(sensor_9_last_seen)); sensor_9_last_seen[sizeof(sensor_9_last_seen) - 1] = '\0'; 
+                  }
+                  break;
+                  
+                  case 10: {
+                      sensor_10_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
+                      sensor_10_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
+                      sensor_10_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
+                      sensor_10_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
+                      sensor_10_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
+                      sensor_10_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
+                      sensor_10_packet_size = JSON_data["PKT"] | 0;
+                  
+                      strncpy(sensor_10_transmissions, JSON_data["Sends"], sizeof(sensor_10_transmissions)); // up to 11 bytes: e.g., "1234567890"
+                      strncpy(sensor_10_CPU_freq, JSON_data["CPU"], sizeof(sensor_10_CPU_freq)); // 11 bytes: "80MHz CPU"
+                      
+                      temperature_readings[9] = sensor_10_temp; humidity_readings[9] = sensor_10_humidity;  // arrays or indexes
+                      strncpy(sensor_10_last_seen, SystemTime, sizeof(sensor_10_last_seen)); sensor_10_last_seen[sizeof(sensor_10_last_seen) - 1] = '\0'; 
+                  }
+                  break;
+                  
+                  case 11: {
+                      sensor_11_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
+                      sensor_11_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
+                      sensor_11_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
+                      sensor_11_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
+                      sensor_11_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
+                      sensor_11_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
+                      sensor_11_packet_size = JSON_data["PKT"] | 0;
+                  
+                      strncpy(sensor_11_transmissions, JSON_data["Sends"], sizeof(sensor_11_transmissions)); // up to 11 bytes: e.g., "1234567890"
+                      strncpy(sensor_11_CPU_freq, JSON_data["CPU"], sizeof(sensor_11_CPU_freq)); // 11 bytes: "80MHz CPU"
+                      
+                      temperature_readings[10] = sensor_11_temp; humidity_readings[10] = sensor_11_humidity;  // arrays or indexes
+                      strncpy(sensor_11_last_seen, SystemTime, sizeof(sensor_11_last_seen)); sensor_11_last_seen[sizeof(sensor_11_last_seen) - 1] = '\0'; 
+                  }
+                  break;
+                  
+                  case 12: {
+                      sensor_12_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
+                      sensor_12_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
+                      sensor_12_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
+                      sensor_12_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
+                      sensor_12_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
+                      sensor_12_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
+                      sensor_12_packet_size = JSON_data["PKT"] | 0;
+                  
+                      strncpy(sensor_12_transmissions, JSON_data["Sends"], sizeof(sensor_12_transmissions)); // up to 11 bytes: e.g., "1234567890"
+                      strncpy(sensor_12_CPU_freq, JSON_data["CPU"], sizeof(sensor_12_CPU_freq)); // 11 bytes: "80MHz CPU"
+                      
+                      temperature_readings[11] = sensor_12_temp; humidity_readings[11] = sensor_12_humidity;  // arrays or indexes
+                      strncpy(sensor_12_last_seen, SystemTime, sizeof(sensor_12_last_seen)); sensor_12_last_seen[sizeof(sensor_12_last_seen) - 1] = '\0'; 
+                  }
+                  break;
+                  
+                  default: {
+                      Serial.printf("Unknown sensor: %s\n", sensor_ID);
+                  }
+                  break;
+             
+           } // end of switch
+   
+} // end of extractor
+ 
+
+
+      
+
+
+
+
+
+/*const char * sensor_2_ID = JSON_data["S_ID"] | "unknown";
     
     const char * sensor_3_ID = JSON_data["S_ID"] | "unknown"; const char * sensor_4_ID = JSON_data["S_ID"] | "unknown";
     
@@ -887,242 +2436,311 @@ void extract_readings(){
     const char * sensor_9_ID = JSON_data["S_ID"] | "unknown";  const char * sensor_10_ID = JSON_data["S_ID"] | "unknown";
    
     const char * sensor_11_ID = JSON_data["S_ID"] | "unknown"; const char * sensor_12_ID = JSON_data["S_ID"] | "unknown";
-    */
+  */
 
-    if(strcmp(sensor_ID, "T_1") == 0){
-          sensor_1_temp = JSON_data["Temp"] | NAN;
-          sensor_1_humidity = JSON_data["Humi"] | NAN; 
-          sensor_1_pressure = JSON_data["Atm_Pre"] | NAN;
-          sensor_1_elevation = JSON_data["Elev"] | NAN;
-          sensor_1_h_index = JSON_data["Heat_index"] | NAN;
-           
-       //   temperature_readings[0] = sensor_1_temp; humidity_readings[0] = sensor_1_humidity;  // arrays or indexes
-      strncpy(sensor_1_last_seen, ShortTime, sizeof(sensor_1_last_seen));      sensor_1_last_seen[sizeof(sensor_1_last_seen) - 1] = '\0'; 
-      strncpy(sensor_1_transmissions,  JSON_data["Sends"], sizeof(sensor_1_transmissions));
-    }
+/*
+//deserialize to assign char[] and floats accordingly
+void extract_readings(){
+  if(!packet_received) { LOG("No packet received!"); return; }  // this never runs, but just in case 
+      
+       DeserializationError err = deserializeJson(JSON_data, dataPack);
 
-    if(strcmp(sensor_ID, "T_2") == 0){
-        sensor_2_temp = JSON_data["Temp"] | NAN;
-        sensor_2_humidity = JSON_data["Humi"] | NAN; 
-        sensor_2_pressure = JSON_data["Atm_Pre"] | NAN;
-        sensor_2_elevation = JSON_data["Elev"] | NAN;
-        sensor_2_h_index = JSON_data["Heat_index"] | NAN;
-    strncpy(sensor_2_last_seen, ShortTime, sizeof(sensor_2_last_seen)); sensor_2_last_seen[sizeof(sensor_2_last_seen) - 1] = '\0';
-    strncpy(sensor_2_transmissions, JSON_data["Sends"], sizeof(sensor_2_transmissions));
-    }
+        if (err) {
+            Serial.print("JSON Deserialization Error: ");
+            Serial.println(err.c_str());
+            return;
+        }
+       // LOG(dataPack); // SEE WHAT HAS BEEN RECEIVED!
 
-    if(strcmp(sensor_ID, "T_3") == 0){
-        sensor_3_temp = JSON_data["Temp"] | NAN;
-        sensor_3_humidity = JSON_data["Humi"] | NAN; 
-        sensor_3_pressure = JSON_data["Atm_Pre"] | NAN;
-        sensor_3_elevation = JSON_data["Elev"] | NAN;
-        sensor_3_h_index = JSON_data["Heat_index"] | NAN;
-      strncpy(sensor_3_last_seen, ShortTime, sizeof(sensor_3_last_seen)); sensor_3_last_seen[sizeof(sensor_3_last_seen) - 1] = '\0';
-      strncpy(sensor_3_transmissions,  JSON_data["Sends"], sizeof(sensor_3_transmissions));
-    }
+          
+    const char * sensor_ID = JSON_data["S_ID"] | "unknown"; 
 
-    if(strcmp(sensor_ID, "T_4") == 0){
-        sensor_4_temp = JSON_data["Temp"] | NAN;
-        sensor_4_humidity = JSON_data["Humi"] | NAN;
-        sensor_4_pressure = JSON_data["Atm_Pre"] | NAN;
-        sensor_4_elevation = JSON_data["Elev"] | NAN;
-        sensor_4_h_index = JSON_data["Heat_index"] | NAN;
-      strncpy(sensor_4_last_seen, ShortTime, sizeof(sensor_4_last_seen)); sensor_4_last_seen[sizeof(sensor_4_last_seen) - 1] = '\0';
-      strncpy(sensor_4_transmissions, JSON_data["Sends"], sizeof(sensor_4_transmissions));
-    }
-
-    if(strcmp(sensor_ID, "T_5") == 0){
-        sensor_5_temp = JSON_data["Temp"] | NAN;
-        sensor_5_humidity = JSON_data["Humi"] | NAN;
-        sensor_5_pressure = JSON_data["Atm_Pre"] | NAN;
-        sensor_5_elevation = JSON_data["Elev"] | NAN;
-        sensor_5_h_index = JSON_data["Heat_index"] | NAN;
-      strncpy(sensor_5_last_seen, ShortTime, sizeof(sensor_5_last_seen)); sensor_5_last_seen[sizeof(sensor_5_last_seen) - 1] = '\0';
-      strncpy(sensor_5_transmissions,  JSON_data["Sends"], sizeof(sensor_5_transmissions));
-    }
-
-     if(strcmp(sensor_ID, "T_6") == 0){
-        sensor_6_temp = JSON_data["Temp"] | NAN;
-        sensor_6_humidity = JSON_data["Humi"] | NAN;
-        sensor_6_pressure = JSON_data["Atm_Pre"] | NAN;
-        sensor_6_elevation = JSON_data["Elev"] | NAN;
-        sensor_6_h_index = JSON_data["Heat_index"] | NAN;
-    strncpy(sensor_6_last_seen, ShortTime, sizeof(sensor_6_last_seen)); sensor_6_last_seen[sizeof(sensor_6_last_seen) - 1] = '\0';
-    strncpy(sensor_6_transmissions,  JSON_data["Sends"], sizeof(sensor_6_transmissions));
-     }
-
-     if(strcmp(sensor_ID, "T_7") == 0){
-        sensor_7_temp = JSON_data["Temp"];
-        sensor_7_humidity = JSON_data["Humi"]; // humidity ... moisture in the air
-        sensor_7_pressure = JSON_data["Atm_Pre"];
-        sensor_7_elevation = JSON_data["Elev"];
-        sensor_7_h_index = JSON_data["Heat_index"];
-    strncpy(sensor_7_last_seen, ShortTime, sizeof(sensor_7_last_seen)); sensor_7_last_seen[sizeof(sensor_7_last_seen) - 1] = '\0';
-    strncpy(sensor_7_transmissions, JSON_data["Sends"], sizeof(sensor_7_transmissions));
-     }
-
-     if(strcmp(sensor_ID, "T_8") == 0){
-        sensor_8_temp = JSON_data["Temp"];
-        sensor_8_humidity = JSON_data["Humi"]; // humidity ... moisture in the air
-        sensor_8_pressure = JSON_data["Atm_Pre"];
-        sensor_8_elevation = JSON_data["Elev"];
-        sensor_8_h_index = JSON_data["Heat_index"];
-    strncpy(sensor_8_last_seen, ShortTime, sizeof(sensor_8_last_seen)); sensor_8_last_seen[sizeof(sensor_8_last_seen) - 1] = '\0';
-    strncpy(sensor_8_transmissions, JSON_data["Sends"], sizeof(sensor_8_transmissions));
-     }
-
-     if(strcmp(sensor_ID, "T_9") == 0){
-        sensor_9_temp = JSON_data["Temp"];
-        sensor_9_humidity = JSON_data["Humi"]; // humidity ... moisture in the air
-        sensor_9_pressure = JSON_data["Atm_Pre"];
-        sensor_9_elevation = JSON_data["Elev"];
-        sensor_9_h_index = JSON_data["Heat_index"];
-        strncpy(sensor_9_last_seen, ShortTime, sizeof(sensor_9_last_seen)); sensor_9_last_seen[sizeof(sensor_9_last_seen) - 1] = '\0';
-        strncpy(sensor_9_transmissions, JSON_data["Sends"], sizeof(sensor_9_transmissions));
-     }
-
-     if(strcmp(sensor_ID, "T_10") == 0){
-        sensor_10_temp = JSON_data["Temp"];
-        sensor_10_humidity = JSON_data["Humi"]; // humidity ... moisture in the air
-        sensor_10_pressure = JSON_data["Atm_Pre"];
-        sensor_10_elevation = JSON_data["Elev"];
-        sensor_10_h_index = JSON_data["Heat_index"];
-    strncpy(sensor_10_last_seen, ShortTime, sizeof(sensor_10_last_seen)); sensor_10_last_seen[sizeof(sensor_10_last_seen) - 1] = '\0';
-    strncpy(sensor_10_transmissions, JSON_data["Sends"], sizeof(sensor_10_transmissions));
-     }
-
-     if(strcmp(sensor_ID, "T_11") == 0){
-        sensor_11_temp = JSON_data["Temp"];
-        sensor_11_humidity = JSON_data["Humi"]; // humidity ... moisture in the air
-        sensor_11_pressure = JSON_data["Atm_Pre"];
-        sensor_11_elevation = JSON_data["Elev"];
-        sensor_11_h_index = JSON_data["Heat_index"];
-    strncpy(sensor_11_last_seen, ShortTime, sizeof(sensor_11_last_seen)); sensor_11_last_seen[sizeof(sensor_11_last_seen) - 1] = '\0';
-    strncpy(sensor_11_transmissions, JSON_data["Sends"], sizeof(sensor_11_transmissions));
-     }
-
-     if(strcmp(sensor_ID, "T_12") == 0){
-        sensor_12_temp = JSON_data["Temp"];
-        sensor_12_humidity = JSON_data["Humi"]; // humidity ... moisture in the air
-        sensor_12_pressure = JSON_data["Atm_Pre"];
-        sensor_12_elevation = JSON_data["Elev"];
-        sensor_12_h_index = JSON_data["Heat_index"];
-    strncpy(sensor_12_last_seen, ShortTime, sizeof(sensor_12_last_seen)); sensor_12_last_seen[sizeof(sensor_12_last_seen) - 1] = '\0';
-    strncpy(sensor_12_transmissions, JSON_data["Sends"], sizeof(sensor_12_transmissions));
-     }
-
-  /* the above only update when the respective sensor has ID'd itself, 
-  hence no need for the part below... which was preventing the zeroing of other unsent values
-
-    if(sensor_1_temp > 2.00) {  
-        last_seen[0] = now_now_ms;    
-        strcpy(sensor_1_last_seen, ShortTime_am_pm);  
-        sensor_1_humidity  = sensor_1_humidity_;
-        sensor_1_pressure  = sensor_1_pressure_;
-        sensor_1_elevation = sensor_1_elevation_;
-        sensor_1_h_index   = sensor_1_h_index_;
-        temperature_readings[0] = sensor_1_temp; humidity_readings[0] = sensor_1_humidity;
-      //  sensor_1_transmissions = sensor_1_transmissions_;
-       
-      }
-
-    if(sensor_2_temp > 2.00) {  
-        strcpy(sensor_2_last_seen, ShortTime_am_pm);  
-        sensor_2_humidity  = sensor_2_humidity_;
-        sensor_2_pressure  = sensor_2_pressure_;
-        sensor_2_elevation = sensor_2_elevation_;
-        sensor_2_h_index   = sensor_2_h_index_;
-        temperature_readings[1] = sensor_2_temp; humidity_readings[1] = sensor_2_humidity;
-      //  sensor_2_transmissions = sensor_2_transmissions_;
-       
-      }
-
-    if(sensor_3_temp > 2.00) {  
-        strcpy(sensor_3_last_seen, ShortTime_am_pm);  
-        sensor_3_humidity  = sensor_3_humidity_;
-        sensor_3_pressure  = sensor_3_pressure_;
-        sensor_3_elevation = sensor_3_elevation_;
-        sensor_3_h_index   = sensor_3_h_index_;
-        temperature_readings[2] = sensor_3_temp; humidity_readings[2] = sensor_3_humidity;
-      //  sensor_2_transmissions = sensor_2_transmissions_;
-       
-      } 
-
-    if(sensor_4_temp > 2.00) {  
-        strcpy(sensor_4_last_seen, ShortTime_am_pm);  
-        sensor_4_humidity  = sensor_4_humidity_;
-        sensor_4_pressure  = sensor_4_pressure_;
-        sensor_4_elevation = sensor_4_elevation_;
-        sensor_4_h_index   = sensor_4_h_index_;
-        temperature_readings[3] = sensor_4_temp; humidity_readings[3] = sensor_4_humidity;
-      //  sensor_2_transmissions = sensor_2_transmissions_;
-       
-      }  
-   
-       if(sensor_5_temp > 2.00) {  
-        strcpy(sensor_5_last_seen, ShortTime_am_pm);  
-        sensor_5_humidity  = sensor_5_humidity_;
-        sensor_5_pressure  = sensor_5_pressure_;
-        sensor_5_elevation = sensor_5_elevation_;
-        sensor_5_h_index   = sensor_5_h_index_;
-        temperature_readings[4] = sensor_5_temp; humidity_readings[4] = sensor_5_humidity;
-      //  sensor_2_transmissions = sensor_2_transmissions_;
-       
-      }
-
-          if(sensor_6_temp > 2.00) {  
+        if(strcmp(sensor_ID, "T_1") == 0){
+            sensor_1_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
+            sensor_1_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
+            sensor_1_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
+            sensor_1_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
+            sensor_1_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
+            sensor_1_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
+            sensor_1_packet_size = JSON_data["PKT"] | 0;
         
-        strcpy(sensor_6_last_seen, ShortTime_am_pm);  
-        sensor_6_humidity  = sensor_6_humidity_;
-        sensor_6_pressure  = sensor_6_pressure_;
-        sensor_6_elevation = sensor_6_elevation_;
-        sensor_6_h_index   = sensor_6_h_index_;
-        temperature_readings[5] = sensor_6_temp; humidity_readings[5] = sensor_6_humidity;
-      //  sensor_2_transmissions = sensor_2_transmissions_;
-       
+            strncpy(sensor_1_transmissions,  JSON_data["Sends"], sizeof(sensor_1_transmissions)); // up to 11 bytes: e.g., "1234567890"
+            strncpy(sensor_1_CPU_freq,  JSON_data["CPU"], sizeof(sensor_1_CPU_freq)); // 11 bytes: "80MHz CPU"
+            
+            temperature_readings[0] = sensor_1_temp; humidity_readings[0] = sensor_1_humidity;  // arrays or indexes
+            strncpy(sensor_1_last_seen, ShortTime, sizeof(sensor_1_last_seen));      sensor_1_last_seen[sizeof(sensor_1_last_seen) - 1] = '\0'; 
       }
-      */
 
+      else if(strcmp(sensor_ID, "T_2") == 0){
+                  sensor_2_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
+                  sensor_2_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
+                  sensor_2_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
+                  sensor_2_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
+                  sensor_2_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
+                  sensor_2_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
+                  sensor_2_packet_size = JSON_data["PKT"] | 0;
+              
+                  strncpy(sensor_2_transmissions,  JSON_data["Sends"], sizeof(sensor_2_transmissions)); // up to 11 bytes: e.g., "1234567890"
+                  strncpy(sensor_2_CPU_freq,  JSON_data["CPU"], sizeof(sensor_2_CPU_freq)); // 11 bytes: "80MHz CPU"
+                  
+                  temperature_readings[0] = sensor_2_temp; humidity_readings[0] = sensor_2_humidity;  // arrays or indexes
+                  strncpy(sensor_2_last_seen, ShortTime, sizeof(sensor_2_last_seen));      sensor_2_last_seen[sizeof(sensor_2_last_seen) - 1] = '\0'; 
+      }
+
+      else if(strcmp(sensor_ID, "T_3") == 0){
+                  sensor_3_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
+                  sensor_3_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
+                  sensor_3_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
+                  sensor_3_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
+                  sensor_3_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
+                  sensor_3_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
+                  sensor_3_packet_size = JSON_data["PKT"] | 0;
+              
+                  strncpy(sensor_3_transmissions,  JSON_data["Sends"], sizeof(sensor_3_transmissions)); // up to 11 bytes: e.g., "1234567890"
+                  strncpy(sensor_3_CPU_freq,  JSON_data["CPU"], sizeof(sensor_3_CPU_freq)); // 11 bytes: "80MHz CPU"
+                  
+                  temperature_readings[2] = sensor_3_temp; humidity_readings[2] = sensor_3_humidity;  // arrays or indexes
+                  strncpy(sensor_3_last_seen, ShortTime, sizeof(sensor_3_last_seen));      sensor_3_last_seen[sizeof(sensor_3_last_seen) - 1] = '\0'; 
+      }
+
+      else if(strcmp(sensor_ID, "T_4") == 0){
+                  sensor_4_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
+                  sensor_4_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
+                  sensor_4_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
+                  sensor_4_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
+                  sensor_4_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
+                  sensor_4_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
+                  sensor_4_packet_size = JSON_data["PKT"] | 0;
+              
+                  strncpy(sensor_4_transmissions,  JSON_data["Sends"], sizeof(sensor_4_transmissions)); // up to 11 bytes: e.g., "1234567890"
+                  strncpy(sensor_4_CPU_freq,  JSON_data["CPU"], sizeof(sensor_4_CPU_freq)); // 11 bytes: "80MHz CPU"
+                  
+                  temperature_readings[3] = sensor_4_temp; humidity_readings[3] = sensor_4_humidity;  // arrays or indexes
+                  strncpy(sensor_4_last_seen, ShortTime, sizeof(sensor_4_last_seen));      sensor_4_last_seen[sizeof(sensor_4_last_seen) - 1] = '\0'; 
+      }
+
+      else if(strcmp(sensor_ID, "T_5") == 0){
+                  sensor_5_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
+                  sensor_5_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
+                  sensor_5_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
+                  sensor_5_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
+                  sensor_5_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
+                  sensor_5_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
+                  sensor_5_packet_size = JSON_data["PKT"] | 0;
+              
+                  strncpy(sensor_5_transmissions,  JSON_data["Sends"], sizeof(sensor_5_transmissions)); // up to 11 bytes: e.g., "1234567890"
+                  strncpy(sensor_5_CPU_freq,  JSON_data["CPU"], sizeof(sensor_5_CPU_freq)); // 11 bytes: "80MHz CPU"
+                  
+                  temperature_readings[4] = sensor_5_temp; humidity_readings[4] = sensor_5_humidity;  // arrays or indexes
+                  strncpy(sensor_5_last_seen, ShortTime, sizeof(sensor_5_last_seen));      sensor_5_last_seen[sizeof(sensor_5_last_seen) - 1] = '\0'; 
+      }
+
+      else if(strcmp(sensor_ID, "T_6") == 0){
+                  sensor_6_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
+                  sensor_6_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
+                  sensor_6_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
+                  sensor_6_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
+                  sensor_6_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
+                  sensor_6_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
+                  sensor_6_packet_size = JSON_data["PKT"] | 0;
+              
+                  strncpy(sensor_6_transmissions,  JSON_data["Sends"], sizeof(sensor_6_transmissions)); // up to 11 bytes: e.g., "1234567890"
+                  strncpy(sensor_6_CPU_freq,  JSON_data["CPU"], sizeof(sensor_6_CPU_freq)); // 11 bytes: "80MHz CPU"
+                  
+                  temperature_readings[5] = sensor_6_temp; humidity_readings[5] = sensor_6_humidity;  // arrays or indexes
+                  strncpy(sensor_6_last_seen, ShortTime, sizeof(sensor_6_last_seen));      sensor_6_last_seen[sizeof(sensor_6_last_seen) - 1] = '\0'; 
+      }
+
+      else if(strcmp(sensor_ID, "T_7") == 0){
+                  sensor_7_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
+                  sensor_7_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
+                  sensor_7_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
+                  sensor_7_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
+                  sensor_7_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
+                  sensor_7_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
+                  sensor_7_packet_size = JSON_data["PKT"] | 0;
+              
+                  strncpy(sensor_7_transmissions,  JSON_data["Sends"], sizeof(sensor_7_transmissions)); // up to 11 bytes: e.g., "1234567890"
+                  strncpy(sensor_7_CPU_freq,  JSON_data["CPU"], sizeof(sensor_7_CPU_freq)); // 11 bytes: "80MHz CPU"
+                  
+                  temperature_readings[6] = sensor_7_temp; humidity_readings[6] = sensor_7_humidity;  // arrays or indexes
+                  strncpy(sensor_7_last_seen, ShortTime, sizeof(sensor_7_last_seen));      sensor_7_last_seen[sizeof(sensor_7_last_seen) - 1] = '\0'; 
+      }
+
+      else if(strcmp(sensor_ID, "T_8") == 0){
+                  sensor_8_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
+                  sensor_8_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
+                  sensor_8_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
+                  sensor_8_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
+                  sensor_8_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
+                  sensor_8_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
+                  sensor_8_packet_size = JSON_data["PKT"] | 0;
+              
+                  strncpy(sensor_8_transmissions,  JSON_data["Sends"], sizeof(sensor_8_transmissions)); // up to 11 bytes: e.g., "1234567890"
+                  strncpy(sensor_8_CPU_freq,  JSON_data["CPU"], sizeof(sensor_8_CPU_freq)); // 11 bytes: "80MHz CPU"
+                  
+                  temperature_readings[7] = sensor_8_temp; humidity_readings[7] = sensor_8_humidity;  // arrays or indexes
+                  strncpy(sensor_8_last_seen, ShortTime, sizeof(sensor_8_last_seen));      sensor_8_last_seen[sizeof(sensor_8_last_seen) - 1] = '\0'; 
+      }
+
+      else if(strcmp(sensor_ID, "T_9") == 0){
+                  sensor_9_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
+                  sensor_9_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
+                  sensor_9_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
+                  sensor_9_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
+                  sensor_9_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
+                  sensor_9_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
+                  sensor_9_packet_size = JSON_data["PKT"] | 0;
+              
+                  strncpy(sensor_9_transmissions,  JSON_data["Sends"], sizeof(sensor_9_transmissions)); // up to 11 bytes: e.g., "1234567890"
+                  strncpy(sensor_9_CPU_freq,  JSON_data["CPU"], sizeof(sensor_9_CPU_freq)); // 11 bytes: "80MHz CPU"
+                  
+                  temperature_readings[8] = sensor_9_temp; humidity_readings[8] = sensor_9_humidity;  // arrays or indexes
+                  strncpy(sensor_9_last_seen, ShortTime, sizeof(sensor_9_last_seen));      sensor_9_last_seen[sizeof(sensor_9_last_seen) - 1] = '\0'; 
+      }
+
+      else if(strcmp(sensor_ID, "T_10") == 0){
+                  sensor_10_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
+                  sensor_10_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
+                  sensor_10_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
+                  sensor_10_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
+                  sensor_10_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
+                  sensor_10_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
+                  sensor_10_packet_size = JSON_data["PKT"] | 0;
+              
+                  strncpy(sensor_10_transmissions,  JSON_data["Sends"], sizeof(sensor_10_transmissions)); // up to 11 bytes: e.g., "1234567890"
+                  strncpy(sensor_10_CPU_freq,  JSON_data["CPU"], sizeof(sensor_10_CPU_freq)); // 11 bytes: "80MHz CPU"
+                  
+                  temperature_readings[9] = sensor_10_temp; humidity_readings[9] = sensor_10_humidity;  // arrays or indexes
+                  strncpy(sensor_10_last_seen, ShortTime, sizeof(sensor_10_last_seen));      sensor_10_last_seen[sizeof(sensor_10_last_seen) - 1] = '\0'; 
+      }
+
+      else if(strcmp(sensor_ID, "T_11") == 0){
+                  sensor_11_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
+                  sensor_11_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
+                  sensor_11_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
+                  sensor_11_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
+                  sensor_11_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
+                  sensor_11_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
+                  sensor_11_packet_size = JSON_data["PKT"] | 0;
+              
+                  strncpy(sensor_11_transmissions,  JSON_data["Sends"], sizeof(sensor_11_transmissions)); // up to 11 bytes: e.g., "1234567890"
+                  strncpy(sensor_11_CPU_freq,  JSON_data["CPU"], sizeof(sensor_11_CPU_freq)); // 11 bytes: "80MHz CPU"
+                  
+                  temperature_readings[10] = sensor_11_temp; humidity_readings[10] = sensor_11_humidity;  // arrays or indexes
+                  strncpy(sensor_11_last_seen, ShortTime, sizeof(sensor_11_last_seen));      sensor_11_last_seen[sizeof(sensor_11_last_seen) - 1] = '\0'; 
+      }
+
+      else if(strcmp(sensor_ID, "T_12") == 0){
+                  sensor_12_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
+                  sensor_12_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
+                  sensor_12_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
+                  sensor_12_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
+                  sensor_12_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
+                  sensor_12_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
+                  sensor_12_packet_size = JSON_data["PKT"] | 0;
+              
+                  strncpy(sensor_12_transmissions,  JSON_data["Sends"], sizeof(sensor_12_transmissions)); // up to 11 bytes: e.g., "1234567890"
+                  strncpy(sensor_12_CPU_freq,  JSON_data["CPU"], sizeof(sensor_12_CPU_freq)); // 11 bytes: "80MHz CPU"
+                  
+                  temperature_readings[11] = sensor_12_temp; humidity_readings[11] = sensor_12_humidity;  // arrays or indexes
+                  strncpy(sensor_12_last_seen, ShortTime, sizeof(sensor_12_last_seen));      sensor_12_last_seen[sizeof(sensor_12_last_seen) - 1] = '\0'; 
+      }
+
+        else {
+               Serial.printf("Unknown sensor: %s\n", sensor_ID);
+             }
 
 }
 
+*/
 
 
+int extract_sensor_number(const char *identity){
+    int index = 0;
+
+     if (identity[0] == 'T' && identity[1] == '_') { // T_1
+          index = atoi(&identity[2]);  // extract the index from the ID name: "T_7" → 7
+        
+          }
+    return index;
+}
+
+uint8_t reading_count = 0;
+
+// now_now_ms
 void monitor_dryer_readings(){
+
   average_temp = 0.00;
   average_humi = 0.00;
   active_sensors = 0;
   average_press = 0.0;
   average_elev = 0.0;
 
-  
-  average_press = sensor_1_pressure + sensor_2_pressure + sensor_3_pressure + sensor_4_pressure + sensor_5_pressure + sensor_6_pressure;
-  average_elev = sensor_1_elevation + sensor_2_elevation + sensor_3_elevation + sensor_4_elevation + sensor_5_elevation + sensor_6_elevation;
+  average_press = sensor_1_pressure + sensor_2_pressure + sensor_3_pressure + sensor_4_pressure + sensor_5_pressure + sensor_6_pressure
+                + sensor_7_pressure + sensor_8_pressure + sensor_9_pressure + sensor_10_pressure + sensor_11_pressure + sensor_12_pressure;
 
+  average_elev = sensor_1_elevation + sensor_2_elevation + sensor_3_elevation + sensor_4_elevation + sensor_5_elevation + sensor_6_elevation
+               + sensor_7_elevation + sensor_8_elevation + sensor_9_elevation + sensor_10_elevation + sensor_11_elevation + sensor_12_elevation;
 
-    //  Serial.print("Readings Stored: [");
-      for(int i=0; i<(sizeof(temperature_readings)/sizeof(temperature_readings[0])); i++){
-        if(temperature_readings[i] >= 2.00 || !isnan(temperature_readings)){ // !is_nan and is not unexplainably cold            
-            active_sensors++;
-        }
-        // Serial.print(temperature_readings[i]); if(i<5) Serial.print(", ");
+  for(int i=0; i<(sizeof(temperature_readings)/sizeof(temperature_readings[0])); i++){
+    if(temperature_readings[i] >= 2.00){
+      active_sensors++;
+      average_temp += temperature_readings[i];
+      average_humi += humidity_readings[i];
+    }
+  }
+
+  Serial.print("Active Sensors: "); Serial.println(active_sensors);
+
+  if(active_sensors <= 0){
+      average_temp = 0.00;
+      average_humi = 0.00;
+      average_press = 0.00;
+      average_elev = 0.00;
+  }
+  else{
+      average_temp /= active_sensors;
+      average_humi /= active_sensors;
+      average_press /= active_sensors;
+      average_elev /= active_sensors;
+  }
+
+  // ==============================
+  // STORE HISTORY (Refined Block)
+  // ==============================
+
+  if(new_average_temp != average_temp){
+
+      // shift arrays backward (oldest dropped)
+      for(int i = 9; i > 0; i--){
+          historical_temperature_readings[i] = historical_temperature_readings[i-1];
+          historical_outside_temperatures[i] = historical_outside_temperatures[i-1];
+          historical_humidity_readings[i]    = historical_humidity_readings[i-1];
+          historical_pressure_readings[i]    = historical_pressure_readings[i-1];
+          strcpy(time_stamps[i], time_stamps[i-1]);
       }
-    //  Serial.print("] :: Active Sensors: ");   
-      Serial.print("Active Sensors: "); Serial.println(active_sensors);
-      if(active_sensors <= 0) { average_temp = 0.00; average_humi = 0.00; }
-      else {
-        average_temp /= (active_sensors);
-        average_humi /= (active_sensors);
-      }
 
-      Serial.print("Average Temp: "); Serial.println(average_temp);
-      Serial.print("Average Humi: "); Serial.println(average_humi);
+      // insert newest at index 0
+      historical_temperature_readings[0] = average_temp;
+      historical_outside_temperatures[0] = sensor_12_temp;
+      historical_humidity_readings[0]    = average_humi;
+      historical_pressure_readings[0]    = average_press;
+      strcpy(time_stamps[0], ShortTime); // HH:MM
 
+      if(reading_count < 10) reading_count++;
 
-  average_press /= active_sensors;
-  average_elev /=  active_sensors;
+      new_average_temp = average_temp;
+  }
+
+  // ==============================
+
+  dtostrf(average_temp, 3, 1, average_temp_str);
+  dtostrf(average_humi, 3, 1, average_humi_str);
+
+  Serial.print("Average Temp: "); Serial.println(average_temp);
+  Serial.print("Average Humi: "); Serial.println(average_humi);
 }
-
 
 
 char fans_log[100] = "...";
@@ -1166,9 +2784,338 @@ void monitor_fans(uint64_t time_now_ms){ // ALL DRYER FANS ARE ACTIVE LOW
      }
 }
 
+// Helper function to write static metadata to a file
+void write_json_metadata(File &file) {
+    if (!file) return;
+    
+    // Create a JSON document for metadata
+    StaticJsonDocument<1024> metaDoc;
+    
+    // SYSTEM PARAMETERS (static)
+    JsonObject System = metaDoc["System"].to<JsonObject>();
+    System["FW_Version"] = FW_VERSION;
+    System["Device_ID"] = devicename; // Assuming you have a device ID
+    System["Created_Date"] = SystemDate;
+    System["Created_Time"] = SystemTime;
+    System["Max_File_Size_MB"] = MAX_FILE_SIZE / (1024 * 1024);
+    System["Max_Total_Size_MB"] = MAX_TOTAL_SIZE / (1024 * 1024);
+    
+    // Sensor positions (static configuration)
+    JsonObject Sensor_Config = metaDoc["Sensor_Config"].to<JsonObject>();
+    
+    JsonObject Sensor_1_Config = Sensor_Config["1"].to<JsonObject>();
+    Sensor_1_Config["Position"] = "AIR INLET 1";
+    
+    JsonObject Sensor_2_Config = Sensor_Config["2"].to<JsonObject>();
+    Sensor_2_Config["Position"] = "AIR INLET 2";
+    
+    JsonObject Sensor_3_Config = Sensor_Config["3"].to<JsonObject>();
+    Sensor_3_Config["Position"] = "AIR OUTLET 1";
+    
+    JsonObject Sensor_4_Config = Sensor_Config["4"].to<JsonObject>();
+    Sensor_4_Config["Position"] = "AIR OUTLET 2";
+    
+    JsonObject Sensor_5_Config = Sensor_Config["5"].to<JsonObject>();
+    Sensor_5_Config["Position"] = "DRYING BED LOWEST";
+    
+    JsonObject Sensor_6_Config = Sensor_Config["6"].to<JsonObject>();
+    Sensor_6_Config["Position"] = "DRYING BED MIDDLE";
+    
+    JsonObject Sensor_7_Config = Sensor_Config["7"].to<JsonObject>();
+    Sensor_7_Config["Position"] = "DRYING BED TOP";
+    
+    JsonObject Sensor_8_Config = Sensor_Config["8"].to<JsonObject>();
+    Sensor_8_Config["Position"] = "DRYING BED MIDDLE ZONE";
+    
+    JsonObject Sensor_9_Config = Sensor_Config["9"].to<JsonObject>();
+    Sensor_9_Config["Position"] = "DRYING BED ENTRY ZONE";
+    
+    JsonObject Sensor_10_Config = Sensor_Config["10"].to<JsonObject>();
+    Sensor_10_Config["Position"] = "DRYING BED EXIT ZONE";
+    
+    JsonObject Sensor_11_Config = Sensor_Config["11"].to<JsonObject>();
+    Sensor_11_Config["Position"] = "DRYING BED RANDOM POSITION";
+    
+    JsonObject Sensor_12_Config = Sensor_Config["12"].to<JsonObject>();
+    Sensor_12_Config["Position"] = "DRYING BED AMBIENT ZONE";
+    
+    // Start JSON array for data entries
+    file.print("{\"metadata\":");
+    serializeJson(metaDoc, file);
+    file.print(",\"data\":[\n");
+    
+    // Write metadata to global variable for reference
+    serializeJson(metaDoc, meta_data);
+    meta_data[sizeof(meta_data) - 1] = '\0';
+    
+    LOG("[JSON] Metadata written to new file");
+}
+
+char serialization_log[512] = "JSON Serialization Not Done!";
+char csv_bind_log[512] = "CSV Serialization Not Done!";
 
 
-bool bind_datasets_into_json(){
+bool bind_dynamic_data_into_json() {
+
+    bool bound_successfully = false;
+
+    JSON_sendable.clear();
+    save_counter++; // save this into EEPROM or SPIFFS
+
+    // ================= SYSTEM RUNTIME DATA =================
+    JsonObject System = JSON_sendable["System"].to<JsonObject>();
+    System["Uptime"] = (now_now_ms / 1000);
+    System["Date"] = SystemDate;
+    System["Time"] = SystemTime;
+    System["Datalog_Count"] = save_counter;
+    System["Voltage"] = voltage;
+    System["Internal_Temp"] = cabin_temperature;
+    System["Internal_Fan"] = inner_fan_status;
+    System["OTA_Status"] = ota_log;
+    System["LastOTA_Update"] = LastOTAUpdate;
+    System["SD_TOTAL_SIZE"] = sd_storage_size;
+    System["SD_USED_SPACE"] = usedSpace;
+    System["SD_REMAINING_SPACE"] = freeSpace;
+
+    // ================= DRYER SNAPSHOT =================
+    JsonObject Dryer_Conditions = JSON_sendable["Dryer_Conditions"].to<JsonObject>();
+    Dryer_Conditions["Active_Sensors"] = active_sensors;
+    Dryer_Conditions["Average_Temperature"] = average_temp;
+    Dryer_Conditions["Average_Humidity"] = average_humi;
+    Dryer_Conditions["Average_Pressure"] = average_press;
+
+    // ================= HISTORICAL SNAPSHOT ARRAYS =================
+    JsonObject All_Sensors = JSON_sendable["All_Sensors"].to<JsonObject>();
+
+    for (int i = 0; i < active_sensors; i++) {
+        All_Sensors["Temperature_Readings"][i] = historical_temperature_readings[i];
+        All_Sensors["External Temperatures"][i] = historical_outside_temperatures[i];
+        All_Sensors["Humidity_Readings"][i] = historical_humidity_readings[i];
+        All_Sensors["Pressure_Readings"][i] = historical_pressure_readings[i];
+        All_Sensors["Time"][i] = time_stamps[i];
+    }
+
+    // ================= INDIVIDUAL SENSOR RUNTIME VALUES =================
+
+    JsonObject Sensor_1 = JSON_sendable["Sensor_1"].to<JsonObject>();
+    Sensor_1["Temp"] = sensor_1_temp;
+    Sensor_1["Humi"] = sensor_1_humidity;
+    Sensor_1["Pressure"] = sensor_1_pressure;
+    Sensor_1["Last_Seen"] = sensor_1_last_seen;
+    Sensor_1["Sends"] = sensor_1_transmissions;
+
+    JsonObject Sensor_2 = JSON_sendable["Sensor_2"].to<JsonObject>();
+    Sensor_2["Temp"] = sensor_2_temp;
+    Sensor_2["Humi"] = sensor_2_humidity;
+    Sensor_2["Pressure"] = sensor_2_pressure;
+    Sensor_2["Last_Seen"] = sensor_2_last_seen;
+    Sensor_2["Sends"] = sensor_2_transmissions;
+
+    JsonObject Sensor_3 = JSON_sendable["Sensor_3"].to<JsonObject>();
+    Sensor_3["Temp"] = sensor_3_temp;
+    Sensor_3["Humi"] = sensor_3_humidity;
+    Sensor_3["Pressure"] = sensor_3_pressure;
+    Sensor_3["Last_Seen"] = sensor_3_last_seen;
+    Sensor_3["Sends"] = sensor_3_transmissions;
+
+    JsonObject Sensor_4 = JSON_sendable["Sensor_4"].to<JsonObject>();
+    Sensor_4["Temp"] = sensor_4_temp;
+    Sensor_4["Humi"] = sensor_4_humidity;
+    Sensor_4["Pressure"] = sensor_4_pressure;
+    Sensor_4["Last_Seen"] = sensor_4_last_seen;
+    Sensor_4["Sends"] = sensor_4_transmissions;
+
+    JsonObject Sensor_5 = JSON_sendable["Sensor_5"].to<JsonObject>();
+    Sensor_5["Temp"] = sensor_5_temp;
+    Sensor_5["Humi"] = sensor_5_humidity;
+    Sensor_5["Pressure"] = sensor_5_pressure;
+    Sensor_5["Last_Seen"] = sensor_5_last_seen;
+    Sensor_5["Sends"] = sensor_5_transmissions;
+
+    JsonObject Sensor_6 = JSON_sendable["Sensor_6"].to<JsonObject>();
+    Sensor_6["Temp"] = sensor_6_temp;
+    Sensor_6["Humi"] = sensor_6_humidity;
+    Sensor_6["Pressure"] = sensor_6_pressure;
+    Sensor_6["Last_Seen"] = sensor_6_last_seen;
+    Sensor_6["Sends"] = sensor_6_transmissions;
+
+    JsonObject Sensor_7 = JSON_sendable["Sensor_7"].to<JsonObject>();
+    Sensor_7["Temp"] = sensor_7_temp;
+    Sensor_7["Humi"] = sensor_7_humidity;
+    Sensor_7["Pressure"] = sensor_7_pressure;
+    Sensor_7["Last_Seen"] = sensor_7_last_seen;
+    Sensor_7["Sends"] = sensor_7_transmissions;
+
+    JsonObject Sensor_8 = JSON_sendable["Sensor_8"].to<JsonObject>();
+    Sensor_8["Temp"] = sensor_8_temp;
+    Sensor_8["Humi"] = sensor_8_humidity;
+    Sensor_8["Pressure"] = sensor_8_pressure;
+    Sensor_8["Last_Seen"] = sensor_8_last_seen;
+    Sensor_8["Sends"] = sensor_8_transmissions;
+
+    JsonObject Sensor_9 = JSON_sendable["Sensor_9"].to<JsonObject>();
+    Sensor_9["Temp"] = sensor_9_temp;
+    Sensor_9["Humi"] = sensor_9_humidity;
+    Sensor_9["Pressure"] = sensor_9_pressure;
+    Sensor_9["Last_Seen"] = sensor_9_last_seen;
+    Sensor_9["Sends"] = sensor_9_transmissions;
+
+    JsonObject Sensor_10 = JSON_sendable["Sensor_10"].to<JsonObject>();
+    Sensor_10["Temp"] = sensor_10_temp;
+    Sensor_10["Humi"] = sensor_10_humidity;
+    Sensor_10["Pressure"] = sensor_10_pressure;
+    Sensor_10["Last_Seen"] = sensor_10_last_seen;
+    Sensor_10["Sends"] = sensor_10_transmissions;
+
+    JsonObject Sensor_11 = JSON_sendable["Sensor_11"].to<JsonObject>();
+    Sensor_11["Temp"] = sensor_11_temp;
+    Sensor_11["Humi"] = sensor_11_humidity;
+    Sensor_11["Pressure"] = sensor_11_pressure;
+    Sensor_11["Last_Seen"] = sensor_11_last_seen;
+    Sensor_11["Sends"] = sensor_11_transmissions;
+
+    JsonObject Sensor_12 = JSON_sendable["Sensor_12"].to<JsonObject>();
+    Sensor_12["Temp"] = sensor_12_temp;
+    Sensor_12["Humi"] = sensor_12_humidity;
+    Sensor_12["Pressure"] = sensor_12_pressure;
+    Sensor_12["Last_Seen"] = sensor_12_last_seen;
+    Sensor_12["Sends"] = sensor_12_transmissions;
+
+    // ================= ENVIRONMENT =================
+    JsonObject Environment = JSON_sendable["Environment"].to<JsonObject>();
+    Environment["Solar_Radiation"] = average_solar_radiation;
+    Environment["Wind_Speed"] = average_wind_speed;
+
+    // ================= SERIALIZATION =================
+
+                // ================= SERIALIZATION =================
+
+            size_t len_sd   = serializeJsonPretty(JSON_sendable, sendable_to_sd_card); // serializeJsonPretty
+            size_t len_cloud = serializeJson(JSON_sendable, sendable_to_cloud_db);
+
+            if (len_sd == 0 || len_cloud == 0) {
+                snprintf(serialization_log,
+                        sizeof(serialization_log),
+                        "[JSON] Serialization failed!");
+                LOG(serialization_log);
+                return false;
+            }
+
+            // Optional: detect truncation (ArduinoJson does NOT null-terminate if truncated)
+            if (len_sd >= sizeof(sendable_to_sd_card) ||
+                len_cloud >= sizeof(sendable_to_cloud_db))
+            {
+                snprintf(serialization_log,
+                        sizeof(serialization_log),
+                        "[JSON] WARNING: Buffer may be too small (truncation detected)");
+                LOG(serialization_log);
+            }
+
+            bound_successfully = true;
+
+            snprintf(serialization_log,
+                    sizeof(serialization_log),
+                    "[JSON] Serialized OK | SD: %u bytes | Cloud: %u bytes",
+                    (unsigned int)len_sd,
+                    (unsigned int)len_cloud);
+
+            LOG(serialization_log);
+
+
+    return bound_successfully;
+}
+
+
+
+
+bool bind_dynamic_data_into_csv(){
+
+    bool bound_successfully = false;
+
+    // Clear buffer
+    memset(sendable_to_sd_card_csv, 0, sizeof(sendable_to_sd_card_csv));
+
+    // Build single CSV row
+    int len = snprintf(
+        sendable_to_sd_card_csv,
+        sizeof(sendable_to_sd_card_csv),
+
+        // ================= HEADER ORDER =================
+        "%s,%s," // System + Dryer snapshot [Date, Time]
+     //   "%.2f,%.2f,%.2f,"   
+        "%.2f,%.2f,%.2f,"                  // Sensor 1
+        "%.2f,%.2f,%.2f,"                  // Sensor 2
+        "%.2f,%.2f,%.2f,"                  // Sensor 3
+        "%.2f,%.2f,%.2f,"                  // Sensor 4
+        "%.2f,%.2f,%.2f,"                  // Sensor 5
+        "%.2f,%.2f,%.2f,"                  // Sensor 6
+        "%.2f,%.2f,%.2f,"                  // Sensor 7
+        "%.2f,%.2f,%.2f,"                  // Sensor 8
+        "%.2f,%.2f,%.2f,"                  // Sensor 9
+        "%.2f,%.2f,%.2f,"                  // Sensor 10
+        "%.2f,%.2f,%.2f,"                  // Sensor 11
+        "%.2f,%.2f,%.2f,"                  // Sensor 12
+        "%.2f,%.2f,%llu,%.2f\n",                     // Environment [solar, wind], uptime, voltage
+
+        // ================= VALUES =================
+        SystemDate,
+        ShortTime_am_pm, //ShortTime, //SystemTime, 
+        // average_temp,
+       // average_humi,
+       // average_press,
+
+        sensor_1_temp, sensor_1_humidity, sensor_1_pressure,
+        sensor_2_temp, sensor_2_humidity, sensor_2_pressure,
+        sensor_3_temp, sensor_3_humidity, sensor_3_pressure,
+        sensor_4_temp, sensor_4_humidity, sensor_4_pressure,
+        sensor_5_temp, sensor_5_humidity, sensor_5_pressure,
+        sensor_6_temp, sensor_6_humidity, sensor_6_pressure,
+        sensor_7_temp, sensor_7_humidity, sensor_7_pressure,
+        sensor_8_temp, sensor_8_humidity, sensor_8_pressure,
+        sensor_9_temp, sensor_9_humidity, sensor_9_pressure,
+        sensor_10_temp, sensor_10_humidity, sensor_10_pressure,
+        sensor_11_temp, sensor_11_humidity, sensor_11_pressure,
+        sensor_12_temp, sensor_12_humidity, sensor_12_pressure,
+
+        average_solar_radiation,
+        average_wind_speed,
+        (unsigned long long)(now_now_ms / 1000), // converted to secs
+         voltage
+       
+    );
+
+    // ================= VALIDATION =================
+    if (len <= 0) {
+        snprintf(csv_bind_log,
+                 sizeof(csv_bind_log),
+                 "[CSV] Serialization failed!");
+        LOG(csv_bind_log);
+        return false;
+    }
+
+    if (len >= sizeof(sendable_to_sd_card_csv)) {
+        snprintf(csv_bind_log,
+                 sizeof(csv_bind_log),
+                 "[CSV] WARNING: Buffer too small (truncated)");
+        LOG(csv_bind_log);
+    }
+
+    bound_successfully = true;
+
+    snprintf(csv_bind_log,
+             sizeof(csv_bind_log),
+             "[CSV] Serialized OK | %u bytes",
+             (unsigned int)len);
+
+    LOG(csv_bind_log);
+
+    return bound_successfully;
+}
+
+
+
+/*
+bool bind_dynamic_data_into_json(){
   bool bound_successfully = false;
            JSON_sendable.clear();
            save_counter++; // save this into EEPROM or SPIFFS
@@ -1183,7 +3130,10 @@ bool bind_datasets_into_json(){
         System["Voltage"] = voltage;
         System["Internal_Temp"] = cabin_temperature;
         System["Internal_Fan"] = inner_fan_status;
-        
+        System["OTA_Status"] = ota_log;
+        System["LastOTA_Update"] = LastOTAUpdate;
+
+        System["SD_REMAINING_SPACE"] = storage;
 
         // SNAPSHOTS OF READINGS AT A CERTAIN TIME, NOT CUMMULATED MEDIANS/MEANS
         JsonObject Dryer_Conditions      = JSON_sendable["Dryer_Conditions"].to<JsonObject>();
@@ -1192,25 +3142,14 @@ bool bind_datasets_into_json(){
         Dryer_Conditions["Average_Humidity"] = average_humi;
         Dryer_Conditions["Average_Pressure"] = average_press;
 
-        Dryer_Conditions["Humidity_Fans"] = humi_fan_on; // state of fan
-        Dryer_Conditions["Humidity_Fans_Start_Time"] = humi_fans_start_time_str; // most recent time of ON
-        Dryer_Conditions["Humidity_Fans_Stop_Time"] = humi_fan_stop_time_str;
-        Dryer_Conditions["Humidity_Fans_ON_Duration"] = humi_fan_duration;
-
-        Dryer_Conditions["Cooling_Fans"] = cooling_fan_on;
-        Dryer_Conditions["Cooling_Fans_Start_Time"] = cooling_fan_stop_time_str; 
-        Dryer_Conditions["Cooling_Fans_Start_Time"] = cooling_fans_start_time_str; // most recent time of ON
-        Dryer_Conditions["Cooling_Fans_Stop_Time"] = cooling_fan_stop_time_str;
-        Dryer_Conditions["Cooling_Fans_ON_Duration"] = cooling_fan_duration;
         
-        
-
         //ALL SENSOR COMBINED SENSOR PARAMETERS
         JsonObject All_Sensors      = JSON_sendable["All_Sensors"].to<JsonObject>();
     for(int i = 0; i < active_sensors; i++){ 
-        All_Sensors["Temperature_Readings"][i] = temperature_readings[i];
-        All_Sensors["Humidity_Readings"][i] = humidity_readings[i];
-        All_Sensors["Pressure_Readings"][i] = pressure_readings[i];
+        All_Sensors["Temperature_Readings"][i] = historical_temperature_readings[i];
+        All_Sensors["Humidity_Readings"][i] = historical_humidity_readings[i];
+        All_Sensors["Pressure_Readings"][i] = historical_pressure_readings[i];
+        All_Sensors["Time"][i] = time_stamps[i];
     }   
 
         // ---------------- INDIVIDUAL SENSORS ----------------
@@ -1223,18 +3162,7 @@ bool bind_datasets_into_json(){
           Sensor_1["Last_Seen"] =   sensor_1_last_seen;
           Sensor_1["Sends"]     =   sensor_1_transmissions;
 
-  /*
-       // time series readings/... we shall do this later
-          JsonArray readings1 = Sensor_1["Time_Series_Readings"].to<JsonArray>();
-          JsonArray times1    = Sensor_1["Timestamps"].to<JsonArray>();
-          for (int i = 0; i < 30; i++) {
-              readings1.add(sensor_1_temp_readings[i]);
-              readings1.add(sensor_1_humi_readings[i]);
-              readings1.add(sensor_1_press_readings[i]);
-              times1.add(sensor_1_time_stamps[i]);
-          }
-
-  */
+  
         // SENSOR 2 PARAMETERS
       JsonObject Sensor_2    = JSON_sendable["Sensor_2"].to<JsonObject>();
           Sensor_2["Position"]     = "AIR INLET 2";
@@ -1331,7 +3259,7 @@ bool bind_datasets_into_json(){
         // SENSOR 12 PARAMETERS
       JsonObject Sensor_12    = JSON_sendable["Sensor_12"].to<JsonObject>();
           Sensor_12["Position"]     = "DRYING BED AMBIENT ZONE";
-          Sensor_12["Temp"]      =   sensor_1_temp;
+          Sensor_12["Temp"]      =   sensor_12_temp;
           Sensor_12["Humi"]      =   sensor_12_humidity;
           Sensor_12["Pressure"]  =   sensor_12_pressure;
           Sensor_12["Last_Seen"] =   sensor_12_last_seen;
@@ -1339,18 +3267,19 @@ bool bind_datasets_into_json(){
 
           // SOLAR RADIATION DATA // WIND SPEED DATA
       JsonObject Environment    = JSON_sendable["Environment"].to<JsonObject>();
-          Environment["Solar_Radiation"]     = solar_radiation;
-          Environment["Wind_Speed"]     = wind_speed;
+          Environment["Solar_Radiation"]     = average_solar_radiation;
+          Environment["Wind_Speed"]     = average_wind_speed;
           
           // --- Serialize into a buffer or string ---
            size_t len = serializeJsonPretty(JSON_sendable, sendable_to_sd_card); /// to save to data.json, then as dada.csv
-           serializeJson(JSON_sendable, sendabe_to_cloud_db);  // to send via the 4G SIM to upload_to_web_of_iot(sendabe_to_cloud_db)
+           serializeJson(JSON_sendable, sendable_to_cloud_db);  // to send via the 4G SIM to upload_to_web_of_iot(sendable_to_cloud_db)
 
-
+      
           if (active_sensors <= 0) { // to prevent garbage writes when sensors fail.
               LOG("[JSON] No active sensors. Skipping bind.");
               return false;
           }
+          
 
           if (len <= 0) {
               LOG("[JSON] Serialization failed!");
@@ -1364,14 +3293,14 @@ bool bind_datasets_into_json(){
             LOG("[JSON] Serialization successful.");
             LOG("[JSON] Payload size: " + String(len) + " bytes");
             LOG("[JSON] --- Payload Preview ---");
-           //   LOG(sendable_to_sd_card); // optional: can be commented out if too large//
+            LOG(sendable_to_sd_card); // optional: can be commented out if too large//
           } 
           
   return bound_successfully;
 
  
 }
-
+*/
 
 /* LOG SENSOR DROPOUTS AS WELL
 "Events": [
@@ -1449,25 +3378,24 @@ void MonitorBattery() {
 void update_power_settings() {
     switch (current_power) {
         case POWER_CRITICAL:
-            read_frequency = 120ULL * 60ULL * 1000ULL; // 120 minutes
+            data_update_interval = 120ULL * 60ULL * 1000ULL; // 120 minutes
             break;
         case POWER_LOW:
-            read_frequency = 30ULL * 60ULL * 1000ULL;  // 30 minutes
+            data_update_interval = 30ULL * 60ULL * 1000ULL;  // 30 minutes
             break;
         case POWER_MODERATE:
-            read_frequency = 10ULL * 60ULL * 1000ULL;  // 10 minutes
+            data_update_interval = 10ULL * 60ULL * 1000ULL;  // 10 minutes
             break;
         case POWER_EXCELLENT:
-            read_frequency = 10ULL * 1000ULL;          // 10 seconds
+            data_update_interval = 10ULL * 1000ULL;          // 10 seconds
             break;
     }
     
     Serial.printf("Power mode %d: Read frequency = %.1f minutes\n", 
-                 current_power, (float)read_frequency / 60000.0f);
+                 current_power, (float)data_update_interval / 60000.0f);
 }
 
 //  Serial.print("Inside Temp: "); Serial.print(cabin_temperature);  Serial.print("\tFAN: ");
-
 
 
 void monitor_box_conditions() {
@@ -1476,43 +3404,42 @@ void monitor_box_conditions() {
     cabin_temperature = real_time.getTemperature();
 
     // ---------- FAN CONTROL (with hysteresis) ----------
-    if (cabin_temperature >= 29.0f) { // turn fan ON
+    
+    if (cabin_temperature >= 29.5f && !innerFan_ON) { // turn fan ON
         digitalWrite(innerFAN, HIGH);
         innerFan_ON = true;
         buzzer.beep(1, 50, 0);
     }
-    else if (cabin_temperature <= 25.0f) { // turn fan OFF
+    else if (cabin_temperature <= 27.0f && innerFan_ON) { // turn fan OFF
         digitalWrite(innerFAN, LOW);
         innerFan_ON = false;
-       // buzzer.beep(1, 50, 0);
+        buzzer.beep(2, 300, 200);
     }
 
     // ---------- NIGHT LIGHT CONTROL ----------
     // ON from 8:00 → 07:00
-    bool isNight = (hr >= 20 || hr < 7);
 
-    if (isNight) { // turn light ON
+    if (is_night_time && !night_Light_ON) { // turn light ON
         digitalWrite(night_Light, HIGH);
         night_Light_ON = true;
         buzzer.beep(1, 100, 0);
     }
-    else if (!isNight) { // turn light OFF
+    else if (!is_night_time && night_Light_ON) { // turn light OFF
         digitalWrite(night_Light, LOW);
         night_Light_ON = false;
-        //buzzer.beep(2, 100, 100);
+        buzzer.beep(2, 100, 100);
     }
 
     // ---------- STATUS LOG ----------
     snprintf(
                 internals_log,
                 sizeof(internals_log),
-                "Box Temp: %.1fC | Fan: %s | Night Light: %s",
+                "SD: %s | System Temp: %.1fC | Fan: %s",
+                sd_initialized?"Initialized":"Failed!",
                 cabin_temperature,
-                innerFan_ON ? "ON" : "OFF",
-                night_Light_ON ? "ON" : "OFF"
+                innerFan_ON ? "ON" : "OFF"
+                
            );
-
-    //Serial.println(internals_log);
     
 }
 
@@ -1629,6 +3556,52 @@ bool switch_radio_to_wifi() {
   return false;
 }
 
+// ====== Wi-Fi Connect Cycle ======
+bool connectKnownWiFi() {
+  bool connected_state = false;
+  
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(true);
+  delay(100);
+
+  int n = WiFi.scanNetworks();
+  if (n <= 0) return false;
+
+  int bestIndex = -1, bestRSSI = -999;
+  for (int i = 0; i < n; i++) {
+    String foundSSID = WiFi.SSID(i);
+    int32_t rssi = WiFi.RSSI(i);
+    for (int j = 0; j < knownCount; j++) {
+      if (foundSSID == knownNetworks[j].SECRET_SSID) {
+        if (rssi > bestRSSI) { bestRSSI = rssi; bestIndex = j; }
+      }
+    }
+  }
+
+  if (bestIndex == -1) return false;
+
+  WiFi.begin(knownNetworks[bestIndex].SECRET_SSID, knownNetworks[bestIndex].SECRET_PASS);
+  unsigned long startAttempt = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 10000) {
+    delay(100);
+    yield();
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    //err = 14;
+    //error_log(err);
+    connected_state = true;
+   // return true;
+  } else { // WiFi connection failed
+    //err = 15;
+    //error_log(err);
+    connected_state = false;
+   // return false;
+  }
+
+  return connected_state;
+}
+
 // Add dynamic sleep based on conditions
 void optimize_power_consumption() {
     // Reduce update frequency during night/low activity
@@ -1636,7 +3609,7 @@ void optimize_power_consumption() {
     bool low_activity = (average_temp < 18.0 && average_humi > 60.0); // go to idle at night
     
     if (is_night && low_activity) {
-      read_frequency = 30ULL * 60ULL * 1000ULL;
+      data_update_interval = 30ULL * 60ULL * 1000ULL;
       fans_are_togglable = false;
         // Extend reading intervals
         // Consider deep sleep between readings
@@ -1675,13 +3648,13 @@ void initializeOTA() {
     ArduinoOTA.setPassword(OTA_PASS);
 
     ArduinoOTA
-        .onStart([]() { otaStarted = true; }) 
-        .onEnd([]() { otaFinished = true;}) 
-        .onProgress([](unsigned int progress, unsigned int total) {
+        .onStart([]() { otaStarted = true; otaProgress = false;}) 
+        .onEnd([]() { otaFinished = true; otaProgress = false; }) 
+        .onProgress([](unsigned int progress, unsigned int total) { otaProgress = true;
            // snprintf(ota_log, sizeof(ota_log), "Progress: %u%%", (progress * 100) / total);
            // flash(now_now_ms, blinker, 50, 50, 0, 0);
         })
-        .onError([](ota_error_t error) { otaError = true;
+        .onError([](ota_error_t error) { otaError = true; otaProgress = false;
             snprintf(ota_log, sizeof(ota_log), "Error[%u]: ", error);
             if (error == OTA_AUTH_ERROR)
                 strcat(ota_log, "Auth Failed");
@@ -1704,116 +3677,7 @@ void initializeOTA() {
 
 
 
-/*
-float total_bmp_readings = 0.00;
-float total_humi_readings = 0.00;
 
-uint8_t which_temperature = 0;
-
-int i = 0;
-void read_temperatures(){
-    
-  //  for(int i = 0; i < 10; i++){
-    while(i < 10){
-      cumulated_temp_readings[i] =  bmp.readTemperature();
-      if(cumulated_temp_readings[i] >= 5.0) {total_bmp_readings += cumulated_temp_readings[i]; i++; }
-   //   delay(5000); // instead take other readings and do other things in the 5 second gap
-    }
-
-        temp1 = total_bmp_readings/(i);
- 
-        average_temp = 0.00;
-        temp1 = bmp.readTemperature(); atm_pressure = bmp.readPressure(); elevation = bmp.readAltitude(1013.25);
-        temp2 = dht.readTemperature(); humidity = dht.readHumidity(); temp_fara = dht.readTemperature(true); // falanahait
-
-        heat_index = dht.computeHeatIndex(temp2, humidity, false);
-
-        if(temp1 > 0.0 && temp2 > 0.0){ // so we don't get half a value when one is zero
-            average_temp = (temp1 + temp2)/2.0;
-             dtostrf(average_temp, 3, 1, temp_str); // strcat(temp_str, "C"); 27.8
-             dtostrf(humidity, 3, 1, humi_str);
-            which_temperature = 1;
-        }
-
-        else { // if any iz zero or both
-        //if both give zero... impossible here in Africa.... 
-          if(temp1 <= 0.0 && temp2 <= 0.0) { 
-                strcpy(temp_str_log, "Error Taking Temperature Readings");
-                strcpy(humi_str_log, "Error Taking Humidity Readings");
-                which_temperature = 6;
-             }
-
-          else{
-
-
-              if(temp1 <= 0.00 || isnan(temp1)) average_temp = temp2; // take the non zero
-              if(temp2 <= 0.00 || isnan(temp2)) average_temp = temp1; // take the non zero
-                  which_temperature = 2;
-              if(temp1 - temp2 >= 10.0){ // too high a disparity
-                  average_temp = temp2;  // take the lower  
-                  which_temperature = 3;
-              }
-              if(temp2 - temp1 >= 10.0){ // too high a disparity
-                  average_temp = temp1; // take the lower
-                  which_temperature = 4; 
-              }
-
-          dtostrf(average_temp, 3, 1, temp_str);
-          dtostrf(humidity, 3, 1, humi_str);
-
-             } // both are not is_nan
-        } // 
-
-
- 
-    Serial.print("Temperature Order: ");    Serial.println(which_temperature);
-    Serial.print(F("Temperature 1 = "));    Serial.print(temp1, 2); Serial.println(" °C ");
-    Serial.print(F("Temperature 2 = "));    Serial.print(temp2, 3);    Serial.println(F("°C "));
-    Serial.print(F("AVG TEMP: "));  Serial.print(temp_str);  Serial.println(F("°C ")); Serial.println();
-
-    Serial.print(F("Pressure = "));    Serial.print(atm_pressure);    Serial.println(" Pa");
-
-    Serial.print(F("Approx altitude = "));    Serial.print(elevation);    Serial.println(" m");
-
-
-    Serial.print(F("Humidity: "));  Serial.println(humidity);
- 
-    //Serial.print(F("Heat index: "));  Serial.print(heat_index);  Serial.print(F("°C "));
-
-
-      Serial.println();
-
-}
-
-*/
-
-
-
-void initiate_bmp280(){
-  
-        Serial.println(F("BMP280 test"));
-        unsigned status;
-        //status = bmp.begin(BMP280_ADDRESS_ALT, BMP280_CHIPID);
-        status = bmp.begin();
-        if (!status) {
-          Serial.println(F("Could not find a valid BMP280 sensor, check wiring or "
-                            "try a different address!"));
-          Serial.print("SensorID was: 0x"); Serial.println(bmp.sensorID(),16);
-          Serial.print("        ID of 0xFF probably means a bad address, a BMP 180 or BMP 085\n");
-          Serial.print("   ID of 0x56-0x58 represents a BMP 280,\n");
-          Serial.print("        ID of 0x60 represents a BME 280.\n");
-          Serial.print("        ID of 0x61 represents a BME 680.\n");
-          //while (1) delay(10);
-        }
-
-        /* Default settings from datasheet. */
-        bmp.setSampling(Adafruit_BMP280::MODE_NORMAL,     /* Operating Mode. */
-                        Adafruit_BMP280::SAMPLING_X2,     /* Temp. oversampling */
-                        Adafruit_BMP280::SAMPLING_X16,    /* Pressure oversampling */
-                        Adafruit_BMP280::FILTER_X16,      /* Filtering. */
-                        Adafruit_BMP280::STANDBY_MS_500); /* Standby time. */
-}
-  
 
 /*
 void enforce_bus_quiet() {
@@ -1873,10 +3737,10 @@ void upload_to_web_of_iot(){ // (no leak, better status handling)
 }
 */
 
+/*
 void upload_to_web_of_iot(){
    //  Serial.print("\tData to send via HTTP POST => ");    Serial.println(dataPack);    Serial.print("\tTo: "); Serial.println(serverName); 
    
-    digitalWrite(server_led, HIGH);
     
     // WiFiClientSecure client;
     //client.setInsecure();
@@ -1943,10 +3807,9 @@ void upload_to_web_of_iot(){
     //lastTime = millis();
   //}
 
-  digitalWrite(server_led, LOW);
 }
 
-
+*/
 
 
 
@@ -1981,7 +3844,6 @@ void sleep_dynamically() {
             Serial.printf("Deep Sleep: %.1f hours\n", dynamic_interval / 3.6e9);
 
             // Graceful shutdown sequence
-            digitalWrite(sensorsRelay, HIGH); // Turn off sensor power
             digitalWrite(innerFAN, LOW);
             
             // Update display for shutdown
@@ -2091,168 +3953,130 @@ void initialize_RTC(){
 
 
 
+void query_rtc(){
 
-
-void query_rtc(){ //Serial.println("Time Check!"); Serial.println();
     char root[5] = "th";
+
     char daysOfTheWeek[7][12] = {"Sun", "Mon", "Tue", "Wed", "Thur", "Fri", "Sat"};
-    char Moonth[12][12] = {"January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"};
-    char short_Month[12][10] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sept", "Oct", "Nov", "Dec"};
+    char Moonth[12][12] = {"January", "February", "March", "April", "May", "June",
+                           "July", "August", "September", "October", "November", "December"};
+    char short_Month[12][10] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                "Jul", "Aug", "Sept", "Oct", "Nov", "Dec"};
 
-    char hr_str[5] = ""; char min_str[5] = ""; char sec_str[5] = ""; 
-    char day_str[15] = ""; char date_str[10] = ""; 
-    char mth_str[15] = ""; char short_mth_str[12] = ""; char yr_str[7] = ""; 
-    char zero_holder[4] = "0"; char bucket[4] = "";
+    char hr_str[5] = "";
+    char min_str[5] = "";
+    char sec_str[5] = "";
+    char day_str[15] = "";
+    char date_str[10] = "";
+    char mth_str[15] = "";
+    char short_mth_str[12] = "";
+    char yr_str[7] = "";
 
-    uint8_t datey = 0; uint8_t reminder = 0; // for correcting 24 hour clock
+    uint8_t datey = 0;
+    uint8_t reminder = 0;
 
-  // if(running_ticks%10 == 0){ //query for time once every 10 seconds
-  if(clock_is_working){
-            DateTime time_now = real_time.now();
+    if(clock_is_working){
 
-              hr = time_now.hour(); mint = time_now.minute();  sec = time_now.second();
-              datey = time_now.day(); mth = time_now.month();  mwaka = time_now.year(); day_ = time_now.dayOfTheWeek();
-              cabin_temperature = real_time.getTemperature();
-            if(hr > 24){ 
-                // DateTime now = real_time.now();
-              // while(recursive_counter < 5){ query_rtc(); recursive_counter++;}
+        DateTime time_now = real_time.now();
 
-                hr = 24; mint = 59; sec = 59;  /*beep(2);*/ Serial.println("Time Chip Failed!");
+        hr = time_now.hour();
+        mint = time_now.minute();
+        sec = time_now.second();
 
-              }
-                  reminder = (hr%12);
-                if(hr<=12) itoa(hr, hr_str, 10);  // 00: - 12:
-                else   itoa(reminder, hr_str, 10); // 13: - 23:
-                itoa(mint, min_str, 10); 
-                itoa(sec, sec_str, 10);  
-                itoa(datey, date_str, 10); 
-                strncpy(day_str, daysOfTheWeek[day_], sizeof(day_str));
-                strncpy(mth_str, Moonth[mth-1], sizeof(mth_str));  
-                strncpy(short_mth_str, short_Month[mth-1], sizeof(short_mth_str)); 
-                itoa(mwaka, yr_str, 10);
-  
-              //construct the time sequences
-        if(hr<=9){  strcpy(ShortTime, zero_holder); strcat(ShortTime, hr_str);  } 
-        else {
-             strcpy(ShortTime, hr_str); 
+        datey = time_now.day();
+        mth   = time_now.month();
+        mwaka = time_now.year();
+        day_  = time_now.dayOfTheWeek();
+
+        cabin_temperature = real_time.getTemperature();
+
+        if(hr > 24){
+            hr = 24; mint = 59; sec = 59;
+            Serial.println("Time Chip Failed!");
         }
-        strcat(ShortTime, ":"); 
-        if(mint<=9){strcat(ShortTime, zero_holder);} 
-                    strcat(ShortTime, min_str); // HH:MM
 
-                    strcpy(SystemTime, ShortTime);  strcat(SystemTime, ":"); strcat(SystemTime, sec_str); // HH:MM:SS
+        // ---- 12 hour correction ----
+        reminder = (hr % 12);
+        uint8_t display_hr = (hr <= 12) ? hr : reminder;
+        if(display_hr == 0) display_hr = 12;  // midnight case
 
-          
-          strcpy(ShortTime_am_pm, ShortTime);
-          strcat(ShortTime_am_pm, (hr<12)?" am":" pm");
+        // ---- Safe numeric conversions with zero padding ----
+        snprintf(hr_str,  sizeof(hr_str),  "%02u", display_hr);
+        snprintf(min_str, sizeof(min_str), "%02u", mint);
+        snprintf(sec_str, sizeof(sec_str), "%02u", sec);
+        snprintf(date_str,sizeof(date_str),"%02u", datey);
+        snprintf(yr_str,  sizeof(yr_str),  "%u", mwaka);
 
+        // ---- Copy text safely ----
+        snprintf(day_str,        sizeof(day_str),        "%s", daysOfTheWeek[day_]);
+        snprintf(mth_str,        sizeof(mth_str),        "%s", Moonth[mth-1]);
+        snprintf(short_mth_str,  sizeof(short_mth_str),  "%s", short_Month[mth-1]);
 
-          //construct the date sequence
-          strcpy(SystemDate, day_str); strcat(SystemDate, " "); strcat(SystemDate, date_str);
-          strcpy(ShortDate, date_str); strcat(ShortDate, "-"); strcat(ShortDate, short_mth_str); strcat(ShortDate, "-"); strcat(ShortDate, yr_str);
-        
-         if(datey == 1 || datey == 21 || datey == 31) strcpy(root, "st");
-         if(datey == 2 || datey == 22 ) strcpy(root, "nd");
-         if(datey == 3 || datey == 23 ) strcpy(root, "rd");
-         else strcpy(root, "th");
-         strcat(SystemDate, root); strcat(SystemDate, " ");
-         strcat(SystemDate, mth_str); strcat(SystemDate, ", "); strcat(SystemDate, yr_str);
-  
-                  Serial.println();
-                  Serial.print("Internal Temperature: "); Serial.println(cabin_temperature);
-                  Serial.print("Short Time: ");  Serial.println(ShortTime);
-                  Serial.print("Short Time AM/PM: ");  Serial.println(ShortTime_am_pm);
-                  Serial.print("Full System Time: "); Serial.print(SystemTime); 
-                  Serial.print("\tSystem Date: "); Serial.println(SystemDate); Serial.println();
-                  Serial.println();
-  
-       //  if (minute == 0 || minute == 10 || minute == 20 || minute == 30 || minute == 40 || minute == 50){ 
-       if (mint % 10 == 0){ // every 10 mins
-            if(!data_sent) can_send = true;  // trigger sending once
-            else can_send = false; // already sent in this minute
-            } 
-      else data_sent = false; // reset for the next 10-min cycle
-        
-       } // if clock is working
+        // ===============================
+        // Construct Time Strings
+        // ===============================
 
-       else {
-           if(now_now_ms - last_upload_time_ms >= upload_fequency){ // 
+        snprintf(ShortTime, sizeof(ShortTime), "%s:%s", hr_str, min_str);
+        snprintf(SystemTime, sizeof(SystemTime), "%s:%s", ShortTime, sec_str);
+        snprintf(ShortTime_am_pm, sizeof(ShortTime_am_pm),
+                 "%s %s", ShortTime, (hr < 12) ? "am" : "pm");
+
+        // ===============================
+        // Date suffix logic (fixed bug)
+        // ===============================
+        if(datey == 1 || datey == 21 || datey == 31)
+            snprintf(root, sizeof(root), "st");
+        else if(datey == 2 || datey == 22)
+            snprintf(root, sizeof(root), "nd");
+        else if(datey == 3 || datey == 23)
+            snprintf(root, sizeof(root), "rd");
+        else
+            snprintf(root, sizeof(root), "th");
+
+        // ===============================
+        // Construct Date Strings
+        // ===============================
+
+        snprintf(SystemDate, sizeof(SystemDate),
+                 "%s %s%s %s %s",
+                 day_str, date_str, root, mth_str, yr_str);
+
+        snprintf(ShortDate, sizeof(ShortDate),
+                 "%s-%s-%s",
+                 date_str, short_mth_str, yr_str);
+
+        // ===============================
+        // Debug Output
+        // ===============================
+        Serial.println();
+        Serial.print("Internal Temperature: "); Serial.println(cabin_temperature);
+        Serial.print("Short Time: "); Serial.println(ShortTime);
+        Serial.print("Short Time AM/PM: "); Serial.println(ShortTime_am_pm);
+        Serial.print("Full System Time: "); Serial.print(SystemTime);
+        Serial.print("\tSystem Date: "); Serial.println(SystemDate);
+        Serial.println();
+
+        // ===============================
+        // 10-Minute Trigger Logic
+        // ===============================
+        if(mint % 10 == 0){
+            if(!data_sent) can_send = true;
+            else can_send = false;
+        }
+        else{
+            data_sent = false;
+        }
+    }
+
+    // ===============================
+    // Fallback Timing Mode
+    // ===============================
+    else{
+        if(now_now_ms - last_upload_time_ms >= upload_fequency){
             can_send = true;
-           // if(!data_sent) can_send = true;
-          //  else can_send = false;
-            last_upload_time_ms = now_now_ms; 
-          }
-       }
-
-
-}
-
-
-
-
-
-void update_display(){
-  
-  if(currentScreen == 1) homepage();
-  if(currentScreen == 2) dataPage();
-
-  LCD.hibernate();
-
-}
-
-
-void dataPage(){
-  
-}
-
-
-
-
-
-const char Manufacturer[] = "IntelliSys UG";
-const char DeviceID[] = "Dryer Monitoring System";
-const char Parameter[] = "Susan M PhD Project, MUARIK";
-
-void Boot(){
-
-  LCD.setRotation(2);
-  LCD.setFont(&FreeSans12pt7b);
-  LCD.setTextColor(GxEPD_BLACK);
-
-  int16_t tbx, tby; uint16_t tbw, tbh;
-  LCD.getTextBounds(Manufacturer, 0, 0, &tbx, &tby, &tbw, &tbh);
-  // center the bounding box by transposition of the origin:
-  uint16_t x = ((LCD.width() - tbw) / 2) - tbx;
-  uint16_t y = ((LCD.height() - tbh) / 2) - tby;
-  LCD.setFullWindow();
-
-  LCD.firstPage(); //FULLY CENTERED TEXTS
-  do{
-  
-       //  LCD.fillScreen(GxEPD_BLACK); delay(2000);
-      //   LCD.fillScreen(GxEPD_RED); delay(2000);
-        LCD.fillScreen(GxEPD_WHITE);
-        LCD.setFont(&FreeSansBold24pt7b);
-
-                LCD.setTextColor(LCD.epd2.hasColor ? GxEPD_RED : GxEPD_BLACK);
-
-        LCD.setCursor(50, 100);    
-        
-        LCD.print(Manufacturer);
-
-        delay(3000);
-
-        LCD.setFont(&FreeMonoBold9pt7b);
-        LCD.getTextBounds(DeviceID, 0, 0, &tbx, &tby, &tbw, &tbh);
-
-        x = ((LCD.width() - tbw) / 2) - tbx;
-        LCD.setCursor(x, y+tbh);    LCD.print(DeviceID);
-        
-        LCD.setCursor(70, 200); LCD.print(Parameter);
-
-        delay(1000);
-
-    }  while (LCD.nextPage());
+            last_upload_time_ms = now_now_ms;
+        }
+    }
 }
 
 
@@ -2262,8 +4086,6 @@ uint16_t box_height = 95;
 bool is_home = false;
 
 // ---- Layout constants ----
-static const uint16_t SCREEN_W = 400;
-static const uint16_t SCREEN_H = 300;
 
 static const uint16_t HEADER_H = 27;
 static const uint16_t BOX_RADIUS = 10;
@@ -2289,70 +4111,6 @@ void drawInfoBox(
   LCD.setTextColor(GxEPD_WHITE);
   LCD.setCursor(x + 10, y + 18);
   LCD.print(title);
-}
-
-float temp[12];
-float humi[12];
-uint32_t entry_count = 0;
-
-char time_stamp[12][10];
-
-// ---- Data table layout ----
-static const uint16_t TABLE_X = 20;
-static const uint16_t TABLE_Y = 40;
-static const uint16_t TABLE_W = 360;
-static const uint16_t TABLE_H = 230;
-
-static const uint16_t ROW_H = 24;
-static const uint8_t  MAX_ROWS = 8;
-
-// Column widths
-static const uint16_t COL_NUM_W  = 30;
-static const uint16_t COL_TEMP_W = 95;
-static const uint16_t COL_HUMI_W = 95;
-static const uint16_t COL_TIME_W = 140;
-
-
-void drawTableFrame() {
-
-  uint16_t headerColor = (LCD.epd2.hasColor ? GxEPD_RED : GxEPD_BLACK);
-
-  // Outer border
-  LCD.drawRect(TABLE_X, TABLE_Y, TABLE_W, TABLE_H, GxEPD_BLACK);
-
-  // Header ribbon
-  LCD.fillRect(TABLE_X, TABLE_Y, TABLE_W, ROW_H, headerColor);
-
-  // Vertical lines
-  uint16_t x = TABLE_X + COL_NUM_W;
-  LCD.drawLine(x, TABLE_Y, x, TABLE_Y + TABLE_H, GxEPD_BLACK);
-
-  x += COL_TEMP_W;
-  LCD.drawLine(x, TABLE_Y, x, TABLE_Y + TABLE_H, GxEPD_BLACK);
-
-  x += COL_HUMI_W;
-  LCD.drawLine(x, TABLE_Y, x, TABLE_Y + TABLE_H, GxEPD_BLACK);
-
-  // Horizontal lines
-  for (uint16_t y = TABLE_Y + ROW_H; y < TABLE_Y + TABLE_H; y += ROW_H) {
-    LCD.drawLine(TABLE_X, y, TABLE_X + TABLE_W, y, GxEPD_BLACK);
-  }
-
-  // ---- Column titles ----
-  LCD.setFont(&FreeSans9pt7b);
-  LCD.setTextColor(GxEPD_WHITE);
-
-  LCD.setCursor(TABLE_X + 8, TABLE_Y + 17);
-  LCD.print("#");
-
-  LCD.setCursor(TABLE_X + COL_NUM_W + 12, TABLE_Y + 17);
-  LCD.print("Avg Temp");
-
-  LCD.setCursor(TABLE_X + COL_NUM_W + COL_TEMP_W + 12, TABLE_Y + 17);
-  LCD.print("Avg Humi");
-
-  LCD.setCursor(TABLE_X + COL_NUM_W + COL_TEMP_W + COL_HUMI_W + 20, TABLE_Y + 17);
-  LCD.print("Time");
 }
 
 
@@ -2417,6 +4175,1273 @@ void drawSwitch(uint16_t x, uint16_t y, bool isOn) {
   }
 }
 
+uint32_t entry_count = 0;
+
+// ---- Data table layout ----
+// Table dimensions
+static const uint16_t TABLE_X = 20;
+static const uint16_t TABLE_Y = 40;
+static const uint16_t TABLE_W = 360;
+static const uint16_t TABLE_H = 230;
+
+static const uint16_t ROW_H = 24;
+static const uint8_t  MAX_ROWS = 8;
+static const uint8_t  VISIBLE_ROWS = (TABLE_H / ROW_H) - 1; // Account for header
+
+// Column widths - ensure they sum to TABLE_W
+static const uint16_t COL_ID_W    = 40;   // Increased for better readability
+static const uint16_t COL_TEMP_W  = 80;   // Adjusted for better distribution
+static const uint16_t COL_HUMI_W  = 80;   // Adjusted for better distribution
+static const uint16_t COL_PRE_W   = 85;   // Adjusted for better distribution
+static const uint16_t COL_TIME_W  = 75;   // Remaining width
+
+// Verify column widths sum correctly
+static_assert(COL_ID_W + COL_TEMP_W + COL_HUMI_W + COL_PRE_W + COL_TIME_W == TABLE_W, 
+              "Column widths must sum to TABLE_W");
+
+// Text positioning constants
+static const uint8_t TEXT_Y_OFFSET_HEADER = 17;  // Vertical position for header text
+static const uint8_t TEXT_Y_OFFSET_ROWS = 20;    // Vertical position for row data
+static const uint8_t TEXT_X_PADDING = 10;         // Left padding for text
+
+void drawTableFrame() {
+    uint16_t headerColor = (LCD.epd2.hasColor ? GxEPD_RED : GxEPD_BLACK);
+    
+    // Outer border
+    LCD.drawRect(TABLE_X, TABLE_Y, TABLE_W, TABLE_H, GxEPD_BLACK);
+    
+    // Header ribbon
+    LCD.fillRect(TABLE_X, TABLE_Y, TABLE_W, ROW_H, headerColor);
+    
+    // Calculate column positions for cleaner code
+    uint16_t colPos[5]; // X positions for column boundaries
+    colPos[0] = TABLE_X;                    // Start
+    colPos[1] = colPos[0] + COL_ID_W;       // After ID column
+    colPos[2] = colPos[1] + COL_TEMP_W;     // After Temp column
+    colPos[3] = colPos[2] + COL_HUMI_W;     // After Humi column
+    colPos[4] = colPos[3] + COL_PRE_W;      // After Pressure column
+    
+    // Draw vertical lines
+    for (int i = 1; i < 5; i++) { // Skip first (start) and last (end)
+        LCD.drawLine(colPos[i], TABLE_Y, colPos[i], TABLE_Y + TABLE_H, GxEPD_BLACK);
+    }
+    
+    // Draw horizontal lines between rows
+    for (uint16_t y = TABLE_Y + ROW_H; y < TABLE_Y + TABLE_H; y += ROW_H) {
+        LCD.drawLine(TABLE_X, y, TABLE_X + TABLE_W, y, GxEPD_BLACK);
+    }
+    
+    // ---- Column titles ----
+    LCD.setFont(&FreeSans9pt7b);
+    LCD.setTextColor(GxEPD_WHITE);
+    
+    // Column headers with better alignment
+    LCD.setCursor(colPos[0] + TEXT_X_PADDING, TABLE_Y + TEXT_Y_OFFSET_HEADER);
+    LCD.print("ID");
+    
+    LCD.setCursor(colPos[1] + TEXT_X_PADDING, TABLE_Y + TEXT_Y_OFFSET_HEADER);
+    LCD.print("Temp");
+    
+    LCD.setCursor(colPos[2] + TEXT_X_PADDING, TABLE_Y + TEXT_Y_OFFSET_HEADER);
+    LCD.print("Humi");
+    
+    LCD.setCursor(colPos[3] + TEXT_X_PADDING, TABLE_Y + TEXT_Y_OFFSET_HEADER);
+    LCD.print("Pressure");
+    
+    LCD.setCursor(colPos[4] + TEXT_X_PADDING, TABLE_Y + TEXT_Y_OFFSET_HEADER);
+    LCD.print("Time");
+    
+    // Optional: Add units in smaller font
+    
+    LCD.setFont();
+    LCD.setTextColor(GxEPD_WHITE);
+    LCD.setCursor(colPos[1] + COL_TEMP_W - 30, TABLE_Y + TEXT_Y_OFFSET_HEADER - 2);
+    LCD.print("degC");
+    LCD.setCursor(colPos[2] + COL_HUMI_W - 20, TABLE_Y + TEXT_Y_OFFSET_HEADER - 2);
+    LCD.print("%");
+   // LCD.setCursor(colPos[3] + COL_PRE_W - 25, TABLE_Y + TEXT_Y_OFFSET_HEADER - 2);
+   // LCD.print("hPa");
+    
+}
+
+char table_log[32] = "...";
+
+// Helper function to populate a row with data
+void drawTableRow(uint8_t rowIndex, const char* id, float temp, float humi, float pressure, const char* time) {
+
+    if (rowIndex >= MAX_ROWS) {
+        strncat(table_log, "No Data to Tabulate\n",
+                sizeof(table_log) - strlen(table_log) - 1);
+        return;
+    }
+    else if(rowIndex < 0){
+       strncat(table_log, "Invalid Entry\n",
+                sizeof(table_log) - strlen(table_log) - 1);
+        return;
+    }
+
+    else if(rowIndex == 0){ // make sure to not overwrite the header
+       uint16_t yPos = TABLE_Y + (2 * ROW_H); // 
+        
+        LCD.setFont(&FreeSans9pt7b);
+        LCD.setTextColor(GxEPD_BLACK);
+        
+        // Calculate column positions
+        uint16_t colPos[5];
+        colPos[0] = TABLE_X;
+        colPos[1] = colPos[0] + COL_ID_W;
+        colPos[2] = colPos[1] + COL_TEMP_W;
+        colPos[3] = colPos[2] + COL_HUMI_W;
+        colPos[4] = colPos[3] + COL_PRE_W;
+        
+        // Draw row data
+        LCD.setCursor(colPos[0] + TEXT_X_PADDING-5, yPos + TEXT_Y_OFFSET_ROWS - ROW_H);
+        LCD.print("T_1"); 
+        
+        // Format temperature with 1 decimal
+        char tempStr[8];
+        snprintf(tempStr, sizeof(tempStr), "%.1f", temp);
+        LCD.setCursor(colPos[1] + TEXT_X_PADDING, yPos + TEXT_Y_OFFSET_ROWS - ROW_H);
+        LCD.print(tempStr);
+        
+        // Format humidity with 1 decimal
+        char humiStr[8];
+        snprintf(humiStr, sizeof(humiStr), "%.1f", humi);
+        LCD.setCursor(colPos[2] + TEXT_X_PADDING, yPos + TEXT_Y_OFFSET_ROWS - ROW_H);
+        LCD.print(humiStr);
+        
+        // Format pressure with 1 decimal
+        char preStr[8];
+        snprintf(preStr, sizeof(preStr), "%.1f", pressure);
+        LCD.setCursor(colPos[3] + TEXT_X_PADDING, yPos + TEXT_Y_OFFSET_ROWS - ROW_H);
+        LCD.print(preStr);
+        
+        LCD.setFont();
+        LCD.setCursor(colPos[4] + TEXT_X_PADDING, yPos +  TEXT_Y_OFFSET_ROWS - ROW_H - 10);
+        LCD.print(time);
+
+        return;
+    }
+
+    else { // for all d remaining entries
+        uint16_t yPos = TABLE_Y + ((rowIndex + 2) * ROW_H); // +1 to skip header
+        
+        LCD.setFont(&FreeSans9pt7b);
+        LCD.setTextColor(GxEPD_BLACK);
+        
+        // Calculate column positions
+        uint16_t colPos[5];
+        colPos[0] = TABLE_X;
+        colPos[1] = colPos[0] + COL_ID_W;
+        colPos[2] = colPos[1] + COL_TEMP_W;
+        colPos[3] = colPos[2] + COL_HUMI_W;
+        colPos[4] = colPos[3] + COL_PRE_W;
+        
+        // Draw row data
+        LCD.setCursor(colPos[0] + TEXT_X_PADDING-5, yPos + TEXT_Y_OFFSET_ROWS - ROW_H-2);
+        LCD.print(id); // stop here if no data
+        /*
+        LCD.setCursor(colPos[0] + TEXT_X_PADDING, yPos + TEXT_Y_OFFSET_ROWS - ROW_H);
+        LCD.print("T_2"); 
+        LCD.setCursor(colPos[0] + TEXT_X_PADDING, yPos + TEXT_Y_OFFSET_ROWS - ROW_H);
+        LCD.print("T_3"); 
+        LCD.setCursor(colPos[0] + TEXT_X_PADDING, yPos + TEXT_Y_OFFSET_ROWS - ROW_H);
+        LCD.print("T_4"); 
+        LCD.setCursor(colPos[0] + TEXT_X_PADDING, yPos + TEXT_Y_OFFSET_ROWS - ROW_H);
+        LCD.print("T_5"); 
+        LCD.setCursor(colPos[0] + TEXT_X_PADDING, yPos + TEXT_Y_OFFSET_ROWS - ROW_H);
+        LCD.print("T_6"); 
+        LCD.setCursor(colPos[0] + TEXT_X_PADDING, yPos + TEXT_Y_OFFSET_ROWS - ROW_H);
+        LCD.print("T_7"); 
+        */
+                       
+        // do not print zero'z
+
+            // Format temperature with 1 decimal
+        char tempStr[8];
+        snprintf(tempStr, sizeof(tempStr), "%.1f", temp);
+        LCD.setCursor(colPos[1] + TEXT_X_PADDING, yPos + TEXT_Y_OFFSET_ROWS - ROW_H);
+        LCD.print(tempStr);
+        
+        // Format humidity with 1 decimal
+        char humiStr[8];
+        snprintf(humiStr, sizeof(humiStr), "%.1f", humi);
+        LCD.setCursor(colPos[2] + TEXT_X_PADDING, yPos + TEXT_Y_OFFSET_ROWS - ROW_H);
+        LCD.print(humiStr);
+        
+        // Format pressure with 1 decimal
+        char preStr[8];
+        snprintf(preStr, sizeof(preStr), "%.1f", pressure);
+        LCD.setCursor(colPos[3] + TEXT_X_PADDING, yPos + TEXT_Y_OFFSET_ROWS - ROW_H);
+        LCD.print(preStr);
+        LCD.setFont();
+        LCD.setCursor(colPos[4] + TEXT_X_PADDING, yPos + TEXT_Y_OFFSET_ROWS - ROW_H-10);
+        LCD.print(time);
+    }
+}
+
+// Helper function to clear a specific row
+void clearTableRow(uint8_t rowIndex) {
+    if (rowIndex >= MAX_ROWS) return;
+    
+    uint16_t yPos = TABLE_Y + ((rowIndex + 1) * ROW_H);
+    LCD.fillRect(TABLE_X + 1, yPos - ROW_H + 1, TABLE_W - 2, ROW_H - 2, GxEPD_WHITE);
+}
+
+// Helper function to clear entire table content (keeps frame)
+void clearTableContent() {
+    LCD.fillRect(TABLE_X + 1, TABLE_Y + ROW_H + 1, TABLE_W - 2, TABLE_H - ROW_H - 2, GxEPD_WHITE);
+}
+
+
+
+#define LINEGRAPH 1
+#define BARGRAPH 2
+#define PIECHART 3
+
+uint8_t graph_mode = 1; // show line graph by default
+
+#define FULLTABLE 1
+#define ONLY_TEMP 2
+#define ONLY_HUMI 3
+
+uint8_t which_data_table = 1; // show all as default
+
+/*
+    homepage() → Tiles only
+    tablePage() → Pure data
+    graphPage() → Pure visualization
+    filesPage() → Directory view
+    logsPage() → Diagnostics
+    otaPage() → OTA mode
+*/
+
+bool shouldRotateScreen(uint64_t screen_time_ms = 0) {
+        // Display update (often in daytime, less frequent at night) 5mins vs 30mins
+   
+    if ((screen_time_ms - last_refresh_time_ms) >= screen_refresh_interval) {
+        last_refresh_time_ms = screen_time_ms;
+          if(currentScreen > 5) currentScreen = 1;
+          else currentScreen++;
+        return true;
+    }
+
+    return false;
+}
+
+void update_display(){
+
+    if((!shouldRotateScreen(now_now_ms)) && (!special_call)) // Most of the time: subtraction, compasison, branch, return...Calling a function every loop that usually returns immediately...microseconds
+        return;
+    //  proceed either only after timer expiring or after receiving a special call 
+
+    switch(currentScreen){
+        case 0: Boot();
+            break;
+
+        case 1: homepage(); //  with tiles of temp, humi, wind, sun
+            break;
+
+        case 2: tablePage(); // having the table of results
+            break;
+
+        case 3: graphPage(); // having graphs of inside vs outside temp
+            break;
+        
+        case 4: filesPage(); // showing the folders in main directory
+        break;
+
+        case 5: logsPage(); // files, saves, cloud sends, offline sensors, etc
+            break;
+
+        case 6: cloudPage();
+            break;
+
+        case 10: otaPage(); // showing OTA mode, WiFi, and IP
+            break;
+
+        default: errorPage();
+        break;
+    }
+
+    LCD.hibernate();
+    if(special_call)   special_call = false;  // reset after handling
+
+}
+
+
+void cloudPage(){
+
+    uint16_t accentColor = (LCD.epd2.hasColor ? GxEPD_RED : GxEPD_BLACK);
+
+    uint64_t now = now_now_ms;
+    uint64_t elapsed = now - last_upload_time_ms;
+
+    uint64_t remaining = 0;
+    if (elapsed < upload_frequency_ms)
+        remaining = upload_frequency_ms - elapsed;
+
+    uint32_t rem_sec = remaining / 1000;
+    uint16_t rem_min = rem_sec / 60;
+    uint16_t rem_s   = rem_sec % 60;
+
+    LCD.firstPage();
+    do {
+        LCD.fillScreen(GxEPD_WHITE);
+
+        // ================= HEADER =================
+        LCD.fillRect(1, 1, SCREEN_W - 2, 40, accentColor);
+
+        LCD.setFont(&FreeSans12pt7b);
+        LCD.setTextColor(GxEPD_WHITE);
+        LCD.setCursor(20, 28);
+        LCD.print("Cloud Connectivity");
+
+        LCD.setTextColor(GxEPD_BLACK);
+
+        int y = 60;
+
+        // ================= WIFI STATUS =================
+        LCD.setFont(&FreeSans9pt7b);
+
+        LCD.setCursor(10, y);
+        LCD.print("WiFi Status:");
+
+        if (wifi_connected) {
+            LCD.setCursor(160, y);
+            LCD.print("CONNECTED");
+        } else {
+            LCD.setCursor(160, y);
+            LCD.print("DISCONNECTED");
+        }
+
+        y += 25;
+
+        // ================= LAST UPLOAD =================
+        LCD.drawLine(0, y, SCREEN_W, y, GxEPD_BLACK);
+        y += 20;
+
+        LCD.setCursor(10, y);
+        LCD.printf("Last Upload: %s", last_upload_time);
+
+        y += 20;
+
+        LCD.setCursor(10, y);
+        LCD.printf("Next Upload In: %02u:%02u", rem_min, rem_s);
+
+        y += 20;
+
+        LCD.setCursor(10, y);
+        LCD.printf("Interval: %llu min",
+                   (unsigned long long)(upload_frequency_ms / 60000ULL));
+
+        y += 25;
+
+        // ================= DATA STATUS =================
+        LCD.drawLine(0, y, SCREEN_W, y, GxEPD_BLACK);
+        y += 20;
+
+        LCD.setCursor(10, y);
+        LCD.printf("Data Sent: %s", data_sent ? "YES" : "NO");
+
+        y += 20;
+
+        LCD.setCursor(10, y);
+        LCD.printf("Payload Size: %d bytes",
+                   strlen(sendable_to_cloud_db));
+
+        y += 25;
+
+        // ================= HTTP REPORT =================
+        LCD.drawLine(0, y, SCREEN_W, y, GxEPD_BLACK);
+        y += 20;
+
+        LCD.setCursor(10, y);
+        LCD.print("Last HTTP Report:");
+        y += 15;
+
+        LCD.setFont(&FreeMono9pt7b);
+        LCD.setCursor(10, y);
+        LCD.print(Uploader.get_upload_report());
+
+        y += 20;
+
+        LCD.setCursor(10, y);
+        LCD.print("Error Code:");
+        y += 15;
+
+        LCD.setCursor(10, y);
+        LCD.print(Uploader.get_error_code());
+
+        footer();
+
+    } while (LCD.nextPage());
+}
+
+/*
+void update_display(){
+
+  if(currentScreen == 1) homepage();
+  if(currentScreen == 2) dataPage();
+  if(currentScreen == 3) otaPage();
+  if(currentScreen == 4) logsPage();
+
+  LCD.hibernate();
+}
+*/
+
+void graphPage(){  //GRAPHS, CHARTS etc ----
+      LCD.firstPage();
+  do {
+
+    if(graph_mode == LINEGRAPH) { // ---- line graph for inside vs outside temps, temporally varied 
+
+        uint16_t accentColor = (LCD.epd2.hasColor ? GxEPD_RED : GxEPD_BLACK);
+
+        // ---- Header ----
+        LCD.fillRect(1, 1, SCREEN_W - 3, HEADER_H, accentColor);
+        LCD.fillRoundRect(260, 2, 120, 30, 5, GxEPD_WHITE);
+
+        LCD.setFont(&FreeSans12pt7b);
+        LCD.setTextColor(GxEPD_BLACK);
+        LCD.setCursor(270, 22);
+        LCD.print("Graphs");
+
+        LCD.setFont(&FreeSans9pt7b);
+        LCD.setTextColor(GxEPD_WHITE);
+        LCD.setCursor(20, 19);
+        LCD.print("Tiles");
+
+        LCD.setCursor(140, 19);
+        LCD.print("Data Table");
+
+        LCD.setFont();
+        LCD.setTextColor(GxEPD_RED);
+        LCD.setCursor(0, 285);
+        LCD.print(storage_status_log);
+
+        // ===============================
+        // GRAPH AREA
+        // ===============================
+
+        int graph_left   = 40;
+        int graph_right  = 360;
+        int graph_top    = 60;
+        int graph_bottom = 250;
+
+        int graph_width  = graph_right - graph_left;
+        int graph_height = graph_bottom - graph_top;
+
+        // ---- Draw Axes ----
+        LCD.drawLine(graph_left, graph_bottom, graph_right, graph_bottom, GxEPD_BLACK); // LCD.fillTriangle(); // X-axis // pointed forward
+        LCD.drawLine(graph_left, graph_bottom+1, graph_right, graph_bottom+1, GxEPD_BLACK); // LCD.fillTriangle(); // X-axis // pointed forward
+        LCD.drawLine(graph_left, graph_top, graph_left, graph_bottom, GxEPD_BLACK);    //  LCD.fillTriangle();  // Y-axis // pointed upward
+        LCD.drawLine(graph_left-1, graph_top, graph_left-1, graph_bottom, GxEPD_BLACK);    //  LCD.fillTriangle();  // Y-axis // pointed upward
+        
+                    // ---- Axis Arrows ----
+            // X-axis arrow (pointing right)
+            LCD.fillTriangle(
+                graph_right, graph_bottom,
+                graph_right - 8, graph_bottom - 5,
+                graph_right - 8, graph_bottom + 5,
+                GxEPD_BLACK
+            );
+
+            // Y-axis arrow (pointing up)
+            LCD.fillTriangle(
+                graph_left, graph_top,
+                graph_left - 5, graph_top + 8,
+                graph_left + 5, graph_top + 8,
+                GxEPD_BLACK
+            );
+
+        // ---- Only draw if we have data ----
+        if(reading_count > 1){
+            
+            //FIXED SCALING
+            float minTemp = 15.0f;
+            float maxTemp = 55.0f;
+            float range   = maxTemp - minTemp;
+            /*
+            //DYNAMIC SCALING
+
+            // Find min & max for scaling
+            float minTemp = historical_temperature_readings[0];
+            float maxTemp = historical_temperature_readings[0];
+
+            for(int i = 0; i < reading_count; i++){
+                if(historical_temperature_readings[i] < minTemp)
+                    minTemp = historical_temperature_readings[i];
+                if(historical_temperature_readings[i] > maxTemp)
+                    maxTemp = historical_temperature_readings[i];
+            }
+
+            // Prevent flat-line divide-by-zero
+            if(maxTemp - minTemp < 0.5f){
+                maxTemp += 0.5f;
+                minTemp -= 0.5f;
+            }
+
+            float range = maxTemp - minTemp;
+            */
+
+            int prev_x1 = 0, prev_y1 = 0;  // inside
+            int prev_x2 = 0, prev_y2 = 0;  // outside
+
+
+                for(int i = 0; i < reading_count; i++){
+
+                    //int x = graph_left + (graph_width * i) / 9;
+                    int x = graph_left + (graph_width * i) / (reading_count - 1);
+                    float inside  = historical_temperature_readings[i];
+                    float outside = historical_outside_temperatures[i];
+
+                    // Clamp both
+                    if(inside < minTemp) inside = minTemp;
+                    if(inside > maxTemp) inside = maxTemp;
+
+                    if(outside < minTemp) outside = minTemp;
+                    if(outside > maxTemp) outside = maxTemp;
+
+                    int y_inside  = graph_bottom - ((inside  - minTemp) / range) * graph_height;
+                    int y_outside = graph_bottom - ((outside - minTemp) / range) * graph_height;
+
+                    // ---- DRAW OUTSIDE FIRST (background line) ----
+                    LCD.fillCircle(x, y_outside, 2, GxEPD_BLACK);
+
+                    if(i > 0){
+                        LCD.drawLine(prev_x2, prev_y2, x, y_outside, GxEPD_BLACK);
+                    }
+
+                    // ---- DRAW INSIDE (accent color on top) ----
+                    LCD.fillCircle(x, y_inside, 3, accentColor);
+
+                    if(i > 0){
+                        LCD.drawLine(prev_x1, prev_y1, x, y_inside, accentColor);
+                    }
+
+                    // Store previous positions
+                    prev_x1 = x;
+                    prev_y1 = y_inside;
+
+                    prev_x2 = x;
+                    prev_y2 = y_outside;
+                }
+             // ---- Y-axis Labels ----
+                LCD.setFont(&FreeSans9pt7b);
+                LCD.setTextColor(GxEPD_BLACK);
+
+                LCD.setCursor(5, graph_top + 10);
+                LCD.print("55C");
+
+                LCD.setCursor(5, graph_bottom);
+                LCD.print("15C");
+
+             //Add faint horizontal lines every 5°C:
+             /*
+            for(int t = 20; t <= 50; t += 5){
+                int y = graph_bottom - ((t - minTemp) / range) * graph_height;
+                LCD.drawLine(graph_left, y, graph_right, y, GxEPD_RED);
+            }
+            */
+
+           // ---- Time Labels (X-axis) ----
+                LCD.setFont(&FreeSans9pt7b);
+               // LCD.setFont();
+                LCD.setTextColor(GxEPD_BLACK);
+
+                for(int i = 0; i < reading_count; i++){
+
+                    int x = graph_left + (graph_width * i) / 9;
+                    // int x = graph_left + (graph_width * i) / (reading_count - 1);
+
+                    // Only draw label if we have a valid timestamp
+                    if(strlen(time_stamps[i]) > 0){
+
+                        int label_x = x - 18;  // center under dot (HH:MM ≈ 5 chars)
+                        int label_y = graph_bottom + 18;
+
+                        // Prevent left overflow
+                        if(label_x < 2)
+                            label_x = 2;
+
+                        // Prevent right overflow
+                        if(label_x > SCREEN_W - 60)
+                            label_x = SCREEN_W - 60;
+
+                        LCD.setCursor(label_x, label_y);
+                     // LCD.print(time_stamps[i], 90);  // HH:MM // rotate to 90deg to prevent the horizontal overlaps
+                      //  if(i % 2 == 0) LCD.print(time_stamps[i]);  // HH:MM // Now labels appear every other point.
+                            int step = reading_count > 6 ? 2 : 1; // ADAPTIVE label density
+                            if(i % step == 0) LCD.print(time_stamps[i]); 
+                    }
+                }
+                
+
+            }
+    }
+
+     LCD.setFont(&FreeMono9pt7b); LCD.setTextColor(GxEPD_RED); //FreeMono9pt7b
+     LCD.setCursor(70, 70); LCD.print(active_sensors); LCD.print(" sensors active");
+
+
+  } while (LCD.nextPage());
+    
+}
+
+void filesPage(){
+
+  LCD.firstPage();
+  do {
+
+    uint16_t accentColor = (LCD.epd2.hasColor ? GxEPD_RED : GxEPD_BLACK);
+
+    // ================= HEADER =================
+    LCD.fillRect(1, 1, SCREEN_W - 3, HEADER_H, accentColor);
+    LCD.fillRoundRect(260, 2, 120, 30, 5, GxEPD_WHITE);
+
+    LCD.setFont(&FreeSans12pt7b);
+    LCD.setTextColor(GxEPD_BLACK);
+    LCD.setCursor(270, 22);
+    LCD.print("Data Files");
+
+    LCD.setFont(&FreeSans9pt7b);
+    LCD.setTextColor(GxEPD_WHITE);
+    LCD.setCursor(20, 19);
+    LCD.print("Tiles");
+
+    LCD.setCursor(140, 19);
+    LCD.print("Data");
+
+    LCD.setCursor(200, 19);
+    LCD.print("Graphs");
+
+    LCD.setFont();
+    LCD.setTextColor(GxEPD_RED);
+    LCD.setCursor(0, 285);
+    LCD.print(storage_status_log);
+
+    // ================= FILE AREA =================
+
+    int startY = 70;
+    int boxW = 150;
+    int boxH = 90;
+    int gapX = 30;
+
+    // ================= GET FILE SIZES =================
+    size_t jsonSize = 0;
+    size_t csvSize  = 0;
+
+    if (SD.exists(json_log_file)) {
+        File f = SD.open(json_log_file, FILE_READ);
+        if (f) { jsonSize = f.size(); f.close(); }
+    }
+
+    if (SD.exists(csv_log_file)) {
+        File f = SD.open(csv_log_file, FILE_READ);
+        if (f) { csvSize = f.size(); f.close(); }
+    }
+
+    // ===================================================
+    // DRAW FILE ICON FUNCTION (inline style)
+    // ===================================================
+
+    auto drawFileIcon = [&](int x, int y, const char* name,
+                            size_t sizeBytes,
+                            const char* lastSave,
+                            uint16_t color){
+
+        // Main rectangle
+        LCD.drawRect(x, y, boxW, boxH, color);
+
+        // Folded corner
+        LCD.fillTriangle(
+            x + boxW - 20, y,
+            x + boxW, y,
+            x + boxW, y + 20,
+            color
+        );
+
+        // File name
+        LCD.setFont(&FreeSans9pt7b);
+        LCD.setTextColor(color);
+        LCD.setCursor(x + 10, y + 25);
+        LCD.print(name);
+
+        // Size
+        LCD.setFont();
+        LCD.setTextColor(GxEPD_BLACK);
+        LCD.setCursor(x + 10, y + 45);
+
+        float sizeKB = sizeBytes / 1024.0f;
+        LCD.print(sizeKB, 2);
+        LCD.print(" KB");
+
+        // Last save
+        LCD.setCursor(x + 10, y + 60);
+        LCD.print("Last Saved:");
+        LCD.setCursor(x + 10, y + 75);
+        LCD.print(lastSave);
+    };
+
+    // ================= DRAW FILES =================
+
+    // JSON (left)
+    drawFileIcon(40, startY,
+                 "JSON LOG",
+                 jsonSize,
+                 last_json_save_time,
+                 accentColor);
+
+    // CSV (right)
+    drawFileIcon(40 + boxW + gapX, startY,
+                 "CSV LOG",
+                 csvSize,
+                 last_csv_save_time,
+                 GxEPD_BLACK);
+
+    // ================= FOOTER =================
+    footer();
+
+  } while (LCD.nextPage());
+}
+
+
+void logsPage(){
+
+    uint16_t accentColor = (LCD.epd2.hasColor ? GxEPD_RED : GxEPD_BLACK);
+
+    LCD.firstPage();
+    do {
+
+        LCD.fillScreen(GxEPD_WHITE);
+
+        // ================= HEADER =================
+        LCD.fillRect(1, 1, SCREEN_W - 3, HEADER_H, GxEPD_RED);
+
+        LCD.setFont(&FreeSans12pt7b);
+        LCD.setTextColor(GxEPD_WHITE);
+        LCD.setCursor(20, 22);
+        LCD.print("System Diagnostics");
+
+        LCD.setTextColor(GxEPD_BLACK);
+
+        int y = 55;
+
+        // =================================================
+        // ICON STATUS ROW
+        // =================================================
+
+        int x = 20;
+        int spacing = 100;
+
+        // SD
+         //LCD.setFont(&FreeSans12pt7b); 
+         LCD.setFont(&FreeSans9pt7b);
+
+         LCD.setCursor(x, 50); LCD.print("SD");
+        drawFolderIcon(x, y);
+        LCD.setCursor(x, y + 40); 
+        LCD.print(storage_initialized ? "OK" : "FAIL");
+        x += spacing;
+
+        // JSON
+         LCD.setCursor(x-10, 50); LCD.print("JSON");
+         drawFileIcon(x, y);
+        LCD.setCursor(x-20, y + 40);  
+        LCD.print(json_bound_successfully ? "Saved" : "Failed"); // come here bind_json
+        x += spacing;
+        
+
+        // CSV
+         LCD.setCursor(x-10, 50); LCD.print("CSV");
+        drawFileIcon(x, y);
+        LCD.setCursor(x-10, y + 40); 
+        LCD.print(csv_bound_successfully ? "Saved" : "Failed");
+        x += spacing;
+
+        // Cloud
+        LCD.setCursor(x-20, 50); LCD.print("CLOUD");
+         drawCloudIcon(x, y);
+        LCD.setCursor(x-20, y + 40); 
+        //LCD.print(strstr(upload_log, "Success") ? "OK" : "FAIL");
+        LCD.setFont();
+        LCD.print(data_sent ? "Uploaded" : "Not Uploaded!");
+
+        y += 65;
+
+        LCD.drawLine(0, y, SCREEN_W, y, GxEPD_BLACK);
+        y += 20;
+
+        // =================================================
+        // DETAILED LOG TEXT (Full Width)
+        // =================================================
+
+        LCD.setFont(&FreeMono9pt7b);
+
+        LCD.setCursor(20, y);
+        LCD.printf("JSON : %.50s", "20 array elements......");
+        y += 18;
+
+        LCD.setCursor(20, y);
+        LCD.printf("CSV  : %.50s", "20 entries ......");
+        y += 18;
+
+        LCD.setCursor(20, y);
+        LCD.printf("Cloud: %.50s", "upload_log...");
+        y += 22;
+
+        LCD.drawLine(0, y, SCREEN_W, y, GxEPD_BLACK);
+        y += 15;
+
+        // =================================================
+        // PAYLOAD CONSOLE (Your existing one)
+        // =================================================
+
+        int consoleHeight = 90;
+        LCD.drawRect(15, y, SCREEN_W - 30, consoleHeight, GxEPD_BLACK);
+
+        LCD.setCursor(25, y + 15);
+        LCD.print("Last Payload:");
+
+      //  LCD.setFont(&FreeMono9pt7b);
+       LCD.setFont();
+
+
+        int textY = y + 25;
+        int maxChars = 200;
+        int charsPerLine = 45;
+        int count = 0;
+
+        LCD.setCursor(25, textY);
+
+        for(int i = 0; i < maxChars && sendable_to_sd_card[i] != '\0'; i++){
+            LCD.write(sendable_to_sd_card[i]);
+            count++;
+
+            if(count >= charsPerLine){
+                count = 0;
+                textY += 15;
+                LCD.setCursor(25, textY);
+            }
+        }
+
+        //footer();
+
+    } while (LCD.nextPage());
+}
+
+void drawFolderIcon(int x, int y) {
+    // Folder body
+    LCD.fillRect(x, y + 8, 28, 18, GxEPD_BLACK);
+
+    // Folder tab
+    LCD.fillRect(x + 3, y, 14, 10, GxEPD_BLACK);
+
+    // Inner highlight
+    LCD.fillRect(x + 2, y + 10, 24, 14, GxEPD_WHITE);
+}
+
+void drawFileIcon(int x, int y) {
+    LCD.drawRect(x, y, 22, 28, GxEPD_BLACK);
+
+    // Folded corner
+    LCD.drawLine(x + 15, y, x + 22, y + 7, GxEPD_BLACK);
+    LCD.drawLine(x + 22, y + 7, x + 15, y + 7, GxEPD_BLACK);
+}
+
+void drawCloudIcon(int x, int y) {
+    LCD.fillCircle(x + 10, y + 10, 6, GxEPD_BLACK);
+    LCD.fillCircle(x + 18, y + 10, 8, GxEPD_BLACK);
+    LCD.fillCircle(x + 26, y + 12, 6, GxEPD_BLACK);
+    LCD.fillRect(x + 10, y + 12, 20, 10, GxEPD_BLACK);
+}
+
+
+/*
+void logsPage(){
+    // SHOW LAST SAVED TIME
+  // SHOW LAST UPLOAD TIME
+  // BELOW IN A BIG BOX, PRINT sendable_to_sd_card WHICH WAS FORMATTED IN PRETTY JSON
+
+    uint16_t accentColor = (LCD.epd2.hasColor ? GxEPD_RED : GxEPD_BLACK);
+
+     LCD.firstPage();
+  do {
+    LCD.fillScreen(GxEPD_WHITE);
+
+    // ================= HEADER =================
+    LCD.fillRect(1, 1, 400 - 3, 40, accentColor);
+
+    LCD.setFont(&FreeSans12pt7b);
+    LCD.setTextColor(GxEPD_WHITE);
+    LCD.setCursor(20, 28);
+    LCD.print("Logs & Storage");
+
+    LCD.setTextColor(GxEPD_BLACK);
+
+    int y = 60;
+
+    // ================= FILE INFO =================
+    size_t jsonSize = 0;
+    size_t csvSize  = 0;
+
+    if (SD.exists(json_log_file)) {
+        File f = SD.open(json_log_file, FILE_READ);
+        if (f) { jsonSize = f.size(); f.close(); }
+    }
+
+    if (SD.exists(csv_log_file)) {
+        File f = SD.open(csv_log_file, FILE_READ);
+        if (f) { csvSize = f.size(); f.close(); }
+    }
+
+    LCD.setFont(&FreeMono9pt7b);
+
+    LCD.setCursor(10, y);
+    LCD.printf("JSON: %lu KB | Last: %s",
+               (unsigned long)(jsonSize / 1024),
+               last_json_save_time);
+
+    y += 20;
+
+    LCD.setCursor(10, y);
+    LCD.printf("CSV : %lu KB | Last: %s",
+               (unsigned long)(csvSize / 1024),
+               last_csv_save_time);
+
+    y += 25;
+
+    // ================= UPLOAD INFO =================
+    LCD.drawLine(0, y, SCREEN_W, y, GxEPD_BLACK);
+    y += 20;
+
+    LCD.setCursor(10, y);
+    LCD.printf("Last Upload: %s", last_upload_time);
+
+    y += 18;
+
+    LCD.setCursor(10, y);
+    LCD.print("Upload Log:");
+    y += 15;
+
+    LCD.setCursor(10, y);
+    LCD.print(upload_log);
+
+    y += 25;
+
+    // ================= SAVE LOGS =================
+    LCD.drawLine(0, y, SCREEN_W, y, GxEPD_BLACK);
+    y += 20;
+
+    LCD.setCursor(10, y);
+    LCD.print("JSON Save:");
+    y += 15;
+
+    LCD.setCursor(10, y);
+    LCD.print(save_log);
+
+    y += 20;
+
+    LCD.setCursor(10, y);
+    LCD.print("CSV Save:");
+    y += 15;
+
+    LCD.setCursor(10, y);
+    LCD.print(csv_save_log);
+
+    y += 25;
+
+    // ================= SERIALIZATION LOG =================
+    LCD.drawLine(0, y, SCREEN_W, y, GxEPD_BLACK);
+    y += 20;
+
+    LCD.setCursor(10, y);
+    LCD.print("Serialization:");
+    y += 15;
+
+    LCD.setCursor(10, y);
+    LCD.print(serialization_log);
+
+    y += 25;
+
+    // ================= JSON SNAPSHOT =================
+    LCD.drawLine(0, y, SCREEN_W, y, GxEPD_BLACK);
+    y += 20;
+
+    LCD.setCursor(10, y);
+    LCD.print("Last JSON Snapshot:");
+    y += 15;
+
+    // Print trimmed JSON (avoid overflow)
+            int maxChars = 300;
+            for (int i = 0; i < maxChars && sendable_to_sd_card[i] != '\0'; i++) {
+                LCD.write(sendable_to_sd_card[i]);
+            }
+                footer(); // semi universal footing
+     } while (LCD.nextPage());
+}
+*/
+
+void tablePage(){
+
+     LCD.firstPage();
+  do {
+
+        
+    if(which_data_table == FULLTABLE){ // the data table page
+        
+     // ---- Header ----
+      uint16_t headerColor = (LCD.epd2.hasColor ? GxEPD_RED : GxEPD_BLACK);
+      LCD.fillRect(1, 1, SCREEN_W - 3, HEADER_H, headerColor);
+      LCD.fillRoundRect(120, 2, 130, 33, 5, GxEPD_WHITE);
+
+      LCD.setFont(&FreeSans12pt7b);
+      LCD.setTextColor(GxEPD_BLACK);
+      LCD.setCursor(130, 22);
+      LCD.print("Data Table");
+
+      LCD.setFont(&FreeSans9pt7b);
+      LCD.setTextColor(GxEPD_WHITE);
+      LCD.setCursor(20, 19);
+      LCD.print("Tiles");
+
+      //LCD.fillRect(250, 5, 2, 20, GxEPD_WHITE);
+
+      LCD.setCursor(290, 19);
+      LCD.print("Files");
+
+      LCD.setCursor(40, 40); LCD.setFont(); LCD.print(upload_log);
+
+  
+      // ---- Table ----
+      drawTableFrame();
+      // In your setup or initialization:
+      //  initializeTable();  // This shows T1-T8 with "--" placeholders immediately
+
+
+     // uint8_t visible_rows = min(entry_count, MAX_ROWS);
+      uint8_t visible_rows = min((uint8_t)entry_count, MAX_ROWS);
+
+      
+                  // To populate a single row (automatically uses T_1, T_2, etc.)
+              if(sensor_1_temp > 0.00) drawTableRow(0, "T_1", sensor_1_temp, sensor_1_humidity, sensor_1_pressure, sensor_1_last_seen);  // Row 0 = T_1
+              if(sensor_2_temp > 0.00) drawTableRow(1, "T_2",sensor_2_temp, sensor_2_humidity, sensor_2_pressure, sensor_2_last_seen);  // Row 1 = T_2
+              if(sensor_3_temp > 0.00) drawTableRow(2, "T_3",sensor_3_temp, sensor_3_humidity, sensor_3_pressure, sensor_3_last_seen);  // Row 2 = T_3
+              if(sensor_4_temp > 0.00) drawTableRow(3, "T_4",sensor_4_temp, sensor_4_humidity, sensor_4_pressure, sensor_4_last_seen);  // Row 3 = T_4
+              if(sensor_5_temp > 0.00) drawTableRow(4, "T_5",sensor_5_temp, sensor_5_humidity, sensor_5_pressure, sensor_5_last_seen);  // Row 4 = T_5
+              if(sensor_6_temp > 0.00) drawTableRow(5, "T_6",sensor_6_temp, sensor_6_humidity, sensor_6_pressure, sensor_6_last_seen);  // Row 5 = T_6
+              if(sensor_7_temp > 0.00) drawTableRow(6, "T_7",sensor_7_temp, sensor_7_humidity, sensor_7_pressure, sensor_7_last_seen);  // Row 6 = T_7
+              if(sensor_8_temp > 0.00) drawTableRow(7, "T_8",sensor_8_temp, sensor_8_humidity, sensor_8_pressure, sensor_8_last_seen);  // Row 7 = T_8
+            /*
+              drawTableRow(8, sensor_5_temp, 67.8, 1012.9, "14:31");  // Row 1 = T_2
+              drawTableRow(9, sensor_5_temp, 67.8, 1012.9, "14:31");  // Row 1 = T_2
+              drawTableRow(10, sensor_5_temp, 67.8, 1012.9, "14:31");  // Row 1 = T_2
+              drawTableRow(11, sensor_5_temp, 67.8, 1012.9, "14:31");  // Row 1 = T_2
+              drawTableRow(12, sensor_5_temp, 67.8, 1012.9, "14:31");  // Row 1 = T_2
+              */
+
+      /*
+              // To populate all rows at once
+              float temps[12] = {25.3, 26.1, 25.8, 25.9, 26.2, 25.7, 25.4, 25.6, 25.1, 25.5, 25.8, 25.2};
+              float humis[12] = {65.5, 64.8, 65.2, 65.0, 64.5, 65.3, 65.1, 64.9, 65.4, 65.2, 65.0, 64.7};
+              float pressures[12] = {1013.2, 1012.9, 1013.1, 1013.0, 1012.8, 1013.3, 1012.7, 1013.2, 1013.0, 1012.9, 1013.1, 1012.8};
+              const char* times[12] = {"14:30", "14:31", "14:32", "14:33", "14:34", "14:35", 
+                            "14:36", "14:37", "14:38", "14:39", "14:40", "14:41"};
+
+          drawAllTableRows(temps, humis, pressures, times);
+          */
+        /*
+        // Later, when data arrives for specific sensors:
+        updateTableRow(0, 25.3, 65.5, 1013.2, "14:30");  // Updates T1 with real data
+        updateTableRow(1, 26.1, 64.8, 1012.9, "14:31");  // Updates T2 with real data
+        // T3-T8 remain visible but show "--" until updated
+
+        // When T9 data arrives (optional):
+        updateTableRow(7, 24.7, 66.2, 1013.5, "14:32");  // Updates T9 (will now appear)
+      */
+
+                  footer(); // universal footing
+
+    }
+
+          footer(); // semi universal footing
+
+   } while (LCD.nextPage());
+
+}
+
+
+void errorPage(){
+         LCD.firstPage();
+  do {
+               
+                footer(); // semi universal footing
+
+    } while (LCD.nextPage());
+}
+
+void otaPage(){
+      LCD.firstPage();
+  do {
+
+    LCD.fillScreen(GxEPD_WHITE);
+
+    uint16_t accent = (LCD.epd2.hasColor ? GxEPD_RED : GxEPD_BLACK);
+
+    // ===== Header =====
+    LCD.setFont(&FreeSans24pt7b);
+    LCD.setTextColor(accent);
+    LCD.setCursor(50, 50);
+    LCD.print("OTA MODE");
+
+    // ===== WiFi Icon (Simple Bars) =====
+    int baseX = 40;
+    int baseY = 120;
+
+    for (int i = 0; i < 4; i++) {
+        LCD.fillRect(baseX + i * 15,
+                     baseY - (i * 15),
+                     10,
+                     i * 15,
+                     accent);
+    }
+
+    // ===== Device Name =====
+    LCD.setFont(&FreeSans12pt7b);
+    LCD.setTextColor(GxEPD_BLACK);
+    LCD.setCursor(40, 170);
+    LCD.print("Device:");
+    LCD.setCursor(160, 170);
+    LCD.print(devicename);
+
+    // ===== Connected SSID =====
+    LCD.setCursor(40, 200);
+    LCD.print("WiFi:");
+    LCD.setCursor(160, 200);
+   // LCD.print(WiFi.SSID());
+   // LCD.print(wifi_obj.WiFi.SSID());
+
+    // ===== IP Address =====
+    LCD.setCursor(40, 230);
+    LCD.print("IP:");
+    LCD.setCursor(160, 230);
+    LCD.print(WiFi.localIP());
+
+    // ===== OTA Status =====
+    LCD.setFont(&FreeSans9pt7b);
+    LCD.setCursor(40, 260);
+    LCD.print(ota_log);
+
+   // LCD.display();
+     } while (LCD.nextPage());
+}
+
+
+
+
+
+
+
+
+const char Manufacturer[15] = "IntelliSys UG";
+const char DeviceID[32] = "Dryer Monitoring System";
+const char DeviceClient[36] = "Susan M PhD Project, MUARIK";
+uint8_t SystemAddress[] = {0x68, 0xFE, 0x71, 0x88, 0x1A, 0x6C}; 
+char macAddressStr[32]; // Format: XX:XX:XX:XX:XX:XX + null terminator
+
+void Boot(){
+  LCD.setRotation(2);
+  LCD.setFullWindow();
+
+
+    // Variables for text bounds
+  int16_t tbx, tby; uint16_t tbw, tbh; 
+  int16_t tbx2, tby2; uint16_t tbw2, tbh2;
+  int16_t tbx3, tby3; uint16_t tbw3, tbh3;
+  int16_t tbx4, tby4; uint16_t tbw4, tbh4;  // For fourth line
+  int16_t tbx5, tby5; uint16_t tbw5, tbh5;  // For fourth line
+
+   // Format MAC address as string
+    snprintf(macAddressStr, sizeof(macAddressStr), 
+             "Address=>[%02X:%02x:%02x:%02x:%02x:%02x]",
+             SystemAddress[0], SystemAddress[1], SystemAddress[2],
+             SystemAddress[3], SystemAddress[4], SystemAddress[5]);
+
+    // Getting text bounds for each line with appropriate fonts
+  LCD.setFont(&FreeSansBold24pt7b);
+  LCD.getTextBounds(Manufacturer, 0, 0, &tbx, &tby, &tbw, &tbh);
+  
+  LCD.setFont(&FreeSans12pt7b);
+  LCD.getTextBounds(DeviceID, 0, 0, &tbx2, &tby2, &tbw2, &tbh2);
+
+  LCD.setFont(&FreeMonoBold9pt7b); // 
+  LCD.getTextBounds(DeviceClient, 0, 0, &tbx3, &tby3, &tbw3, &tbh3);
+
+   LCD.setFont(&FreeSans9pt7b);  // Smaller font for MAC address
+   LCD.getTextBounds(macAddressStr, 0, 0, &tbx4, &tby4, &tbw4, &tbh4);
+
+   LCD.getTextBounds(storage_status_log, 0, 0, &tbx5, &tby5, &tbw5, &tbh5);
+
+    // Calculate X positions for centering
+    uint16_t x1 = ((LCD.width() - tbw) / 2) - tbx; 
+    uint16_t x2 = ((LCD.width() - tbw2) / 2) - tbx2; 
+    uint16_t x3 = ((LCD.width() - tbw3) / 2) - tbx3;
+    uint16_t x4 = ((LCD.width() - tbw4) / 2) - tbx4;  // For MAC address
+    uint16_t x5 = ((LCD.width() - tbw5) / 2) - tbx5;
+   // Fixed Y positions (can be adjusted based on screen layout needs)
+    const uint16_t y1 = 80;   // Manufacturer position
+    const uint16_t y2 = 160;  // Device ID position
+    const uint16_t y3 = 220;  // Client info position
+    const uint16_t y4 = 250;  // MAC address position
+    const uint16_t y5 = 290;  // MAC address position
+
+  //uint16_t y = ((LCD.height() - tbh) / 2) - tby;
+
+      // Add a small delay before starting display update
+    delay(10);
+
+  LCD.firstPage(); //FULLY CENTERED TEXTS
+  do{
+        LCD.fillScreen(GxEPD_WHITE);
+     
+        // Manufacturer - Red if color display available
+        LCD.setFont(&FreeSansBold24pt7b);
+        LCD.setTextColor(LCD.epd2.hasColor ? GxEPD_RED : GxEPD_BLACK);
+        LCD.setCursor(x1, y1);
+        LCD.print(Manufacturer);
+        
+        // Device ID - Black
+        LCD.setFont(&FreeSans12pt7b);
+        LCD.setTextColor(GxEPD_BLACK);
+        LCD.setCursor(x2, y2);
+        LCD.print(DeviceID);
+        
+        // Client Info - Black with monospace font for clean look
+        LCD.setFont(&FreeMonoBold9pt7b);
+        LCD.setCursor(x3, y3);
+        LCD.print(DeviceClient);
+        
+        // Optional: A separator
+         LCD.drawLine(20, y3 + 50, LCD.width() - 40, y3 + 50, GxEPD_BLACK);
+        
+                 // Client Info - Black with monospace font for clean look
+        LCD.setFont(&FreeSans9pt7b);         LCD.setTextColor(GxEPD_RED);
+
+        
+        LCD.setCursor(x4, y4);
+        LCD.print(macAddressStr);
+
+        LCD.setFont();
+        LCD.setCursor(0, y5);
+        LCD.print(storage_status_log);
+        
+
+     //   delay(1000);
+
+    }  while (LCD.nextPage());
+}
+
 
 
 void homepage() {
@@ -2424,22 +5449,21 @@ void homepage() {
   LCD.firstPage();
   do {
 
-    LCD.fillScreen(GxEPD_WHITE);
-    LCD.drawRect(0, 0, SCREEN_W, SCREEN_H, GxEPD_BLACK);
-    LCD.drawRect(1, 1, SCREEN_W - 2, SCREEN_H - 2, GxEPD_BLACK);
+      LCD.fillScreen(GxEPD_WHITE);
+      LCD.drawRect(0, 0, SCREEN_W, SCREEN_H, GxEPD_BLACK);
+      LCD.drawRect(1, 1, SCREEN_W - 2, SCREEN_H - 2, GxEPD_BLACK);
 
-    if (side_scroll == 1) { // the sensors page
+  //  if (side_scroll == 1) { // 
 
-           
 
- // VERTICAL SCROLL BAR
+      // VERTICAL SCROLL BAR
         LCD.drawRoundRect(370, 50, 20, 160, 5, LCD.epd2.hasColor ? GxEPD_RED : GxEPD_BLACK);
         LCD.fillRoundRect(375, 60, 10, 80, 12, GxEPD_BLACK);
 
         LCD.fillTriangle(370, 45, 380, 35, 390, 45, LCD.epd2.hasColor ? GxEPD_RED : GxEPD_BLACK);  // UPPER ARROW
         LCD.drawTriangle(370, 215, 380, 225, 390, 215, LCD.epd2.hasColor ? GxEPD_RED : GxEPD_BLACK);  // DOWN ARROE
         
-      // ---- Header ----
+       // ---- Header ----
       uint16_t headerColor = (LCD.epd2.hasColor ? GxEPD_RED : GxEPD_BLACK);
       LCD.fillRect(1, 1, SCREEN_W - 3, HEADER_H, headerColor);
       LCD.fillRoundRect(8, 2, 100, 30, 5, GxEPD_WHITE);
@@ -2447,7 +5471,7 @@ void homepage() {
       LCD.setFont(&FreeSans12pt7b);
       LCD.setTextColor(GxEPD_BLACK);
       LCD.setCursor(14, 22);
-      LCD.print("Sensors");
+      LCD.print("Tiles");
 
       LCD.setFont(&FreeSans9pt7b);
       LCD.setTextColor(GxEPD_WHITE);
@@ -2457,22 +5481,11 @@ void homepage() {
       LCD.fillRect(250, 5, 2, 20, GxEPD_WHITE);
 
       LCD.setCursor(290, 19);
-      LCD.print("Settings");
+      LCD.print("Graphs");
+
 
       // ---- Average Temperature ----
       drawInfoBox(LEFT_X, TOP_ROW_Y, "Av. Temperature", GxEPD_BLACK, GxEPD_BLACK);
-
-      //DYNAMICALLY RESIZABLE BUBBLE
-          if(active_sensors<99){ LCD.fillCircle((25+box_width), 42,  12, GxEPD_RED); }
-          else { // should hold 3-5 digits: 100-99,999
-                LCD.fillRoundRect((15+box_width), 30,  36, 20, 20, GxEPD_RED); // notification bubble
-          } 
-
-         LCD.setFont(); LCD.setTextColor(GxEPD_WHITE); 
-         LCD.setCursor((20+box_width), 37); LCD.print(active_sensors);
-
-        LCD.setFont(&FreeMono9pt7b); LCD.setTextColor(GxEPD_BLACK); //FreeMono9pt7b
-        LCD.setCursor(60, 128); LCD.print(sensor_1_last_seen);
 
       
       LCD.setTextColor(GxEPD_BLACK);
@@ -2480,9 +5493,11 @@ void homepage() {
       LCD.setFont(&FreeSans12pt7b); LCD.setCursor(155, 90); LCD.print("C");
 
        LCD.setFont(&FreeSansBold24pt7b); LCD.setTextColor(GxEPD_BLACK);   
-       LCD.setCursor(50, 110);      LCD.print(average_temp);
-
-
+       LCD.setCursor(50, 110);      LCD.print(average_temp_str);
+    
+        LCD.setFont(&FreeMono9pt7b); LCD.setTextColor(GxEPD_RED); //FreeMono9pt7b
+        LCD.setCursor(60, 128); LCD.print(active_sensors);
+      
 
 
       // ---- Humidity Box ----
@@ -2496,186 +5511,42 @@ void homepage() {
        //  LCD.setCursor(((10+box_width)+(1.2*box_width)), 37);          LCD.print(average_humi);
 
          LCD.setTextColor(GxEPD_BLACK);      LCD.setFont(&FreeSansBold24pt7b); 
-         LCD.setCursor(50+((1.2*box_width)), 110);    LCD.print(average_humi); 
-
-         
-
-          LCD.setFont(&FreeMono9pt7b);  LCD.setTextColor(GxEPD_BLACK); //FreeMono9pt7b
-      //LCD.setCursor(85+(30+(1.2*box_width)), 85); LCD.print("%");
-
-        LCD.setCursor(25+(30+(1.2*box_width)), 128); LCD.print(sensor_2_last_seen); 
-      
-        //DATA
-         LCD.setFont(); LCD.setCursor((40+(1.2*box_width)), 66); 
-        // LCD.print("PERCENT VOLUME");
-         //LCD.print(sensor2_POWER_XTIX);  //LCD.print("PERCENT VOLUME"); // wind speed log
-          
-         LCD.setTextColor(GxEPD_WHITE);
-         LCD.setCursor(((10+box_width)+(1.2*box_width)), 37); 
-         LCD.print("snds");
+         LCD.setCursor(50+((1.2*box_width)), 110);    LCD.print(average_humi_str); 
 
 
-      // ---- Suction Fans ----
+
+      // ---- Solar Radiation ----
       uint16_t fanColor = (LCD.epd2.hasColor ? GxEPD_RED : GxEPD_BLACK);
-      drawInfoBox(LEFT_X, BOTTOM_ROW_Y, "Suction Fans", fanColor, fanColor);
+      drawInfoBox(LEFT_X, BOTTOM_ROW_Y, "Solar Radiation", fanColor, fanColor);
+    // draw an icon of the sun in this box
 
-     // LCD.setFont(&FreeMonoBold12pt7b);
-      LCD.setTextColor(fanColor);
-    //  LCD.setCursor(LEFT_X + 60, BOTTOM_ROW_Y + 45);
-     
 
-    //   LCD.setTextColor((LCD.epd2.hasColor ? GxEPD_RED : GxEPD_BLACK));
-         LCD.setFont(&FreeSansBold24pt7b); 
-         LCD.setCursor(60, (215)); LCD.print(humi_fan_on ? "ON" : "OFF"); 
-         LCD.setFont(&FreeMono9pt7b); 
-         LCD.setCursor(50, (232)); LCD.print(humi_fan_stop_time_str);
-      // ---- Cooling Fans ----
-      drawInfoBox(RIGHT_X, BOTTOM_ROW_Y, "Cooling Fans", fanColor, fanColor);
+
+     //   LCD.setTextColor((LCD.epd2.hasColor ? GxEPD_RED : GxEPD_BLACK));
+         LCD.setFont(&FreeSansBold24pt7b);       LCD.setTextColor(fanColor);
+
+         LCD.setCursor(60, (215)); LCD.print(solar_rad_str); 
+         LCD.setFont();  // FreeMono9pt7b
+         LCD.setCursor(50, (232)); LCD.print("Watts / sq metres");
+
+      // ---- Wind Speed ----
+      drawInfoBox(RIGHT_X, BOTTOM_ROW_Y, "Wind Speed", fanColor, fanColor);
 
       LCD.setTextColor(fanColor);
       LCD.setCursor(RIGHT_X + 60, BOTTOM_ROW_Y + 45);
       
 
       LCD.setFont(&FreeSansBold24pt7b); 
-         LCD.setCursor(20+(60+box_width), (215));    LCD.print(cooling_fan_on ? "ON" : "OFF");
+         LCD.setCursor(20+(60+box_width), (215));    LCD.print(wind_speed_str);
 
-         LCD.setFont(&FreeMono9pt7b); LCD.setTextColor((LCD.epd2.hasColor ? GxEPD_RED : GxEPD_BLACK)); //FreeMono9pt7b
-         LCD.setCursor(90+(box_width), (232));  LCD.print(cooling_fan_stop_time_str);
+         LCD.setFont(); LCD.setTextColor((LCD.epd2.hasColor ? GxEPD_RED : GxEPD_BLACK)); //FreeMono9pt7b
+         LCD.setCursor(90+(box_width), (232));  LCD.print("metres / second");
         
+               footer(); // semi universal footing
 
-    } // side_scroll == 1
-
-    else if(side_scroll == 2){ // the data table page
-        // draw a table with black lines: and a red top ribbon
-        // col 1: #
-        // col 2: Avg Temp
-        // col 3: Avg Humi
-        // col 4: Time
-
-    // ---- Header ----
-  uint16_t headerColor = (LCD.epd2.hasColor ? GxEPD_RED : GxEPD_BLACK);
-  LCD.fillRect(1, 1, SCREEN_W - 3, HEADER_H, headerColor);
-  LCD.fillRoundRect(120, 2, 130, 30, 5, GxEPD_WHITE);
-
-  LCD.setFont(&FreeSans12pt7b);
-  LCD.setTextColor(GxEPD_BLACK);
-  LCD.setCursor(130, 22);
-  LCD.print("Data Table");
-
-  LCD.setFont(&FreeSans9pt7b);
-  LCD.setTextColor(GxEPD_WHITE);
-  LCD.setCursor(20, 19);
-  LCD.print("Sensors");
-
-  LCD.fillRect(250, 5, 2, 20, GxEPD_WHITE);
-
-  LCD.setCursor(290, 19);
-  LCD.print("Settings");
-
-  // ---- Table ----
-  drawTableFrame();
-
-  // ---- Rows ----
-  LCD.setFont(&FreeMono9pt7b);
-  LCD.setTextColor(GxEPD_BLACK);
-
- // uint8_t visible_rows = min(entry_count, MAX_ROWS);
-  uint8_t visible_rows = min((uint8_t)entry_count, MAX_ROWS);
-
-
-  for (uint8_t i = 0; i < visible_rows; i++) {
-
-    uint16_t y = TABLE_Y + ROW_H * (i + 1) + 16;
-
-    // #
-    LCD.setCursor(TABLE_X + 8, y);
-    LCD.print(i + 1);
-
-    // Avg Temp
-    LCD.setCursor(TABLE_X + COL_NUM_W + 10, y);
-    LCD.print(temp[i]);
-    LCD.print("C");
-
-    // Avg Humidity
-    LCD.setCursor(TABLE_X + COL_NUM_W + COL_TEMP_W + 10, y);
-    LCD.print(humi[i]);
-    LCD.print("%");
-
-    // Time
-    LCD.setCursor(TABLE_X + COL_NUM_W + COL_TEMP_W + COL_HUMI_W + 10, y);
-    LCD.print(time_stamp[0][i]);
-      }
-
-
-    }
-
-    else { // ---- side_scroll == 3 :: Settings Page ----
-
-  uint16_t accentColor = (LCD.epd2.hasColor ? GxEPD_RED : GxEPD_BLACK);
-
-  // ---- Header ----
-  LCD.fillRect(1, 1, SCREEN_W - 3, HEADER_H, accentColor);
-  LCD.fillRoundRect(260, 2, 120, 30, 5, GxEPD_WHITE);
-
-  LCD.setFont(&FreeSans12pt7b);
-  LCD.setTextColor(GxEPD_BLACK);
-  LCD.setCursor(270, 22);
-  LCD.print("Settings");
-
-  LCD.setFont(&FreeSans9pt7b);
-  LCD.setTextColor(GxEPD_WHITE);
-  LCD.setCursor(20, 19);
-  LCD.print("Sensors");
-
-  LCD.setCursor(140, 19);
-  LCD.print("Data Table");
-
-  // ---- Fan Icons ----
-  drawFanIcon(CIRCLE1_X, CIRCLE_Y, CIRCLE_R, accentColor);
-  drawFanIcon(CIRCLE2_X, CIRCLE_Y, CIRCLE_R, accentColor);
-
-  // ---- Fan titles ----
-  LCD.setFont(&FreeSans9pt7b);
-  LCD.setTextColor(GxEPD_BLACK);
-
-  LCD.setCursor(CIRCLE1_X - 35, CIRCLE_Y - CIRCLE_R - 25);
-  LCD.print("Suction Fan");
-
-  drawSwitch(
-    CIRCLE1_X - SWITCH_W / 2,
-    CIRCLE_Y - CIRCLE_R - 10,
-    humi_fan_on
-  );
-
-  LCD.setCursor(CIRCLE2_X - 35, CIRCLE_Y - CIRCLE_R - 25);
-  LCD.print("Cooling Fan");
-
-  drawSwitch(
-    CIRCLE2_X - SWITCH_W / 2,
-    CIRCLE_Y - CIRCLE_R - 10,
-    cooling_fan_on
-  );
-
-  // ---- Threshold text ----
-  LCD.setFont(&FreeMono9pt7b);
-  LCD.setTextColor(GxEPD_BLACK);
-
-  LCD.setCursor(CIRCLE1_X - 50, CIRCLE_Y + CIRCLE_R + 20);
-  LCD.print("ON  >= 60%");
-
-  LCD.setCursor(CIRCLE1_X - 50, CIRCLE_Y + CIRCLE_R + 35);
-  LCD.print("OFF <= 50%");
-
-  LCD.setCursor(CIRCLE2_X - 55, CIRCLE_Y + CIRCLE_R + 20);
-  LCD.print("ON  >= 60C");
-
-  LCD.setCursor(CIRCLE2_X - 55, CIRCLE_Y + CIRCLE_R + 35);
-  LCD.print("OFF <= 50C");
-}
-
-
-      footer();
-    
+    //} // side_scroll == 1
+      
+      
 
   } while (LCD.nextPage());
 }
@@ -2734,8 +5605,7 @@ void footer(){
         // LOGS FOR NETWORK
             LCD.setFont();
             LCD.setTextColor(GxEPD_RED);
-            LCD.setCursor(40, 250); LCD.print(internals_log);
-            LCD.setCursor(40, 260); LCD.print(upload_log);
+            LCD.setCursor(40, 260); LCD.print(internals_log);
 
 
             LCD.setFont(&FreeSans9pt7b); // LCD.setFont(&FreeSans9pt7b);
