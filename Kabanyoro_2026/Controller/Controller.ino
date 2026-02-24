@@ -1,12 +1,19 @@
+/* WIRELESS DRYER DATALOGGING SYSTEM FOR SUSAN MBACHO, FOR THE 13mX6m DRYER IN MUARIK*/
 const char *server_address = "https://webofiot.com/dryer/muarik/server.php";
 
-const char *serverName = "https://webofiot.com/dryer/muarik/server.php";
-
 const char *devicename = "Dryer_Controller";
-const char *OTA_PASS = "1234";
+const char *OTA_PASS = "12!34";
 bool otaModeActive = false;
 
 char apiKeyValue[12] = "DRYER_006"; //MUARIK TOKEN
+
+char ESP_IDF_VER[50] = "ESP-IDF Version: ";
+char ARD_CORE_VER[50] = "Arduino Core Version: ";
+
+void ESPInfo() {
+    snprintf(ESP_IDF_VER, sizeof(ESP_IDF_VER), "ESP-IDF Version: %s", esp_get_idf_version());
+    snprintf(ARD_CORE_VER, sizeof(ARD_CORE_VER), "Arduino Core Version: %s", ESP.getSdkVersion());
+}
 
 #define FW_VERSION "v1.3.5-Dryer_Datalogger"
 #define USE_VSPI_FOR_EPD
@@ -66,6 +73,9 @@ StaticJsonDocument<4096> JSON_sendable;
 #include <Fonts/FreeMonoBold12pt7b.h>
 #include <Fonts/FreeSansBold9pt7b.h>
 
+#include <Preferences.h>
+Preferences prefs;
+
 
 // File system instance 
 //extern fs::FS &fs;  // Could be SD, SPIFFS, or LittleFS
@@ -119,6 +129,8 @@ const uint8_t solar_rad_pin = 35;
 const uint8_t blinker = 13;
 const uint8_t innerFAN = 32; // this
 
+const uint8_t sensor_indicator = 17;
+const uint8_t wifi_toggler = 16;
 /*
 const uint8_t cooling_fan_pin = ;//12; 12 is also taken
 const uint8_t humidity_fan_pin = ;// 14; 14 is taken
@@ -366,6 +378,7 @@ bool initialize_sd_card(); //USES HSPI HARDWARE SERIAL
 
 bool save_csv_to_sd_card();
 bool save_json_to_sd_card();
+void initialize_RTC();
 
 bool sd_initialized = false;
 char save_log[512] = "No JSON Saved!";
@@ -374,6 +387,8 @@ char csv_save_log[512] = "not Saved!";
 
 char dataPack[250] = ""; // receivable
 void extract_readings();
+
+void OnSensorData_received(const uint8_t * mac, const uint8_t *incomingData, int len);
 
 uint8_t priority_index = 1; uint8_t dryer_1_fanning_level = 0; uint8_t dryer_2_fanning_level = 0;
  // dryer_2_cool_fan_ON = false, dryer_2_humi_fan_ON = false;
@@ -424,8 +439,10 @@ uint64_t otaStartTime = 0;
 const uint64_t OTA_TIMEOUT = 15ULL * 60ULL * 1000ULL;  // 15 minutes
 char LastOTAUpdate[60] = "27 Oct 2025 10:10";
 //char LastOTAUpdate[60] = "27 Oct 2025 10:10";
+volatile uint64_t totalBytes = 0; /// = SD.totalBytes();
+volatile uint64_t usedBytes = 0; //  = SD.usedBytes();
+volatile uint64_t save_counter = 0; // uint8_t save_counter = 0;
 
-uint8_t save_counter = 0;
 volatile bool packet_received = false;
 
 char sendable_to_cloud_db[3000] = ""; 
@@ -433,7 +450,7 @@ char sendable_to_sd_card[4000] = ""; // JSON ~3kiB
 char sendable_to_sd_card_csv[3000] = "";
 char storage_status_log[512] = "NO SD";
 
-#fedine PWRKEY 0
+#define PWRKEY 0
 
 void setup() { delay(50); // for OTA to fully hand over
        Serial.begin(115200); Serial.print(devicename); Serial.println(" Booting..."); // while (!Serial) delay(100);   // wait for native usb
@@ -449,7 +466,7 @@ void setup() { delay(50); // for OTA to fully hand over
      //   pinMode(SD_Chip_Select, OUTPUT); digitalWrite(SD_Chip_Select, HIGH);
 
   //      Serial2.setTimeout(500); delay(500); // read for 500ms
-          Serial2.begin(115200, SERIAL_8N1, 16, 17); //the GSM MOD
+        //  Serial2.begin(115200, SERIAL_8N1, 16, 17); //the GSM MOD
 
          // Ensure both CS pins are HIGH
           pinMode(SCREEN_CS, OUTPUT);
@@ -466,6 +483,12 @@ void setup() { delay(50); // for OTA to fully hand over
         }
         delay(1000);
 
+            // Initialize Preferences and load counter
+        prefs.begin("SAVES", false);
+        save_counter = prefs.getUInt("SAVES", 0);  // Load saved value, default 0
+        prefs.end();
+        
+        
         // --- Initialize EPD on VSPI ---
         strcpy(initializer, "Initializing E-Paper Display over VSPI...");
         Serial.println(initializer);
@@ -500,7 +523,6 @@ void setup() { delay(50); // for OTA to fully hand over
       pinMode(batteryPin, INPUT);
 
     pinMode(innerFAN, OUTPUT); digitalWrite(innerFAN, LOW); 
-    pinMode(night_Light, OUTPUT);  digitalWrite(night_Light, LOW);
     
     
     Serial.print("Starting Realtime Clock...");
@@ -560,12 +582,10 @@ void setup() { delay(50); // for OTA to fully hand over
 
        for(int i = 0; i < 1; i++){
         digitalWrite(innerFAN, HIGH);
-        digitalWrite(night_Light, LOW);
        // buzzer.beep(1,50,0);
         delay(500);
 
         digitalWrite(innerFAN, LOW);
-        digitalWrite(night_Light, HIGH);
         buzzer.beep(1,50,0);
         delay(500);
 
@@ -592,6 +612,7 @@ void setup() { delay(50); // for OTA to fully hand over
    //   pinMode(humidity_fan_pin, OUTPUT);
 
         pinMode(ota_button, INPUT_PULLUP);
+        pinMode(wifi_toggler, INPUT_PULLUP);
 
         powerOnSIM();
         
@@ -624,6 +645,17 @@ void BuzzingTask(void * pvParams) {
 }
 
 
+const char *file_heading = "Report,for,Hybrid,Solar,Dryer,at,Makerere,University,Agricultural,Research,Institute, Kabanyolo,(MUARIK)\n";
+char file_creation_date[64] = "File created:,,,";
+char logging_interval[52] = "Logging Interval (HH:MM:SS):,,,00:01:00"; // once every minute
+const char data_points_log[128] = "Data Points:,,Temperature, Relative Humidity, Barometric Pressure inside the Dryer (1-11) and ambient / outside the dryer (12)";
+const char units_of_data[156] = "Temperature is taken in Celcius Degrees (°C) | Relative Humidity in percent (%) | Barometric Pressure in kilopascals (kPa)";
+const char additional_entries[156] = "Microclimatic conditions measured: (2) wind speed in metres per second (m/s) and solar radiation in Watts per square metres (W/m²)";
+
+size_t bytesWritten = 0;
+bool writeSuccess = false;
+  
+
 
 static char *csv_file = "/data.csv";
 char new_name[64];
@@ -633,6 +665,27 @@ static char csv_log_file[64] = "/data.csv"; // secondary storage file
 static const size_t MAX_FILE_SIZE = 20 * 1024 * 1024; // 20 MB per file
 static const size_t MAX_TOTAL_SIZE = 100 * 1024 * 1024; // 100 MB total limit
 
+size_t jsonSize = 0; // base file ...  before rotating
+size_t csvSize  = 0; // base file ...  before rotating
+
+size_t json_currentSize = 0;
+size_t csv_currentSize = 0;
+
+
+void enable_sd_card(){
+  
+    digitalWrite(SCREEN_CS, HIGH); delay(10);
+    digitalWrite(SD_Chip_Select, LOW);        
+
+}
+
+void enable_display(){
+    digitalWrite(SD_Chip_Select, HIGH); delay(10);
+    digitalWrite(SCREEN_CS, LOW);        
+
+}
+
+    
 
 bool initialize_sd_card() { // “Is the SD card hardware usable?”
     LOG("-------- INITIALIZING ONSITE STORAGE ------------------");
@@ -691,7 +744,6 @@ bool initialize_sd_card() { // “Is the SD card hardware usable?”
     return status;
 }
 
-
 bool check_storage_files() {
 
     if (!storage_initialized) {
@@ -708,8 +760,8 @@ bool check_storage_files() {
                 freeSpace /= 1000.0;
         */
 
-        uint64_t totalBytes = SD.totalBytes();
-        uint64_t usedBytes  = SD.usedBytes();
+         totalBytes = SD.totalBytes();
+         usedBytes  = SD.usedBytes();
 
         float usedMB = usedBytes / 1048576.0;      // avoids intermediate rounding of  1024*1024
         float freeMB = (totalBytes - usedBytes) / (1024.0 * 1024.0);
@@ -744,7 +796,7 @@ bool check_storage_files() {
         return false;
     }
 
-    size_t json_currentSize = f.size();
+     json_currentSize = f.size();
 
     f.close();
 
@@ -776,7 +828,7 @@ bool check_storage_files() {
         strncat(storage_status_log, " | File needs rotation",
                 sizeof(storage_status_log) - strlen(storage_status_log) - 1);
 
-        uint64_t totalUsed = SD.usedBytes();
+        uint64_t totalUsed =  usedBytes; // SD.usedBytes();
 
         if (totalUsed > MAX_TOTAL_SIZE) {
 
@@ -849,386 +901,745 @@ File create_another_file() {
 }
 
 
+bool handle_sd_recovery();
+void handle_empty_payload();
+void handle_filename_issue();
+bool handle_file_creation();
+bool handle_large_file_issue(size_t weight_under_review);
+void handle_open_failure();
+void handle_timeout(size_t bytesWritten);
+void handle_separator_corruption(size_t separatorWritten);
+void handle_write_failure(size_t bytesWritten, size_t incomingSize);
+void handle_periodic_maintenance();
 
-bool save_json_to_sd_card() { // save json hierarchical data
-    // Clear the log message
+bool timeoutOccurred = false;
+
+
+bool save_json_to_sd_card() {
+
     memset(json_save_log, 0, sizeof(json_save_log));
-    
-    /*
-    * 1. Ensure SD card is initialized (with retry logic)
-    * 2. Validate input data
-    * 3. Check file size before writing
-    * 4. Rotate if needed
-    * 5. Write data with error handling and timeout protection
-    * 6. Verify write operation
-    * 7. Handle write interruptions
-    */
-
-    // --- Step 1: Ensure SD card is initialized ---
-    if (!storage_initialized) {
-        snprintf(json_save_log, sizeof(json_save_log), 
-                 "[SD] Storage not initialized, attempting recovery...");
-        LOG(json_save_log);
-        
-        // Exponential backoff retry (1s, 2s, 4s)
-        for (int i = 0; i < 3; i++) {
-            initialize_sd_card();
-            delay(1000 * (1 << i)); // Exponential backoff: 1s, 2s, 4s
-            
-            if (storage_initialized) {
-                snprintf(json_save_log, sizeof(json_save_log), 
-                         "[SD] Recovered after %d attempts", i + 1);
-                LOG(json_save_log);
-                break;
-            }
-        }
-        
-        if (!storage_initialized) {
-            snprintf(json_save_log, sizeof(json_save_log), 
-                     "[SD] Failed to initialize after retries");
-            LOG(json_save_log);
-            log_dummy_data();
-            return false;
-        }
-    }
-
-    // --- Step 2: Validate input data ---
-    if (!sendable_to_sd_card || strlen(sendable_to_sd_card) == 0) {
-        snprintf(json_save_log, sizeof(json_save_log), 
-                 "[SD] Nothing to write (empty or null data)");
-        LOG(json_save_log);
-        log_dummy_data();
-        return false;
-    }
-
-    // --- Step 3: Validate filename ---
-    if (strlen(json_log_file) == 0) {
-        snprintf(json_save_log, sizeof(json_save_log), 
-                 "[SD] ERROR: Empty filename, resetting to default");
-        LOG(json_save_log);
-        strncpy(json_log_file, "/data.json", sizeof(json_log_file) - 1);
-        json_log_file[sizeof(json_log_file) - 1] = '\0';
-    }
-
-    // Debug output (with timeout protection)
-    #ifdef DEBUG_SERIAL
-    Serial.printf("[SD] File path: '%s'\n", json_log_file);
-    #endif
-
-    // --- Step 4: Ensure file exists ---
-    if (!SD.exists(json_log_file)) {
-        snprintf(json_save_log, sizeof(json_save_log), 
-                 "[SD] File '%s' does not exist. Creating...", json_log_file);
-        LOG(json_save_log);
-        
-        File f = SD.open(json_log_file, FILE_WRITE);
-        if (!f) {
-            snprintf(json_save_log, sizeof(json_save_log), 
-                     "[SD] Failed to create file '%s'", json_log_file);
-            LOG(json_save_log);
-            return false;
-        }
-        f.close();
-        snprintf(json_save_log + strlen(json_save_log), 
-                 sizeof(json_save_log) - strlen(json_save_log),
-                 " (created)");
-    }
-
-    // --- Step 5: Check file size BEFORE opening for append ---
-    // This prevents opening a file that's already too large
-    File sizeCheckFile = SD.open(json_log_file, FILE_READ);
-    size_t currentSize = 0;
-    
-    if (sizeCheckFile) {
-        currentSize = sizeCheckFile.size();
-        sizeCheckFile.close();
-        
-        // Check total storage usage as well
-        uint64_t totalUsed = SD.usedBytes();
-        if (totalUsed > MAX_TOTAL_SIZE) {
-            snprintf(json_save_log, sizeof(json_save_log), 
-                     "[SD] CRITICAL: Total storage limit reached (%lluMB/%lluMB). "
-                     "Consider implementing cleanup.", 
-                     totalUsed / (1024 * 1024), 
-                     MAX_TOTAL_SIZE / (1024 * 1024));
-            LOG(json_save_log);
-            // You might want to trigger cleanup or stop saving here
-        }
-    } else {
-        snprintf(json_save_log, sizeof(json_save_log), 
-                 "[SD] WARNING: Cannot check size of '%s'", json_log_file);
-        LOG(json_save_log);
-    }
-
-    // --- Step 6: Check if rotation is needed ---
-    size_t incomingSize = strlen(sendable_to_sd_card);
-    bool needsRotation = false;
-    
-    if (currentSize > MAX_FILE_SIZE) {
-        // File is already too big
-        needsRotation = true;
-        snprintf(json_save_log + strlen(json_save_log), 
-                 sizeof(json_save_log) - strlen(json_save_log),
-                 " [Rotation: current size %lu > max %lu]", 
-                 (unsigned long)currentSize, 
-                 (unsigned long)MAX_FILE_SIZE);
-    } else if ((currentSize + incomingSize) > MAX_FILE_SIZE) {
-        // File will be too big after this write
-        needsRotation = true;
-        snprintf(json_save_log + strlen(json_save_log), 
-                 sizeof(json_save_log) - strlen(json_save_log),
-                 " [Rotation: current %lu + incoming %lu > max %lu]", 
-                 (unsigned long)currentSize, 
-                 (unsigned long)incomingSize, 
-                 (unsigned long)MAX_FILE_SIZE);
-    }
-
-    // --- Step 7: Handle rotation if needed ---
-    File file;
-    if (needsRotation) {
-        LOG(json_save_log); // Log rotation reason
-        
-        file = create_another_file();
-        if (!file) {
-            snprintf(json_save_log, sizeof(json_save_log), 
-                     "[SD] CRITICAL: File rotation failed, using original");
-            LOG(json_save_log);
-            // Fallback to original file
-            file = SD.open(json_log_file, FILE_APPEND);
-            if (!file) {
-                snprintf(json_save_log, sizeof(json_save_log), 
-                         "[SD] FATAL: Cannot open any file for writing");
-                LOG(json_save_log);
-                return false;
-            }
-        } else {
-            currentSize = 0; // New file starts at 0
-        }
-    } else {
-        // Open existing file for append
-        file = SD.open(json_log_file, FILE_APPEND);
-    }
-
-    if (!file) {
-        snprintf(json_save_log, sizeof(json_save_log), 
-                 "[SD] Failed to open '%s' for appending", json_log_file);
-        LOG(json_save_log);
-        return false;
-    }
-    
-
-    // --- Step 8: Write data with timeout and interruption protection ---
-    size_t bytesWritten = 0;
     bool writeSuccess = false;
-    
-    // Set up write timeout (critical for RTOS task)
-    const uint32_t WRITE_TIMEOUT_MS = 10000UL; // 5 second timeout for writes
+    timeoutOccurred = false;
+
+    // =========================================================
+    // 1. Ensure SD initialized
+    // =========================================================
+    if (!storage_initialized) {
+        if (!handle_sd_recovery()) return false;
+    }
+
+    // =========================================================
+    // 2. Validate input
+    // =========================================================
+    if (!sendable_to_sd_card || strlen(sendable_to_sd_card) == 0) {
+        handle_empty_payload();
+        return false;
+    }
+
+    // =========================================================
+    // 3. Validate filename
+    // =========================================================
+    if (strlen(json_log_file) <= 50) {
+        handle_filename_issue();
+    }
+
+    // =========================================================
+    // 4. Ensure file exists
+    // =========================================================
+    if (!SD.exists(json_log_file)) {
+        if (!handle_file_creation()) return false;
+    }
+
+    // =========================================================
+    // 5. Size check / rotation
+    // =========================================================
+    size_t incomingSize = strlen(sendable_to_sd_card);
+
+    if ((json_currentSize + incomingSize) > MAX_FILE_SIZE) {
+        if (!handle_large_file_issue(json_currentSize + incomingSize))
+            return false;
+    }
+
+    // =========================================================
+    // 6. Open file
+    // =========================================================
+    File file = SD.open(json_log_file, FILE_APPEND);
+    if (!file) {
+        handle_open_failure();
+        return false;
+    }
+
+    // =========================================================
+    // 7. Write with timeout protection
+    // =========================================================
+    const uint32_t WRITE_TIMEOUT_MS = 10000UL;
     uint32_t writeStartTime = millis();
-    bool timeoutOccurred = false;
-    
-    // Write with timeout protection
-  //  bytesWritten = file.print(sendable_to_sd_card);
 
-    // With:
-    bool saved = file.print(sendable_to_sd_card); // Write only dynamic data
-    //file.print(",\n"); // array elements are comma delimited
-     snprintf(last_json_save_time, sizeof(last_json_save_time), "%s", SystemTime);
+    size_t bytesWritten = file.print(sendable_to_sd_card);
 
-    
-    // Check for timeout during write
     if ((millis() - writeStartTime) > WRITE_TIMEOUT_MS) {
         timeoutOccurred = true;
-        snprintf(json_save_log, sizeof(json_save_log),
-                 "[SD] TIMEOUT: Write took >%lums (hung at %lu bytes)", 
-                 WRITE_TIMEOUT_MS, (unsigned long)bytesWritten);
-        LOG(json_save_log);
-        
-        // Emergency cleanup
         file.close();
-        snprintf(last_json_save_time, sizeof(last_json_save_time), "%s", SystemTime);
-
-        storage_initialized = false; // Force reinitialization
-        
-        // Optional: Mark file as potentially corrupted
-        char corruptedName[70];
-        snprintf(corruptedName, sizeof(corruptedName), "%s_CORRUPTED", json_log_file);
-        SD.rename(json_log_file, corruptedName);
-        
-        log_dummy_data();
+        handle_timeout(bytesWritten);
         return false;
     }
-    
-    // Write separator with timeout check
-    if (bytesWritten > 0 && !timeoutOccurred) {
-        size_t separatorWritten = file.print(",\n");
-        bytesWritten += separatorWritten;
-        
-        // Check for interruption/write corruption
-        if (separatorWritten != 2) { // ",\n" should be exactly 2 bytes
-            snprintf(json_save_log, sizeof(json_save_log),
-                     "[SD] WRITE CORRUPTION: Separator write incomplete (%lu/2 bytes)",
-                     (unsigned long)separatorWritten);
-            LOG(json_save_log);
-            
-            // Try to flush and close gracefully
-            file.flush();
-            file.close();
-            
-            /*
-            // Verify file still exists
-            if (!SD.exists(json_log_file)) {
-                storage_initialized = false;
-            }
-            
-            log_dummy_data();
-            */
-            return false;
-        }
-        
-        writeSuccess = (bytesWritten >= incomingSize);
-    }
-    
-    // --- Step 9: Flush with timeout protection ---
-    if (!timeoutOccurred) {
-        uint32_t flushStartTime = millis();
+
+    // Write separator
+    size_t separatorWritten = file.print(",\n");
+    if (separatorWritten != 2) {
         file.flush();
-        
-        if ((millis() - flushStartTime) > 1000) { // 1 second flush timeout
-            snprintf(json_save_log, sizeof(json_save_log),
-                     "[SD] WARNING: Flush took %lums (potential card issue)",
-                     (millis() - flushStartTime));
-            LOG(json_save_log);
-        }
+        file.close();
+        handle_separator_corruption(separatorWritten);
+        return false;
     }
-    
-    // Always close the file
+
+    bytesWritten += separatorWritten;
+    writeSuccess = (bytesWritten >= incomingSize);
+
+    // Flush
+    file.flush();
     file.close();
 
-    // --- Step 10: Verify write operation with interruption recovery ---
-    if (!writeSuccess || bytesWritten == 0 || timeoutOccurred) {
-        if (!timeoutOccurred) {
-            snprintf(json_save_log, sizeof(save_log), 
-                     "[SD] Write FAILED\n\r Expected %lu bytes, wrote %lu bytes", 
-                     (unsigned long)incomingSize, 
-                     (unsigned long)bytesWritten);
-            LOG(json_save_log);
-        }
-        
-        // Check SD card health on write failure
-        if (!SD.exists(json_log_file)) {
-            snprintf(json_save_log + strlen(json_save_log), 
-                     sizeof(json_save_log) - strlen(json_save_log),
-                     " (file missing!)");
-            storage_initialized = false; // Trigger re-initialization
-        }
-        
-        // Attempt recovery for partial writes
-        if (bytesWritten > 0 && bytesWritten < incomingSize) {
-            snprintf(json_save_log + strlen(json_save_log),
-                     sizeof(json_save_log) - strlen(json_save_log),
-                     " [Partial write: %lu/%lu bytes]", 
-                     (unsigned long)bytesWritten, 
-                     (unsigned long)incomingSize);
-            
-            // Try to truncate file to remove partial data
-            File repairFile = SD.open(json_log_file, FILE_WRITE);
-            if (repairFile) {
-                size_t newSize = repairFile.size();
-                repairFile.close();
-                
-                // If the file grew by less than what we tried to write, 
-                // we might have partial data corruption
-                if (newSize < (currentSize + bytesWritten)) {
-                    // Attempt to truncate to last known good size
-                    // Note: SD library doesn't support truncate directly
-                    snprintf(json_save_log + strlen(json_save_log),
-                             sizeof(json_save_log) - strlen(json_save_log),
-                             " [Size mismatch: %lu vs expected %lu]",
-                             (unsigned long)newSize,
-                             (unsigned long)(currentSize + bytesWritten));
-                }
-            }
-        }
-        
-        log_dummy_data();
+    // =========================================================
+    // 8. Verify write result
+    // =========================================================
+    if (!writeSuccess || bytesWritten == 0) {
+        handle_write_failure(bytesWritten, incomingSize);
         return false;
     }
 
-    // --- Step 11: Verify actual write succeeded ---
-    snprintf(json_save_log, sizeof(save_log),
-             "[SD] Success: %lu bytes appended to '%s' (total ~%lu bytes)",
+    // =========================================================
+    // 9. Update state AFTER verified success
+    // =========================================================
+    json_currentSize += bytesWritten;
+
+    snprintf(last_json_save_time, sizeof(last_json_save_time), "%s", SystemTime);
+
+    save_counter++;
+
+    if (save_counter % 60 == 0) {
+        prefs.begin("SAVES", false);
+        prefs.putUInt("SAVES", save_counter);
+        prefs.end();
+    }
+
+    // =========================================================
+    // 10. Periodic resync / maintenance
+    // =========================================================
+    if (save_counter % 120 == 0) {
+        handle_periodic_maintenance();
+    }
+
+    // =========================================================
+    // 11. Success log
+    // =========================================================
+    snprintf(json_save_log, sizeof(json_save_log),
+             "[SD] Success: %lu bytes appended to '%s' (total ~%lu)",
              (unsigned long)bytesWritten,
              json_log_file,
-             (unsigned long)(currentSize + bytesWritten));
-    
-    // Verify actual file size after write (with timeout)
-    uint32_t verifyStartTime = millis();
-    File verifyFile = SD.open(json_log_file, FILE_READ);
-    
-    if (verifyFile) {
-        size_t actualSize = verifyFile.size();
-        verifyFile.close();
-        
-        if ((millis() - verifyStartTime) > 1000) {
-            snprintf(json_save_log + strlen(json_save_log),
-                     sizeof(json_save_log) - strlen(json_save_log),
-                     " [Verify took %lums]", (millis() - verifyStartTime));
-        }
-        
-        // Check for size discrepancies (allow for filesystem overhead)
-        long long sizeDiff = (long long)actualSize - (long long)(currentSize + bytesWritten);
-        if (abs(sizeDiff) > 100) { // Allow 100 bytes discrepancy
-            snprintf(json_save_log + strlen(json_save_log), 
-                     sizeof(json_save_log) - strlen(json_save_log),
-                     " WARNING: Size mismatch (expected ~%lu, got %lu, diff=%lld)", 
-                     (unsigned long)(currentSize + bytesWritten), 
-                     (unsigned long)actualSize,
-                     sizeDiff);
-            
-            // If size is significantly smaller, we might have lost data
-            if (sizeDiff < -1000) { // Lost more than 1KB
-                storage_initialized = false; // Force reinit on next call
-            }
-        }
-    }
-    
+             (unsigned long)json_currentSize);
+
     LOG(json_save_log);
-    
-    // --- Step 12: Periodic maintenance ---
-    static int writeCounter = 0;
-    writeCounter++;
-    
-    // Only do periodic maintenance if we haven't had recent errors
-    if (writeCounter >= 100 && !timeoutOccurred && writeSuccess) { 
-        uint32_t maintenanceStart = millis();
-        
-        SD.end(); // Unmount
-        storage_initialized = SD.begin(SD_Chip_Select, SPI, 4000000); // Remount
-        
-        if ((millis() - maintenanceStart) > 2000) {
-            snprintf(save_log, sizeof(save_log),
-                     "[SD] Maintenance took %lums", (millis() - maintenanceStart));
-            LOG(json_save_log);
-        }
-        
-        if (storage_initialized) {
-            #ifdef DEBUG_SERIAL
-            LOG("[SD] Periodic remount completed");
-            #endif
-        }
-        writeCounter = 0;
-    }
 
     return true;
 }
 
-const char *file_heading = "Report,for,Hybrid,Solar,Dryer,at,Makerere,University,Agricultural,Research,Institute, Kabanyolo,(MUARIK)\n";
-char file_creation_date[64] = "File created:,,,";
-char logging_interval[52] = "Logging Interval (HH:MM:SS):,,,00:01:00"; // once every minute
-const char data_points_log[128] = "Data Points:,,Temperature, Relative Humidity, Barometric Pressure inside the Dryer (1-11) and ambient / outside the dryer (12)";
-const char units_of_data[156] = "Temperature is taken in Celcius Degrees (°C) | Relative Humidity in percent (%) | Barometric Pressure in kilopascals (kPa)";
-const char additional_entries[156] = "Microclimatic conditions measured: (2) wind speed in metres per second (m/s) and solar radiation in Watts per square metres (W/m²)";
+bool handle_large_file_issue(size_t weight_under_review) {
 
+    snprintf(json_save_log + strlen(json_save_log),
+             sizeof(json_save_log) - strlen(json_save_log),
+             " [Rotation: incoming %lu > max %lu]",
+             (unsigned long)weight_under_review,
+             (unsigned long)MAX_FILE_SIZE);
+
+    LOG(json_save_log);
+
+    File newFile = create_another_file();
+
+    if (!newFile) {
+        snprintf(json_save_log, sizeof(json_save_log),
+                 "[SD] CRITICAL: File rotation failed");
+        LOG(json_save_log);
+        return false;
+    }
+
+    newFile.close();
+    json_currentSize = 0;
+
+    return true;
+}
+
+bool handle_sd_recovery() {
+
+    snprintf(json_save_log, sizeof(json_save_log),
+             "[SD] Storage not initialized, attempting recovery...");
+    LOG(json_save_log);
+
+    for (int i = 0; i < 3; i++) {
+
+        storage_initialized = initialize_sd_card();
+        delay(1000 * (1 << i));
+
+        if (storage_initialized) {
+            snprintf(json_save_log, sizeof(json_save_log),
+                     "[SD] Recovered after %d attempts", i + 1);
+            LOG(json_save_log);
+            return true;
+        }
+    }
+
+    snprintf(json_save_log, sizeof(json_save_log),
+             "[SD] Failed to initialize after retries");
+    LOG(json_save_log);
+
+    return false;
+}
+
+void handle_empty_payload() {
+
+    snprintf(json_save_log, sizeof(json_save_log),
+             "[SD] Nothing to write (empty or null data)");
+    LOG(json_save_log);
+
+    log_dummy_data();
+}
+
+void handle_filename_issue() {
+
+    snprintf(json_save_log, sizeof(json_save_log),
+             "[SD] ERROR: Invalid filename, resetting to default");
+    LOG(json_save_log);
+
+    strncpy(json_log_file, "/data.json", sizeof(json_log_file) - 1);
+    json_log_file[sizeof(json_log_file) - 1] = '\0';
+}
+
+void handle_separator_corruption(size_t separatorWritten) {
+
+    snprintf(json_save_log, sizeof(json_save_log),
+             "[SD] WRITE CORRUPTION: Separator incomplete (%lu/2 bytes)",
+             (unsigned long)separatorWritten);
+    LOG(json_save_log);
+
+    log_dummy_data();
+}
+
+bool handle_file_creation() {
+
+    snprintf(json_save_log, sizeof(json_save_log),
+             "[SD] File '%s' does not exist. Creating...",
+             json_log_file);
+    LOG(json_save_log);
+
+    File f = SD.open(json_log_file, FILE_WRITE);
+    if (!f) {
+        snprintf(json_save_log, sizeof(json_save_log),
+                 "[SD] Failed to create file '%s'",
+                 json_log_file);
+        LOG(json_save_log);
+        return false;
+    }
+
+    f.close();
+    return true;
+}
+
+void handle_open_failure() {
+
+    snprintf(json_save_log, sizeof(json_save_log),
+             "[SD] Failed to open '%s' for appending",
+             json_log_file);
+    LOG(json_save_log);
+}
+
+void handle_timeout(size_t bytesWritten) {
+
+    snprintf(json_save_log, sizeof(json_save_log),
+             "[SD] TIMEOUT: Write hung at %lu bytes",
+             (unsigned long)bytesWritten);
+    LOG(json_save_log);
+
+    char corruptedName[70];
+    snprintf(corruptedName, sizeof(corruptedName),
+             "%s_CORRUPTED", json_log_file);
+
+    SD.rename(json_log_file, corruptedName);
+
+    log_dummy_data();
+}
+
+void handle_write_failure(size_t bytesWritten, size_t incomingSize) {
+
+    snprintf(json_save_log, sizeof(json_save_log),
+             "[SD] Write FAILED. Expected %lu, wrote %lu",
+             (unsigned long)incomingSize,
+             (unsigned long)bytesWritten);
+    LOG(json_save_log);
+
+    if (!SD.exists(json_log_file)) {
+        storage_initialized = false;
+    }
+
+    log_dummy_data();
+}
+
+void handle_periodic_maintenance() {
+
+    File f = SD.open(json_log_file, FILE_READ);
+    if (f) {
+        json_currentSize = f.size();
+        f.close();
+    }
+
+    if (json_currentSize > MAX_FILE_SIZE) {
+
+        LOG("[SD] Periodic rotation trigger (size exceeded)");
+
+        File newFile = create_another_file();
+        if (newFile) {
+            newFile.close();
+            json_currentSize = 0;
+        }
+    }
+
+    storage_initialized = false;
+    check_storage_files();
+}
+
+/*
+bool save_csv_to_sd_card() {
+
+    memset(csv_save_log, 0, sizeof(csv_save_log));
+
+    // ================= STEP 1: Check SD Initialization =================
+    if (!storage_initialized) {
+        snprintf(csv_save_log, sizeof(csv_save_log),
+                 "[CSV][SD] Storage not initialized");
+        LOG(csv_save_log);
+        return false;
+    }
+
+    // ================= STEP 2: Validate Data =================
+    if (!sendable_to_sd_card_csv || strlen(sendable_to_sd_card_csv) == 0) {
+        snprintf(csv_save_log, sizeof(csv_save_log),
+                 "[CSV][SD] Nothing to write (empty buffer)");
+        LOG(csv_save_log);
+        return false;
+    }
+
+    // ================= STEP 3: Ensure File Exists =================
+    if (!SD.exists(csv_log_file)) {
+        File createFile = SD.open(csv_log_file, FILE_WRITE);
+        if (!createFile) {
+            snprintf(csv_save_log, sizeof(csv_save_log),
+                     "[CSV][SD] Failed to create '%s'",
+                     csv_log_file);
+            LOG(csv_save_log);
+            return false;
+        }
+        createFile.close();
+        csv_currentSize = 0;
+    }
+
+    // ================= STEP 4: Open for Append =================
+    File file = SD.open(csv_log_file, FILE_APPEND);
+    if (!file) {
+        snprintf(csv_save_log, sizeof(csv_save_log),
+                 "[CSV][SD] Failed to open '%s'",
+                 csv_log_file);
+        LOG(csv_save_log);
+        return false;
+    }
+
+    // If cache unknown (e.g., first boot), sync once
+    if (csv_currentSize == 0) {
+        csv_currentSize = file.size();
+    }
+
+    // ================= STEP 5: If File Empty → Write Header =================
+    if (csv_currentSize <= 90) {
+
+        snprintf(file_creation_date, sizeof(file_creation_date),
+                 "Log File Created:,,,%s,%s", ShortDate, ShortTime_am_pm);
+
+        file.println(file_heading);
+        file.println("#########################################################");
+        file.println(file_creation_date);
+        file.println(logging_interval);
+        file.println(data_points_log);
+        file.println(units_of_data);
+        file.println(additional_entries);
+        file.println("---------------------------------------------------------");
+        file.println();
+
+        file.print(",");
+        file.print(",");
+        file.print("Sensor 1,,,");
+        file.print("Sensor 2,,,");
+        file.print("Sensor 3,,,");
+        file.print("Sensor 4,,,");
+        file.print("Sensor 5,,,");
+        file.print("Sensor 6,,,");
+        file.print("Sensor 7,,,");
+        file.print("Sensor 8,,,");
+        file.print("Sensor 9,,,");
+        file.print("Sensor 10,,,");
+        file.print("Sensor 11,,,");
+        file.print("Sensor 12,,,");
+        file.print("Environment,,");
+        file.println("System,,");
+
+        file.println(
+            "Date,Time,"
+            "S1_T (degC),S1_H (%),S1_P (kPa),"
+            "S2_T (degC),S2_H (%),S2_P (kPa),"
+            "S3_T (degC),S3_H (%),S3_P (kPa),"
+            "S4_T (degC),S4_H (%),S4_P (kPa),"
+            "S5_T (degC),S5_H (%),S5_P (kPa),"
+            "S6_T (degC),S6_H (%),S6_P (kPa),"
+            "S7_T (degC),S7_H (%),S7_P (kPa),"
+            "S8_T (degC),S8_H (%),S8_P (kPa),"
+            "S9_T (degC),S9_H (%),S9_P (kPa),"
+            "S10_T (degC),S10_H (%),S10_P (kPa),"
+            "S11_T (degC),S11_H (%),S11_P (kPa),"
+            "S12_T (degC),S12_H (%),S12_P (kPa),"
+            "Solar (W/sq.m),Wind(m/s),"
+            "Uptime,Voltage (V)"
+        );
+
+        file.flush();
+
+        // Update cached size after header write
+        csv_currentSize = file.size();
+
+        snprintf(csv_save_log + strlen(csv_save_log),
+                 sizeof(csv_save_log) - strlen(csv_save_log),
+                 "[CSV] Header written. ");
+
+        snprintf(last_csv_save_time,
+                 sizeof(last_csv_save_time),
+                 "%s",
+                 SystemTime);
+    }
+
+    // ================= STEP 6: Append CSV Row =================
+    size_t incomingSize = strlen(sendable_to_sd_card_csv);
+    size_t bytesWritten = file.print(sendable_to_sd_card_csv);
+
+    file.flush();
+    file.close();
+
+    // ================= STEP 7: Verify Write =================
+    if (bytesWritten != incomingSize) {
+        snprintf(csv_save_log,
+                 sizeof(csv_save_log),
+                 "[CSV][SD] Write FAILED (%lu/%lu bytes)",
+                 (unsigned long)bytesWritten,
+                 (unsigned long)incomingSize);
+        LOG(csv_save_log);
+        return false;
+    }
+
+    // ================= STEP 8: Update Cache ONLY After Success =================
+    csv_currentSize += bytesWritten;
+
+    snprintf(csv_save_log,
+             sizeof(csv_save_log),
+             "[CSV][SD] Success: %lu bytes appended (total ~%lu)",
+             (unsigned long)bytesWritten,
+             (unsigned long)csv_currentSize);
+
+    LOG(csv_save_log);
+
+    return true;
+}
+*/
+
+bool save_csv_to_sd_card() {
+
+    memset(csv_save_log, 0, sizeof(csv_save_log));
+
+    // =========================================================
+    // 1️⃣ SD Initialization (with recovery)
+    // =========================================================
+    if (!storage_initialized && !handle_csv_sd_recovery())
+        return false;
+
+    // =========================================================
+    // 2️⃣ Validate Payload
+    // =========================================================
+    if (!sendable_to_sd_card_csv || strlen(sendable_to_sd_card_csv) == 0) {
+        handle_csv_empty_payload();
+        return false;
+    }
+
+    size_t incomingSize = strlen(sendable_to_sd_card_csv);
+
+    // =========================================================
+    // 3️⃣ File Rotation Check (pre-write protection)
+    // =========================================================
+    if ((csv_currentSize + incomingSize) > MAX_CSV_FILE_SIZE) {
+        if (!handle_csv_large_file_issue(incomingSize))
+            return false;
+    }
+
+    // =========================================================
+    // 4️⃣ Ensure File Exists
+    // =========================================================
+    if (!SD.exists(csv_log_file) && !handle_csv_file_creation())
+        return false;
+
+    // =========================================================
+    // 5️⃣ Open File
+    // =========================================================
+    File file = SD.open(csv_log_file, FILE_APPEND);
+    if (!file) {
+        handle_csv_open_failure();
+        return false;
+    }
+
+    // Sync cache if unknown (first boot scenario)
+    if (csv_currentSize == 0)
+        csv_currentSize = file.size();
+
+    // =========================================================
+    // 6️⃣ Write Header If Needed
+    // =========================================================
+    if (csv_currentSize <= 90) {
+
+        snprintf(file_creation_date, sizeof(file_creation_date),
+                 "Log File Created:,,,%s,%s", ShortDate, ShortTime_am_pm);
+
+        file.println(file_heading);
+        file.println("#########################################################");
+        file.println(file_creation_date);
+        file.println(logging_interval);
+        file.println(data_points_log);
+        file.println(units_of_data);
+        file.println(additional_entries);
+        file.println("---------------------------------------------------------");
+        file.println();
+
+        file.print(",");
+        file.print(",");
+        file.print("Sensor 1,,,");
+        file.print("Sensor 2,,,");
+        file.print("Sensor 3,,,");
+        file.print("Sensor 4,,,");
+        file.print("Sensor 5,,,");
+        file.print("Sensor 6,,,");
+        file.print("Sensor 7,,,");
+        file.print("Sensor 8,,,");
+        file.print("Sensor 9,,,");
+        file.print("Sensor 10,,,");
+        file.print("Sensor 11,,,");
+        file.print("Sensor 12,,,");
+        file.print("Environment,,");
+        file.println("System,,");
+
+        file.println(
+            "Date,Time,"
+            "S1_T (degC),S1_H (%),S1_P (kPa),"
+            "S2_T (degC),S2_H (%),S2_P (kPa),"
+            "S3_T (degC),S3_H (%),S3_P (kPa),"
+            "S4_T (degC),S4_H (%),S4_P (kPa),"
+            "S5_T (degC),S5_H (%),S5_P (kPa),"
+            "S6_T (degC),S6_H (%),S6_P (kPa),"
+            "S7_T (degC),S7_H (%),S7_P (kPa),"
+            "S8_T (degC),S8_H (%),S8_P (kPa),"
+            "S9_T (degC),S9_H (%),S9_P (kPa),"
+            "S10_T (degC),S10_H (%),S10_P (kPa),"
+            "S11_T (degC),S11_H (%),S11_P (kPa),"
+            "S12_T (degC),S12_H (%),S12_P (kPa),"
+            "Solar (W/sq.m),Wind(m/s),"
+            "Uptime,Voltage (V)"
+        );
+
+        file.flush();
+        csv_currentSize = file.size();
+
+        snprintf(csv_save_log + strlen(csv_save_log),
+                 sizeof(csv_save_log) - strlen(csv_save_log),
+                 "[CSV] Header written. ");
+
+        snprintf(last_csv_save_time,
+                 sizeof(last_csv_save_time),
+                 "%s",
+                 SystemTime);
+    }
+
+    // =========================================================
+    // 7️⃣ Write CSV Row
+    // =========================================================
+    size_t bytesWritten = file.print(sendable_to_sd_card_csv);
+
+    file.flush();
+    file.close();
+
+    // =========================================================
+    // 8️⃣ Verify Write
+    // =========================================================
+    if (bytesWritten != incomingSize) {
+        handle_csv_write_failure(bytesWritten, incomingSize);
+        return false;
+    }
+
+    // =========================================================
+    // 9️⃣ Update Cache After Success
+    // =========================================================
+    csv_currentSize += bytesWritten;
+
+    snprintf(csv_save_log,
+             sizeof(csv_save_log),
+             "[CSV][SD] Success: %lu bytes appended (total ~%lu)",
+             (unsigned long)bytesWritten,
+             (unsigned long)csv_currentSize);
+
+    LOG(csv_save_log);
+
+    return true;
+}
+
+
+bool handle_csv_large_file_issue(size_t incomingSize) {
+
+    snprintf(csv_save_log + strlen(csv_save_log),
+             sizeof(csv_save_log) - strlen(csv_save_log),
+             " [CSV Rotation: incoming %lu > max %lu]",
+             (unsigned long)(csv_currentSize + incomingSize),
+             (unsigned long)MAX_CSV_FILE_SIZE);
+
+    LOG(csv_save_log);
+
+    File newFile = create_another_csv_file();
+
+    if (!newFile) {
+        snprintf(csv_save_log, sizeof(csv_save_log),
+                 "[CSV][SD] CRITICAL: Rotation failed");
+        LOG(csv_save_log);
+        return false;
+    }
+
+    newFile.close();
+    csv_currentSize = 0;
+
+    return true;
+}
+
+bool handle_csv_sd_recovery() {
+
+    snprintf(csv_save_log, sizeof(csv_save_log),
+             "[CSV][SD] Not initialized. Attempting recovery...");
+    LOG(csv_save_log);
+
+    for (int i = 0; i < 3; i++) {
+
+        storage_initialized = initialize_sd_card();
+        delay(1000 * (1 << i));
+
+        if (storage_initialized) {
+            snprintf(csv_save_log, sizeof(csv_save_log),
+                     "[CSV][SD] Recovered after %d attempts", i + 1);
+            LOG(csv_save_log);
+            return true;
+        }
+    }
+
+    snprintf(csv_save_log, sizeof(csv_save_log),
+             "[CSV][SD] Recovery failed");
+    LOG(csv_save_log);
+
+    return false;
+}
+
+void handle_csv_empty_payload() {
+
+    snprintf(csv_save_log, sizeof(csv_save_log),
+             "[CSV][SD] Empty CSV payload");
+    LOG(csv_save_log);
+}
+
+bool handle_csv_file_creation() {
+
+    snprintf(csv_save_log, sizeof(csv_save_log),
+             "[CSV][SD] Creating '%s'...",
+             csv_log_file);
+    LOG(csv_save_log);
+
+    File f = SD.open(csv_log_file, FILE_WRITE);
+    if (!f) {
+        snprintf(csv_save_log, sizeof(csv_save_log),
+                 "[CSV][SD] Failed to create '%s'",
+                 csv_log_file);
+        LOG(csv_save_log);
+        return false;
+    }
+
+    f.close();
+    csv_currentSize = 0;
+    return true;
+}
+
+void handle_csv_open_failure() {
+
+    snprintf(csv_save_log, sizeof(csv_save_log),
+             "[CSV][SD] Failed to open '%s'",
+             csv_log_file);
+    LOG(csv_save_log);
+}
+
+
+void handle_csv_write_failure(size_t bytesWritten, size_t incomingSize) {
+
+    snprintf(csv_save_log, sizeof(csv_save_log),
+             "[CSV][SD] Write FAILED (%lu/%lu bytes)",
+             (unsigned long)bytesWritten,
+             (unsigned long)incomingSize);
+
+    LOG(csv_save_log);
+
+    if (!SD.exists(csv_log_file)) {
+        storage_initialized = false;
+    }
+}
+
+void handle_csv_timeout(size_t bytesWritten) {
+
+    snprintf(csv_save_log, sizeof(csv_save_log),
+             "[CSV][SD] TIMEOUT at %lu bytes",
+             (unsigned long)bytesWritten);
+    LOG(csv_save_log);
+
+    char corruptedName[70];
+    snprintf(corruptedName, sizeof(corruptedName),
+             "%s_CORRUPTED", csv_log_file);
+
+    SD.rename(csv_log_file, corruptedName);
+}
+
+void handle_csv_periodic_maintenance() {
+
+    File f = SD.open(csv_log_file, FILE_READ);
+    if (f) {
+        csv_currentSize = f.size();
+        f.close();
+    }
+
+    if (csv_currentSize > MAX_CSV_FILE_SIZE) {
+
+        LOG("[CSV][SD] Periodic rotation trigger");
+
+        File newFile = create_another_csv_file();
+        if (newFile) {
+            newFile.close();
+            csv_currentSize = 0;
+        }
+    }
+}
+
+
+
+/*
 bool save_csv_to_sd_card(){
 
     memset(csv_save_log, 0, sizeof(csv_save_log));
@@ -1265,25 +1676,25 @@ bool save_csv_to_sd_card(){
     size_t currentSize = file.size();
 
     if (currentSize <= 90) { // each entry weighs about 1kB... SO 90B is considered empty
-     snprintf(file_creation_date, sizeof(file_creation_date),
+      snprintf(file_creation_date, sizeof(file_creation_date),
              "Log File Created:,,,%s,%s", ShortDate, ShortTime_am_pm);
 
-    // ================= REPORT METADATA =================
-    file.println(file_heading);                  // Title
-    file.println("#########################################################");
+        // ================= REPORT METADATA =================
+        file.println(file_heading);                  // Title
+        file.println("#########################################################");
 
-    file.println(file_creation_date);            // Creation timestamp //  in-col-spacing included
-   
-    file.println(logging_interval);
+        file.println(file_creation_date);            // Creation timestamp //  in-col-spacing included
+    
+        file.println(logging_interval);
 
-    file.println(data_points_log);
-    file.println(units_of_data);
-    file.println(additional_entries);
+        file.println(data_points_log);
+        file.println(units_of_data);
+        file.println(additional_entries);
 
-    file.println("---------------------------------------------------------");
-    file.println();   // Blank line before table
+        file.println("---------------------------------------------------------");
+        file.println();   // Blank line before table
 
-    // ================= GROUP HEADER ROW =================
+      // ================= GROUP HEADER ROW =================
 
          // Write the main header rows (two-row header for better organization)
         // Row 1: Main sensor groups (these will span multiple columns when viewed in spreadsheet software)
@@ -1359,8 +1770,16 @@ bool save_csv_to_sd_card(){
 
     LOG(csv_save_log);
 
+   
+      
+        File f = SD.open(csv_log_file, FILE_READ);
+        if (f) { csvSize = f.size(); f.close(); }
+    
+
+
     return true;
 }
+*/
 
 
 String read_complete_json_file() {
@@ -1575,19 +1994,6 @@ void log_dummy_data(){
     "}"
     "}"
   );
-}
-
-void enable_sd_card(){
-  
-    digitalWrite(SCREEN_CS, HIGH); delay(10);
-    digitalWrite(SD_Chip_Select, LOW);        
-
-}
-
-void enable_display(){
-    digitalWrite(SD_Chip_Select, HIGH); delay(10);
-    digitalWrite(SCREEN_CS, LOW);        
-
 }
 
 
@@ -1839,7 +2245,6 @@ void loop() {
           
           monitor_box_conditions(); // internal temp and fan state
           monitor_dryer_readings(); 
-          // monitor_fans(now_now_ms);
           
           //check_meta_data(); // column headers for CSV
            json_bound_successfully = bind_dynamic_data_into_json();
@@ -1879,6 +2284,8 @@ void loop() {
     }
  
  */
+
+    bool wifi_triggered = read_button(wifi_toggler, now_now_ms);
 
     bool otaTrigger = read_button(ota_button, now_now_ms);
 
@@ -1960,7 +2367,7 @@ void loop() {
         }
    } // !otaModeActive         
  
-  else  {   delay(2); // make the loop less when not polling ota
+  else  {   delay(10); // make the loop less when not polling ota
            flash(now_now_ms, blinker, 50, 75, 50, 1500); // normal
         }
 
@@ -2171,7 +2578,7 @@ void OnSensorData_received(const uint8_t * mac, const uint8_t *incomingData, int
 
 void extract_readings(){
       if(!packet_received) { LOG("No packet received!"); return; }  // this never runs, but just in case 
-      
+      digitalWrite(sensor_indicator, HIGH); delay(50); digitalWrite(sensor_indicator, LOW); 
        DeserializationError err = deserializeJson(JSON_data, dataPack);
 
         if (err) {
@@ -2743,46 +3150,7 @@ void monitor_dryer_readings(){
 }
 
 
-char fans_log[100] = "...";
-uint16_t re_run_attempts = 0;
-void monitor_fans(uint64_t time_now_ms){ // ALL DRYER FANS ARE ACTIVE LOW
- Serial.println("Monitoring Fans...");
 
-  if(!fans_are_togglable) {
-    strcpy(fans_log, "Night Conditions: Fans IDLE");
-    return;
-  }
-
-      if(Battery_Level_Counter <= 1){ // < 11.5V ... power is too low
-          if(humi_fan_on){   digitalWrite(humidity_fan_pin, HIGH); cooling_fan_on = false; re_run_attempts++; }
-          if(cooling_fan_on) {digitalWrite(cooling_fan_pin, HIGH); cooling_fan_on = false; re_run_attempts++;}    
-          strcpy(fans_log, "Power too Low: Fans OFF");
-          // return;
-      }
-      else { // START FANS ONLY IF BATTERY IS SUFFICIENT
-         re_run_attempts = 0; 
-        if(average_humi >= 50.0){ // high humidity, toggle extractive fans
-          if(!humi_fan_on){digitalWrite(humidity_fan_pin, LOW); cooling_fan_on = true;  humi_fans_started = time_now_ms; }
-          if(humi_fan_on) { humi_fans_duration = (time_now_ms - humi_fans_started)/1000; }
-        } 
-        else { // if humidity has lowered, jako ezo fan
-              if(humi_fan_on){digitalWrite(humidity_fan_pin, HIGH); cooling_fan_on = false; }
-            }
-
-
-        if(average_temp > 45.0){ // turn em ON at high temperatures
-          if(!cooling_fan_on) {digitalWrite(cooling_fan_pin, LOW); cooling_fan_on = true;  cooling_fans_started = time_now_ms;}
-          if(cooling_fan_on) {cooling_fans_duration = (time_now_ms - cooling_fans_started)/1000;}
-          
-        }
-        else if(average_temp <= 35.0){ // turn em OFF at low temperatures
-             if(cooling_fan_on) {digitalWrite(cooling_fan_pin, HIGH); cooling_fan_on = false; } 
-        }
-        else { // in between 35 - 45 ... do nothing... just monitor the time
-             if(cooling_fan_on) {cooling_fans_duration = (time_now_ms - cooling_fans_started)/1000;}
-        }
-     }
-}
 
 // Helper function to write static metadata to a file
 void write_json_metadata(File &file) {
@@ -2860,7 +3228,7 @@ bool bind_dynamic_data_into_json() {
     bool bound_successfully = false;
 
     JSON_sendable.clear();
-    save_counter++; // save this into EEPROM or SPIFFS
+   // save_counter++; // save this into EEPROM or SPIFFS
 
     // ================= SYSTEM RUNTIME DATA =================
     JsonObject System = JSON_sendable["System"].to<JsonObject>();
@@ -3418,7 +3786,7 @@ void monitor_box_conditions() {
 
     // ---------- NIGHT LIGHT CONTROL ----------
     // ON from 8:00 → 07:00
-
+    /*
     if (is_night_time && !night_Light_ON) { // turn light ON
         digitalWrite(night_Light, HIGH);
         night_Light_ON = true;
@@ -3429,6 +3797,7 @@ void monitor_box_conditions() {
         night_Light_ON = false;
         buzzer.beep(2, 100, 100);
     }
+    */
 
     // ---------- STATUS LOG ----------
     snprintf(
@@ -3709,13 +4078,13 @@ void upload_to_web_of_iot(){ // (no leak, better status handling)
   if (!wifi_connected) { Serial.println("Skip POST: WiFi down"); return; }
   if (!hasFreshJson) { Serial.println("Skip POST: no fresh JSON"); return; }
 
-  Serial.printf("\tPOST JSON => %s\n\tTo: %s\n", httpsData, serverName);
+  Serial.printf("\tPOST JSON => %s\n\tTo: %s\n", httpsData, server_address);
 
   WiFiClientSecure client;   // no heap leak
   client.setInsecure();      // accept all certs (consider proper CA in production)
 
   HTTPClient https;
-  if (https.begin(client, serverName)) {
+  if (https.begin(client, server_address)) {
     https.setTimeout(15000); // 15s network timeout
     https.addHeader("Content-Type", "application/json");
 
@@ -3739,7 +4108,7 @@ void upload_to_web_of_iot(){ // (no leak, better status handling)
 
 /*
 void upload_to_web_of_iot(){
-   //  Serial.print("\tData to send via HTTP POST => ");    Serial.println(dataPack);    Serial.print("\tTo: "); Serial.println(serverName); 
+   //  Serial.print("\tData to send via HTTP POST => ");    Serial.println(dataPack);    Serial.print("\tTo: "); Serial.println(server_address); 
    
     
     // WiFiClientSecure client;
@@ -3758,8 +4127,8 @@ void upload_to_web_of_iot(){
  
       Serial.println("Initializing HTTP...");
       
-    //  bool initialized = https.begin(serverName); 
-        bool initialized = https.begin(*client, serverName); // Your Domain name with URL path or IP address with path
+    //  bool initialized = https.begin(server_address); 
+        bool initialized = https.begin(*client, server_address); // Your Domain name with URL path or IP address with path
 
         if(initialized){ 
            
@@ -4789,6 +5158,7 @@ void graphPage(){  //GRAPHS, CHARTS etc ----
     
 }
 
+
 void filesPage(){
 
   LCD.firstPage();
@@ -4829,18 +5199,8 @@ void filesPage(){
     int gapX = 30;
 
     // ================= GET FILE SIZES =================
-    size_t jsonSize = 0;
-    size_t csvSize  = 0;
+    
 
-    if (SD.exists(json_log_file)) {
-        File f = SD.open(json_log_file, FILE_READ);
-        if (f) { jsonSize = f.size(); f.close(); }
-    }
-
-    if (SD.exists(csv_log_file)) {
-        File f = SD.open(csv_log_file, FILE_READ);
-        if (f) { csvSize = f.size(); f.close(); }
-    }
 
     // ===================================================
     // DRAW FILE ICON FUNCTION (inline style)
@@ -5058,130 +5418,7 @@ void drawCloudIcon(int x, int y) {
 }
 
 
-/*
-void logsPage(){
-    // SHOW LAST SAVED TIME
-  // SHOW LAST UPLOAD TIME
-  // BELOW IN A BIG BOX, PRINT sendable_to_sd_card WHICH WAS FORMATTED IN PRETTY JSON
 
-    uint16_t accentColor = (LCD.epd2.hasColor ? GxEPD_RED : GxEPD_BLACK);
-
-     LCD.firstPage();
-  do {
-    LCD.fillScreen(GxEPD_WHITE);
-
-    // ================= HEADER =================
-    LCD.fillRect(1, 1, 400 - 3, 40, accentColor);
-
-    LCD.setFont(&FreeSans12pt7b);
-    LCD.setTextColor(GxEPD_WHITE);
-    LCD.setCursor(20, 28);
-    LCD.print("Logs & Storage");
-
-    LCD.setTextColor(GxEPD_BLACK);
-
-    int y = 60;
-
-    // ================= FILE INFO =================
-    size_t jsonSize = 0;
-    size_t csvSize  = 0;
-
-    if (SD.exists(json_log_file)) {
-        File f = SD.open(json_log_file, FILE_READ);
-        if (f) { jsonSize = f.size(); f.close(); }
-    }
-
-    if (SD.exists(csv_log_file)) {
-        File f = SD.open(csv_log_file, FILE_READ);
-        if (f) { csvSize = f.size(); f.close(); }
-    }
-
-    LCD.setFont(&FreeMono9pt7b);
-
-    LCD.setCursor(10, y);
-    LCD.printf("JSON: %lu KB | Last: %s",
-               (unsigned long)(jsonSize / 1024),
-               last_json_save_time);
-
-    y += 20;
-
-    LCD.setCursor(10, y);
-    LCD.printf("CSV : %lu KB | Last: %s",
-               (unsigned long)(csvSize / 1024),
-               last_csv_save_time);
-
-    y += 25;
-
-    // ================= UPLOAD INFO =================
-    LCD.drawLine(0, y, SCREEN_W, y, GxEPD_BLACK);
-    y += 20;
-
-    LCD.setCursor(10, y);
-    LCD.printf("Last Upload: %s", last_upload_time);
-
-    y += 18;
-
-    LCD.setCursor(10, y);
-    LCD.print("Upload Log:");
-    y += 15;
-
-    LCD.setCursor(10, y);
-    LCD.print(upload_log);
-
-    y += 25;
-
-    // ================= SAVE LOGS =================
-    LCD.drawLine(0, y, SCREEN_W, y, GxEPD_BLACK);
-    y += 20;
-
-    LCD.setCursor(10, y);
-    LCD.print("JSON Save:");
-    y += 15;
-
-    LCD.setCursor(10, y);
-    LCD.print(save_log);
-
-    y += 20;
-
-    LCD.setCursor(10, y);
-    LCD.print("CSV Save:");
-    y += 15;
-
-    LCD.setCursor(10, y);
-    LCD.print(csv_save_log);
-
-    y += 25;
-
-    // ================= SERIALIZATION LOG =================
-    LCD.drawLine(0, y, SCREEN_W, y, GxEPD_BLACK);
-    y += 20;
-
-    LCD.setCursor(10, y);
-    LCD.print("Serialization:");
-    y += 15;
-
-    LCD.setCursor(10, y);
-    LCD.print(serialization_log);
-
-    y += 25;
-
-    // ================= JSON SNAPSHOT =================
-    LCD.drawLine(0, y, SCREEN_W, y, GxEPD_BLACK);
-    y += 20;
-
-    LCD.setCursor(10, y);
-    LCD.print("Last JSON Snapshot:");
-    y += 15;
-
-    // Print trimmed JSON (avoid overflow)
-            int maxChars = 300;
-            for (int i = 0; i < maxChars && sendable_to_sd_card[i] != '\0'; i++) {
-                LCD.write(sendable_to_sd_card[i]);
-            }
-                footer(); // semi universal footing
-     } while (LCD.nextPage());
-}
-*/
 
 void tablePage(){
 
@@ -5390,8 +5627,8 @@ void Boot(){
     uint16_t x4 = ((LCD.width() - tbw4) / 2) - tbx4;  // For MAC address
     uint16_t x5 = ((LCD.width() - tbw5) / 2) - tbx5;
    // Fixed Y positions (can be adjusted based on screen layout needs)
-    const uint16_t y1 = 80;   // Manufacturer position
-    const uint16_t y2 = 160;  // Device ID position
+    const uint16_t y1 = 40;   // Manufacturer position
+    const uint16_t y2 = 100;  // Device ID position
     const uint16_t y3 = 220;  // Client info position
     const uint16_t y4 = 250;  // MAC address position
     const uint16_t y5 = 290;  // MAC address position
@@ -5416,6 +5653,10 @@ void Boot(){
         LCD.setTextColor(GxEPD_BLACK);
         LCD.setCursor(x2, y2);
         LCD.print(DeviceID);
+        
+        LCD.setFont();
+        LCD.setcursor(1, 150); LCD.println(ESP_IDF_VER); 
+         LCD.setcursor(1, 150); LCD.print(ARD_CORE_VER);
         
         // Client Info - Black with monospace font for clean look
         LCD.setFont(&FreeMonoBold9pt7b);
@@ -5594,34 +5835,22 @@ void footer(){
           //  LCD.setFont(&FreeMono9pt7b);
           //  LCD.setCursor(385, 292); LCD.print(DISP_MODE);
 */
-
-
    //footer with upward curve
             LCD.fillRect(0, 260, 400, 40, GxEPD_BLACK); // GxEPD_BLACK
             LCD.fillRoundRect(2, 255, 396, 15, 8, GxEPD_WHITE);
-            // LCD.fillCircle(0, 295, 2, GxEPD_BLACK);
-
 
         // LOGS FOR NETWORK
             LCD.setFont();
             LCD.setTextColor(GxEPD_RED);
             LCD.setCursor(40, 260); LCD.print(internals_log);
 
-
             LCD.setFont(&FreeSans9pt7b); // LCD.setFont(&FreeSans9pt7b);
             LCD.setTextColor(GxEPD_WHITE);
     
-            //HOME TAB
-          //  LCD.fillRoundRect(5, 275, 62, 20, 10, GxEPD_WHITE); 
-            //LCD.setCursor(12, 290);  LCD.print("Home"); 
-            
             //DATE
             LCD.setCursor(2, 290);  LCD.print(SystemDate); 
 
-            
-            // WIFI & UPLOADS
-            
-            //NETWORK BARS
+            //NETWORK BARS  // WIFI & UPLOADS
             LCD.fillRect(230, 293, 6, 5, GxEPD_WHITE); LCD.fillRect(240, 283, 6, 15, GxEPD_WHITE); LCD.fillRect(250, 274, 6, 25, GxEPD_WHITE);
             LCD.setFont();
             //LCD.setCursor(200, 290); LCD.print("WiFi: "); 
@@ -5648,12 +5877,5 @@ void footer(){
 
 
 
-char ESP_IDF_VER[50] = "ESP-IDF Version: ";
-char ARD_CORE_VER[50] = "Arduino Core Version: ";
-
-void ESPInfo() {
-    snprintf(ESP_IDF_VER, sizeof(ESP_IDF_VER), "ESP-IDF Version: %s", esp_get_idf_version());
-    snprintf(ARD_CORE_VER, sizeof(ARD_CORE_VER), "Arduino Core Version: %s", ESP.getSdkVersion());
-}
 
 
