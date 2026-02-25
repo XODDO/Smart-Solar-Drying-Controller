@@ -7,19 +7,54 @@ const char *server_address = "https://webofiot.com/dryer/muarik/server.php";
 const char Manufacturer[15] = "IntelliSys UG";
 const char DeviceID[32] = "Dryer Monitoring System";
 const char DeviceClient[36] = "Susan M PhD Project, MUARIK";
-uint8_t SystemAddress[] = {0x68, 0xFE, 0x71, 0x88, 0x1A, 0x6C}; 
+const int SystemAddress[] = {0x68, 0xFE, 0x71, 0x88, 0x1A, 0x6C}; 
+
+//const char *file_heading = "Report,for,Hybrid,Solar,Dryer,at,Makerere,University,Agricultural,Research,Institute, Kabanyolo,(MUARIK)\n";
+
+const char *file_heading = "Data Report for the 12mx6m Hybrid Solar Dryer at Makerere University Agricultural Research Institute Kabanyolo [MUARIK]\n";
+char file_creation_date[64] = "File created:,,,";
+char logging_interval[52] = "Logging Interval (HH:MM:SS):,,,00:01:00,minute(s)\n"; // once every minute
+const char data_points_log[200] = "Data Points:Temperature Relative Humidity Barometric Pressure inside the Dryer (Sensor 1-11) and ambient / Temperature Relative Humidity Barometric Pressure outside the dryer (Sensor 12)";
+const char units_of_data[180] = "Temperature is taken in Celcius Degrees (°C) | Relative Humidity in percent (%) | Barometric Pressure in kilopascals (kPa)";
+const char additional_entries[156] = "Microclimatic conditions measured: (2) wind speed in metres per second (m/s) and solar radiation in Watts per square metres (W/m²)";
+
+size_t bytesWritten = 0;
+bool writeSuccess = false;
+  
+static char *csv_file = "/data.csv";
+char new_name[64];
+static char json_log_file[64] = "/data.json"; // primary storage file
+static char csv_log_file[64] = "/data.csv"; // secondary storage file
+
+static const size_t MAX_FILE_SIZE = 20 * 1024 * 1024; // 20 MB per file
+static const size_t MAX_CSV_FILE_SIZE = 20 * 1024 * 1024; 
+static const size_t MAX_TOTAL_SIZE = 100 * 1024 * 1024; // 100 MB total limit
+
 
 char apiKeyValue[12] = "DRYER_006"; //MUARIK TOKEN
 
 char ESP_IDF_VER[50] = "ESP-IDF Version: ";
 char ARD_CORE_VER[50] = "Arduino Core Version: ";
-char FW_VERSION[50] "v3.3.5-Dryer_Datalogger";
+char FW_VERSION[50] = "v3.3.5-Dryer_Datalogger";
 
 #define USE_VSPI_FOR_SD
 #define USE_HSPI_FOR_EPD
 
 #include <Arduino.h>
 #include "Wire.h"
+#include "SPI.h"
+#include "FS.h"
+#include "SD.h"
+
+#include <stdlib.h>
+#include <math.h>
+#include "RTClib.h"
+
+#include "Adafruit_GFX.h"
+#include <GxEPD2_BW.h>
+#include <GxEPD2_3C.h>
+
+
 #include <WiFi.h>
 #include <esp_now.h>
 
@@ -28,22 +63,6 @@ char FW_VERSION[50] "v3.3.5-Dryer_Datalogger";
 #include <Update.h> //FOR UPDATING OVER THE AIR
 #include <ESPmDNS.h>
 #include <WiFiUdp.h>
-
-#include <stdlib.h>
-#include <math.h>
-
-
-#include "RTClib.h"
-
-
-#include "Adafruit_GFX.h"
-#include <GxEPD2_BW.h>
-#include <GxEPD2_3C.h>
-
-#include "SPI.h"
-#include "FS.h"
-#include "SD.h"
-
 
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
@@ -89,6 +108,29 @@ typedef enum {
     POWER_MODERATE,      // 11.8V - 12.5V - Light Sleep (5 mins)
     POWER_EXCELLENT      // > 12.5V - Active (10 seconds)
 } power_state_t;
+
+// Add these enums and globals at the top with your other globals
+typedef enum {
+    OTA_STATE_IDLE,
+    OTA_STATE_STARTING,
+    OTA_STATE_PROGRESS,
+    OTA_STATE_SUCCESS,
+    OTA_STATE_ERROR,
+    OTA_STATE_TIMEOUT
+} OTAState;
+
+OTAState current_ota_state = OTA_STATE_IDLE;
+uint64_t ota_success_time = 0;
+uint64_t ota_error_time = 0;
+uint64_t ota_timeout_time = 0;
+uint64_t ota_start_time = 0;
+
+
+
+const int64_t wifi_checK_interval = (2ULL * 1000ULL);
+
+uint64_t screen_refresh_interval = (1ULL*60ULL*1000ULL); // refreshing entire screen once 5 mins daytime, else 30mins at night 180 seconds, b4 hibernating
+const uint64_t upload_fequency = (10ULL*60ULL*1000ULL); // every 10 minutes
 
 // Sleep durations in microseconds
 const uint64_t power_critical_sleep_duration = 2ULL * 60ULL * 60ULL * 1000000ULL; // 2 hours
@@ -297,11 +339,8 @@ uint64_t last_seen[12] = {0, 0, 0, 0, 0, 0};
 
 
 
-float sensor_1_time_series_readings[30]; // up to 10 readings ago
-char sensor_1_time_stamps[30][32] = {"10:10", "10:11", "10:12", "10:13"};
 
-float sensor_2_time_series_readings[30]; // up to 30 readings
-char sensor_2_time_stamps[30][32] = {"10:10", "10:11", "10:12", "10:13"};
+
 
 
 char voltage_string[10] = ""; 
@@ -365,7 +404,7 @@ void graphPage();
 void filesPage();
 void logsPage();
 void otaPage();
-void errorPage();
+void sleepPage();
 void cloudPage();
 void footer();
 
@@ -479,6 +518,7 @@ void setup() { delay(50); // for OTA to fully hand over
           digitalWrite(SD_Chip_Select, HIGH);
           delay(100);
 
+
         sd_initialized = initialize_sd_card(); //USES HSPI HARDWARE SERIAL
 
 
@@ -492,6 +532,7 @@ void setup() { delay(50); // for OTA to fully hand over
         save_counter = prefs.getUInt("SAVES", 0);  // Load saved value, default 0
         prefs.end();
         
+        pinMode(sensor_indicator, OUTPUT); digitalWrite(sensor_indicator, HIGH);
         
         // --- Initialize EPD on VSPI ---
         strcpy(initializer, "Initializing E-Paper Display over VSPI...");
@@ -557,15 +598,7 @@ void setup() { delay(50); // for OTA to fully hand over
 
         delay(1000);
 
-       /*
-       switch_radio_to_wifi();
-     
-       //wifi_connected = wifi_obj.ensure_wifi();
-       initializeOTA();
-       
-    
-      */
-        // Uploader.begin(); // leave it because it uses WiFi
+  
         
 
         digitalWrite(blinker, HIGH); delay(1000);
@@ -586,10 +619,12 @@ void setup() { delay(50); // for OTA to fully hand over
 
        for(int i = 0; i < 1; i++){
         digitalWrite(innerFAN, HIGH);
+         digitalWrite(sensor_indicator, HIGH);
        // buzzer.beep(1,50,0);
         delay(500);
 
         digitalWrite(innerFAN, LOW);
+         digitalWrite(sensor_indicator, LOW);
         buzzer.beep(1,50,0);
         delay(500);
 
@@ -598,7 +633,7 @@ void setup() { delay(50); // for OTA to fully hand over
         uint16_t poll = 0;
         while(poll<2000){ // keep a bit here for 2 seconds
             delay(1); poll++;
-            if(packet_received) { buzzer.beep(1,50,0);  extract_readings(); packet_received = false; }
+            if(packet_received) { /*buzzer.beep(1,50,0);*/  extract_readings(); packet_received = false; }
         }
 
         monitor_box_conditions();
@@ -647,28 +682,6 @@ void BuzzingTask(void * pvParams) {
     vTaskDelay(xDelay);
   }
 }
-
-
-const char *file_heading = "Report,for,Hybrid,Solar,Dryer,at,Makerere,University,Agricultural,Research,Institute, Kabanyolo,(MUARIK)\n";
-char file_creation_date[64] = "File created:,,,";
-char logging_interval[52] = "Logging Interval (HH:MM:SS):,,,00:01:00"; // once every minute
-const char data_points_log[128] = "Data Points:,,Temperature, Relative Humidity, Barometric Pressure inside the Dryer (1-11) and ambient / outside the dryer (12)";
-const char units_of_data[156] = "Temperature is taken in Celcius Degrees (°C) | Relative Humidity in percent (%) | Barometric Pressure in kilopascals (kPa)";
-const char additional_entries[156] = "Microclimatic conditions measured: (2) wind speed in metres per second (m/s) and solar radiation in Watts per square metres (W/m²)";
-
-size_t bytesWritten = 0;
-bool writeSuccess = false;
-  
-
-
-static char *csv_file = "/data.csv";
-char new_name[64];
-static char json_log_file[64] = "/data.json"; // primary storage file
-static char csv_log_file[64] = "/data.csv"; // secondary storage file
-
-static const size_t MAX_FILE_SIZE = 20 * 1024 * 1024; // 20 MB per file
-static const size_t MAX_TOTAL_SIZE = 100 * 1024 * 1024; // 100 MB total limit
-
 size_t jsonSize = 0; // base file ...  before rotating
 size_t csvSize  = 0; // base file ...  before rotating
 
@@ -1415,14 +1428,16 @@ bool save_csv_to_sd_card() {
                  "Log File Created:,,,%s,%s", ShortDate, ShortTime_am_pm);
 
         file.println(file_heading);
-        file.println("#########################################################");
+       // file.println("#########################################################");
+        file.println("METADATA");
         file.println(file_creation_date);
         file.println(logging_interval);
         file.println(data_points_log);
         file.println(units_of_data);
         file.println(additional_entries);
-        file.println("---------------------------------------------------------");
+        file.println("--------------------------------------------------------------------------");
         file.println();
+        file.println("DYNAMIC DATA");
 
         file.print(",");
         file.print(",");
@@ -1641,7 +1656,132 @@ void handle_csv_periodic_maintenance() {
     }
 }
 
+File create_another_csv_file() {
 
+    char new_name[80];
+
+    // =========================================================
+    // 1️⃣ Generate Filename
+    // =========================================================
+    if (strlen(ShortDate) == 0 || strlen(ShortTime) == 0) {
+
+        // Fallback to uptime timestamp
+        snprintf(new_name, sizeof(new_name),
+                 "/data_%lu.csv",
+                 (unsigned long)millis());
+
+    } else {
+
+        snprintf(new_name, sizeof(new_name),
+                 "/data_%s_%s.csv",
+                 ShortDate, ShortTime);
+
+        // FAT filesystem invalid character sanitization
+        for (char *p = new_name; *p; p++) {
+            if (*p == ':' || *p == '/' || *p == '\\' || *p == '*' ||
+                *p == '?' || *p == '"' || *p == '<' || *p == '>' || *p == '|') {
+                *p = '-';
+            }
+        }
+    }
+
+    // =========================================================
+    // 2️⃣ Log Rotation
+    // =========================================================
+    char rotation_log[100];
+    snprintf(rotation_log, sizeof(rotation_log),
+             "[CSV][SD] Rotating to: %s",
+             new_name);
+    LOG(rotation_log);
+
+    // =========================================================
+    // 3️⃣ Update Global Filename
+    // =========================================================
+    strncpy(csv_log_file, new_name, sizeof(csv_log_file) - 1);
+    csv_log_file[sizeof(csv_log_file) - 1] = '\0';
+
+    // =========================================================
+    // 4️⃣ Create New File
+    // =========================================================
+    File newFile = SD.open(new_name, FILE_WRITE);
+
+    if (!newFile) {
+
+        LOG("[CSV][SD] ERROR: Failed to create rotated file");
+
+        // Fallback to default CSV filename
+        strncpy(csv_log_file, "/data.csv",
+                sizeof(csv_log_file) - 1);
+        csv_log_file[sizeof(csv_log_file) - 1] = '\0';
+
+        newFile = SD.open(csv_log_file, FILE_APPEND);
+
+        return newFile;   // May still fail — caller handles it
+    }
+
+    // =========================================================
+    // 5️⃣ Write CSV Header to Fresh File
+    // =========================================================
+    write_csv_header(newFile);
+
+    newFile.flush();
+
+    // Reset size cache after header write
+    csv_currentSize = newFile.size();
+
+    return newFile;
+}
+
+void write_csv_header(File &file) {
+
+    snprintf(file_creation_date, sizeof(file_creation_date),
+             "Log File Created:,,,%s,%s",
+             ShortDate, ShortTime_am_pm);
+
+    file.println(file_heading);
+    file.println("#########################################################");
+    file.println(file_creation_date);
+    file.println(logging_interval);
+    file.println(data_points_log);
+    file.println(units_of_data);
+    file.println(additional_entries);
+    file.println("---------------------------------------------------------");
+    file.println();
+
+    file.print(",,");
+    file.print("Sensor 1,,,");
+    file.print("Sensor 2,,,");
+    file.print("Sensor 3,,,");
+    file.print("Sensor 4,,,");
+    file.print("Sensor 5,,,");
+    file.print("Sensor 6,,,");
+    file.print("Sensor 7,,,");
+    file.print("Sensor 8,,,");
+    file.print("Sensor 9,,,");
+    file.print("Sensor 10,,,");
+    file.print("Sensor 11,,,");
+    file.print("Sensor 12,,,");
+    file.print("Environment,,");
+    file.println("System,,");
+
+    file.println(
+        "Date,Time,"
+        "S1_T (degC),S1_H (%),S1_P (kPa),"
+        "S2_T (degC),S2_H (%),S2_P (kPa),"
+        "S3_T (degC),S3_H (%),S3_P (kPa),"
+        "S4_T (degC),S4_H (%),S4_P (kPa),"
+        "S5_T (degC),S5_H (%),S5_P (kPa),"
+        "S6_T (degC),S6_H (%),S6_P (kPa),"
+        "S7_T (degC),S7_H (%),S7_P (kPa),"
+        "S8_T (degC),S8_H (%),S8_P (kPa),"
+        "S9_T (degC),S9_H (%),S9_P (kPa),"
+        "S10_T (degC),S10_H (%),S10_P (kPa),"
+        "S11_T (degC),S11_H (%),S11_P (kPa),"
+        "S12_T (degC),S12_H (%),S12_P (kPa),"
+        "Solar (W/sq.m),Wind(m/s),"
+        "Uptime,Voltage (V)"
+    );
+}
 
 /*
 bool save_csv_to_sd_card(){
@@ -2201,12 +2341,7 @@ bool initialize_sd_card() {
 
 char meta_data[1000];
 
-
-uint64_t screen_refresh_interval = (1ULL*60ULL*1000ULL); // refreshing entire screen once 5 mins daytime, else 30mins at night 180 seconds, b4 hibernating
-const uint64_t upload_fequency = (10ULL*60ULL*1000ULL); // every 10 minutes
-boolean uploaded = false;
-
-const uint64_t wifi_checK_interval = (2ULL * 1000ULL);
+bool uploaded = false;
 uint64_t    last_wifi_check = 0; 
 
 
@@ -2215,20 +2350,41 @@ bool json_data_logged = false;
 bool csv_data_logged = false;
 
 bool fans_are_togglable = false; // when power is low, totawaana
-
+bool wifi_triggered = false;
+bool otaTriggered = false;
 uint32_t loop_count = 0; // tracker for whenever loop or a RTOS task yeesibye
 
-
+bool currently_uploading = false;
 char activity_log[1024];
 bool is_night_time = false;
 bool is_at_peak_sunshine = false;
 
 void loop() {
     now_now_ms = esp_timer_get_time() / 1000ULL; // us to ms
-     update_display(); // this returns 99.9% of the time and only updates screen ever 5, or 30mins
+    // either we are in OTA MODE or uploading mode or normal mode
 
+  if (otaModeActive) { // KEEP CHECKING OTA HANDLE EVERY LOOP
+        ArduinoOTA.handle(); 
+        handle_ota(now_now_ms);
+        
+        return;
+   }         
+ 
+  else  {  // !otaModeActive 
+            if(currently_uploading){ handle_upload(); return; } // should wifi be time based or trigger based?
+        
+            flash(now_now_ms, blinker, 50, 75, 50, 1500); // normal
+
+          //  wifi_triggered = read_button(wifi_toggler, now_now_ms);
+
+            otaTriggered = read_button(ota_button, now_now_ms);
+
+            if (otaTriggered && !otaModeActive) toggle_ota();
+         
+       //  if(wifi_triggered && !currently_uploading) currently_uploading = true;
+ 
+           
     if(packet_received) { buzzer.beep(1,50,0);  extract_readings(); packet_received = false; }
-    
     // Sensor readings
     if ((now_now_ms - last_read_time_ms) >= data_update_interval) { // 60 seconds if power is good for 24 hours:: 1,440 saved packets/day
         last_read_time_ms = now_now_ms;  // Update FIRST to prevent race conditions
@@ -2265,39 +2421,86 @@ void loop() {
               );
 
           LOG(activity_log);
-    }
+      }
     
 
+    }
+     
+         
+        update_display(); // this returns 99.9% of the time and only updates screen ever 5, or 30mins
+
+        loop_count++;
+         delay(10); // make the loop less tight when not polling ota
+
+         
+
+   /*
+    // Enter sleep based on power state
+    if (current_power != POWER_EXCELLENT) {
+        sleep_dynamically();
+    } else {
+        // For excellent power, use delay instead of sleep
+        delay(1000);
+    }
+   */
+
+}
+/// loop()
+
+
+void handle_upload(){
+
+   flash(now_now_ms, blinker, 500, 500, 0, 0); // TELEMETRY MODE
   /*
+   currentScreen = 9; special_call = true;
+   update_display(); // set the upload screen
+  */
     if((now_now_ms - last_upload_time_ms) > upload_frequency_ms){ // either every 10mins or at the tenth minute
       if(can_send){ // when using WiFi to upload
-       switch_radio_to_wifi(); 
-       UploadStatus st Uploader.upload_to_web_of_iot(sendable_to_cloud_db);
-        Serial.printf("[Upload Task] upload status=%d; report=%s\n", (int)st, Uploader.get_upload_report());
-        snprintf(last_upload_time, sizeof(last_upload_time), "%s", SystemTime);
-         snprintf(upload_error_code, sizeof(upload_error_code), 
-                        "Uploaded at %s on %s", ShortTime_am_pm, SystemDate);
-        LOG(upload_error_code);
-        can_send = false;
+      
+                esp_err_t result = esp_now_deinit();
+            if (result != ESP_OK) {
+                Serial.printf("ESP-NOW deinit failed: %d\n", result);
+                 switch_radio_to_espnow();
+                return;
+            }
+     
+     switch_radio_to_wifi(); 
+     wifi_connected = wifi_obj.ensure_wifi();
+     if(!wifi_connected) {Serial.println("WiFi connection failure, switching back");
+        switch_radio_to_espnow();
+        return;
+     }
 
-        data_sent = true;
-        last_upload_time_ms = now_now_ms;
+       delay(1000);
+         if (wifi_connected) {
+                Serial.println("Initializing uploader...");
+                Uploader.begin(); // leave it because it uses WiFi
+                Serial.println("Uploading data...");
+                Uploader.upload_to_web_of_iot(sendable_to_cloud_db);
+                //UploadStatus st Uploader.upload_to_web_of_iot(sendable_to_cloud_db);
+              //  Serial.printf("[Upload Task] upload status=%d; report=%s\n", (int)st, Uploader.get_upload_report());
+                snprintf(last_upload_time, sizeof(last_upload_time), "%s", SystemTime);
+                snprintf(upload_error_code, sizeof(upload_error_code), 
+                            "Uploaded at %s on %s", ShortTime_am_pm, SystemDate);
+                LOG(upload_error_code);
 
+                data_sent = true;
+                currently_uploading = false;
+                last_upload_time_ms = now_now_ms;
+            }
+        delay(2000);
+        switch_radio_to_espnow();
 
       }
     }
- 
- */
+}
 
-    bool wifi_triggered = read_button(wifi_toggler, now_now_ms);
-
-    bool otaTrigger = read_button(ota_button, now_now_ms);
-
- if (otaTrigger && !otaModeActive){
+void toggle_ota(){
 
     Serial.println("\n=== OTA Triggered ===");
 
-                buzzer.beep(3, 500, 200);
+    buzzer.beep(2, 500, 200);
 
     esp_err_t result = esp_now_deinit();
     if (result != ESP_OK) {
@@ -2313,6 +2516,11 @@ void loop() {
         return;
     }
 
+        initializeOTA();
+
+        
+       
+
     otaModeActive = true;
     otaStartTime = now_now_ms;
 
@@ -2323,117 +2531,369 @@ void loop() {
             special_call = true;
             update_display();
             
-  }
+}
 
- // when activated successfully
-  
-  if (otaModeActive) { // KEEP CHECKING OTA HANDLE EVERY LOOP
-        ArduinoOTA.handle();
-        flash(now_now_ms, blinker, 50, 50, 50, 50); // uploading
-       
-     if((now_now_ms - last_wifi_check) >= wifi_checK_interval) { // CHECK WIFI STATUS ONCE EVERY 2 SECONDS, ... 
-            wifi_connected = wifi_obj.ensure_wifi(); 
-            last_wifi_check = now_now_ms;
-        }
+// OTA LED blink patterns (ON1, OFF1, ON2, OFF2 in milliseconds)
+#define OTA_BLINK_IDLE       100, 400, 100, 400    // Slow single pulse (ready)
+#define OTA_BLINK_STARTING   50, 50, 0, 0        // Fast continuous (connecting)
+#define OTA_BLINK_PROGRESS   50, 50, 50, 50    // Medium heartbeat (uploading)
+#define OTA_BLINK_SUCCESS    1000, 100, 0, 0       // Long ON, short OFF (completed)
+#define OTA_BLINK_ERROR      500, 500, 500, 500    // Alternating (error)
+#define OTA_BLINK_TIMEOUT    100, 100, 500, 500    // Two fast, pause (timeout)
 
-        if (otaFinished) { // let it be seen and heard
-                strcpy(ota_log, "Update complete!"); 
-                snprintf(LastOTAUpdate, sizeof(LastOTAUpdate), "On Date: %s, at %s", SystemDate, ShortTime);
-                buzzer.beep(2, 100, 50);
-                delay(50);
-                flash(now_now_ms, blinker, 1000, 100, 0, 0);
-                otaFinished = false;
-        }
-
-     if(otaStarted){
-            strcpy(ota_log, "Start updating...");
-            buzzer.beep(1, 50, 0); 
-            delay(50);
-            otaStarted = false;
-      }
-     if(otaError){
-            buzzer.beep(1, 500, 500);
-            delay(500);
-            otaError = false;
-     }
-     if(otaProgress){
-
-     }
-
-    // Timeout after 5 minutes
-    if ((now_now_ms - otaStartTime) >= OTA_TIMEOUT) {
-            Serial.println();
-            Serial.printf("OTA timeout reached!!! Started at: %llu, Ended at: %llu ", otaStartTime/1000, now_now_ms/1000);
-            Serial.println("Returning to ESP-NOW mode...");
-        
+void handle_ota(uint64_t running_time) {
+    // WiFi check every 2 seconds
+    if ((running_time - last_wifi_check) >= (2ULL * 1000ULL)) { // wifi_check_interval
+        wifi_connected = wifi_obj.ensure_wifi();
+        last_wifi_check = running_time;
+    }
+    
+    // Handle OTA state transitions with appropriate LED patterns
+    if (otaStarted) {
+        strcpy(ota_log, "Starting OTA update...");
+        buzzer.beep(1, 50, 0);
+        ota_start_time = running_time;  // Track when OTA actually started
+        otaStarted = false;
+        current_ota_state = OTA_STATE_STARTING;
+    }
+    
+    if (otaProgress > 0 && otaProgress < 100) {
+        snprintf(ota_log, sizeof(ota_log), "Updating... %d%%", otaProgress);
+        current_ota_state = OTA_STATE_PROGRESS;
+    }
+    
+    if (otaFinished) {
+        strcpy(ota_log, "Update complete!");
+        snprintf(LastOTAUpdate, sizeof(LastOTAUpdate), "On Date: %s, at %s", SystemDate, ShortTime);
+        buzzer.beep(2, 500, 200);
+        otaFinished = false;
+        current_ota_state = OTA_STATE_SUCCESS;
+        ota_success_time = running_time;  // Track for success display duration
+    }
+    
+    if (otaError) {
+        strcpy(ota_log, "Update failed!");
+        buzzer.beep(1, 500, 500);
+        otaError = false;
+        current_ota_state = OTA_STATE_ERROR;
+        ota_error_time = running_time;
+    }
+    
+    // Check for timeout
+    if ((running_time - otaStartTime) >= OTA_TIMEOUT && otaModeActive) {
+        snprintf(ota_log, sizeof(ota_log), "OTA timeout after %llu seconds", 
+                 (running_time - otaStartTime) / 1000);
+        current_ota_state = OTA_STATE_TIMEOUT;
+        ota_timeout_time = running_time;
+    }
+    
+    // Apply appropriate blink pattern based on current state
+    apply_ota_blink_pattern(running_time);
+    
+    // Exit conditions
+    if (current_ota_state == OTA_STATE_TIMEOUT) {
+        if ((running_time - ota_timeout_time) >= 5000) {  // Show timeout for 5 seconds
             otaModeActive = false;
             switch_radio_to_espnow();
         }
-   } // !otaModeActive         
- 
-  else  {   delay(10); // make the loop less when not polling ota
-           flash(now_now_ms, blinker, 50, 75, 50, 1500); // normal
-        }
-
-
-  /*
-    // OTA handling (only in excellent power mode)
-   // WiFi & OTA handling for excellent power mode
-    if (current_power == POWER_LOW || current_power == POWER_MODERATE || current_power == POWER_EXCELLENT) {
-        // Check/ensure WiFi periodically for OTA
-        static uint64_t last_wifi_check = 0;
-          if ((now_now_ms - last_wifi_check) >= 10000) { // Check every 10 seconds
-              wifi_connected = wifi_obj.ensure_wifi();
-              last_wifi_check = now_now_ms;
-          }
-     
     }
-
-    // Data upload (only check WiFi here if not already connected from OTA section)
-    if (can_send) {
-        // If we're in excellent power mode but WiFi check hasn't run recently
-        if (current_power == POWER_EXCELLENT && !wifi_connected) {
-            wifi_connected = wifi_obj.ensure_wifi();
+    
+    if (current_ota_state == OTA_STATE_SUCCESS) {
+        if ((running_time - ota_success_time) >= 5000) {  // Show success for 5 seconds
+            otaModeActive = false;
+            switch_radio_to_espnow();
         }
-        
-        if (wifi_connected) {
-                Serial.println("Uploading data...");
-                bool upload_success = post_to_thingsPeak();
-                delay(500);
-            
-            
-                prepare_JSON_file();
-                delay(500);
-               // upload_to_web_of_iot();
-               UploadStatus st = Uploader.upload_to_web_of_iot(httpsData);
-               Serial.printf("[Upload Task] upload status=%d; report=%s\n", (int)st, Uploader.get_upload_report());
-
-                
-                snprintf(upload_log, sizeof(upload_log), 
-                        "Uploaded at %s on %s", ShortTime_am_pm, SystemDate);
-           // } else {      strncpy(upload_log, "Upload failed", sizeof(upload_log)); }
-            
-            data_sent = true;
-        } else {
-            Serial.println("WiFi not available for upload");
+    }
+    
+    if (current_ota_state == OTA_STATE_ERROR) {
+        if ((running_time - ota_error_time) >= 5000) {  // Show error for 5 seconds
+            otaModeActive = false;
+            switch_radio_to_espnow();
         }
-        
-        can_send = false;
     }
-
- /*
-    // Enter sleep based on power state
-    if (current_power != POWER_EXCELLENT) {
-        sleep_dynamically();
-    } else {
-        // For excellent power, use delay instead of sleep
-        delay(1000); // Short delay to prevent tight loop
-    }
-  */
-        loop_count++;
-
 }
-/// loop()
+
+void apply_ota_blink_pattern(uint64_t running_time) {
+    static OTAState last_state = OTA_STATE_IDLE;
+    
+    // Reset blink phase if state changed
+    if (last_state != current_ota_state) {
+        reset_blink_phase();
+        last_state = current_ota_state;
+    }
+    
+    // Apply pattern based on current state
+    switch (current_ota_state) {
+        case OTA_STATE_IDLE:
+        default:
+            flash(running_time, blinker, OTA_BLINK_IDLE);
+            break;
+            
+        case OTA_STATE_STARTING:
+            flash(running_time, blinker, OTA_BLINK_STARTING);
+            break;
+            
+        case OTA_STATE_PROGRESS:
+            flash(running_time, blinker, OTA_BLINK_PROGRESS);
+            break;
+            
+        case OTA_STATE_SUCCESS:
+            flash(running_time, blinker, OTA_BLINK_SUCCESS);
+            break;
+            
+        case OTA_STATE_ERROR:
+            flash(running_time, blinker, OTA_BLINK_ERROR);
+            break;
+            
+        case OTA_STATE_TIMEOUT:
+            flash(running_time, blinker, OTA_BLINK_TIMEOUT);
+            break;
+    }
+}
+
+// Enhanced flash function with pattern reset capability
+void flash(uint64_t flash_time, uint8_t heartbeat,
+           uint16_t ON_1, uint16_t OFF_1,
+           uint16_t ON_2, uint16_t OFF_2) {
+    
+    static uint64_t previe = 0;
+    static uint8_t phase = 0;
+    static uint16_t last_pattern[4] = {0};
+    
+    // Check if pattern changed (for reset_blink_phase to work)
+    uint16_t current_pattern[4] = {ON_1, OFF_1, ON_2, OFF_2};
+    if (memcmp(last_pattern, current_pattern, sizeof(current_pattern)) != 0) {
+        phase = 0;
+        previe = flash_time;
+        memcpy(last_pattern, current_pattern, sizeof(current_pattern));
+    }
+    
+    uint64_t interval = 0;
+    switch (phase) {
+        case 0: interval = ON_1; break;
+        case 1: interval = OFF_1; break;
+        case 2: interval = ON_2; break;
+        case 3: interval = OFF_2; break;
+    }
+
+    if ((flash_time - previe) >= interval) {
+        previe = flash_time;
+        phase = (phase + 1) % 4;
+        bool ledState = (phase == 0 || phase == 2);
+        digitalWrite(heartbeat, ledState ? HIGH : LOW);
+    }
+}
+
+// Helper to reset blink pattern
+void reset_blink_phase(void) {
+    // This will be detected in flash() by pattern change
+    // Just need to call this before changing patterns
+}
+
+
+/*When OTA is triggered:
+
+Freeze logging
+
+Freeze screen logic
+
+Freeze uploads
+
+Freeze radio switching
+
+Run ONLY OTA
+
+
+Exit cleanly back to ESP-NOW*/
+/*
+void handle_ota(uint64_t running_time){
+                
+     if((running_time - last_wifi_check) >= wifi_checK_interval) { // CHECK WIFI STATUS ONCE EVERY 2 SECONDS, ... 
+            wifi_connected = wifi_obj.ensure_wifi(); 
+            last_wifi_check = running_time;
+        }
+
+        if(otaStarted){
+            strcpy(ota_log, "Start updating...");
+            buzzer.beep(1, 50, 0); 
+            delay(2);
+            otaStarted = false;
+      }
+      if (otaFinished) { // let it be seen and heard
+                strcpy(ota_log, "Update complete!"); 
+                snprintf(LastOTAUpdate, sizeof(LastOTAUpdate), "On Date: %s, at %s", SystemDate, ShortTime);
+                buzzer.beep(2, 100, 50);
+                delay(2);
+                flash(running_time, blinker, 1000, 100, 0, 0);
+                otaFinished = false;
+        }
+
+     
+     if(otaError){
+            buzzer.beep(1, 500, 500);
+           // delay(500);
+            otaError = false;
+     }
+     if(otaProgress){
+        flash(now_now_ms, blinker, 50, 50, 50, 50); // uploading
+     }
+     else flash(now_now_ms, blinker, 100, 100, 100, 100); // active but not uploading
+
+    // Timeout after 5 minutes
+    if ((running_time - otaStartTime) >= OTA_TIMEOUT) {
+           
+            snprintf(ota_log, sizeof(ota_log), "OTA timeout reached!!! Started at: %llu, Ended at: %llu ", otaStartTime/1000, running_time/1000);
+           
+            otaModeActive = false;
+            switch_radio_to_espnow();
+        }
+}
+
+*/
+
+/*
+bool read_button(uint8_t pin, uint64_t time_now){
+
+    static uint64_t pressStart = 0;
+    static bool lastState = HIGH;    // idle is HIGH with INPUT_PULLUP
+    static bool longPressHandled = false;
+
+    bool pressed = false;
+    bool state = digitalRead(pin);   // LOW = pressed (active LOW)
+
+    // Button pressed (HIGH → LOW transition)
+    if (state == LOW && lastState == HIGH) {
+        pressStart = time_now;
+        longPressHandled = false;
+    }
+
+    // Long press detected (3 seconds)
+    if (state == LOW &&
+        !longPressHandled &&
+        (time_now - pressStart >= 2200ULL))
+    {
+        pressed = true;
+        longPressHandled = true;
+        buzzer.beep(1, 50, 0);
+        Serial.println("Mode Activated!");
+    }
+
+    // Button released (LOW → HIGH transition)
+    if (state == HIGH && lastState == LOW) {
+        longPressHandled = false;
+    }
+
+    lastState = state;
+    return pressed;
+}
+*/
+
+// Structure to hold button state for each pin
+struct ButtonState {
+    uint64_t pressStart;
+    bool lastState;
+    bool longPressHandled;
+};
+
+// Map to store state for each button pin (up to 10 buttons)
+static ButtonState buttonStates[10] = {0};
+static uint8_t buttonPins[10] = {0};
+static uint8_t buttonCount = 0;
+
+// Helper to find or create button state index
+int getButtonIndex(uint8_t pin) {
+    // Look for existing pin
+    for (int i = 0; i < buttonCount; i++) {
+        if (buttonPins[i] == pin) return i;
+    }
+    
+    // Add new pin if space available
+    if (buttonCount < 10) {
+        buttonPins[buttonCount] = pin;
+        buttonStates[buttonCount].lastState = HIGH;
+        buttonStates[buttonCount].pressStart = 0;
+        buttonStates[buttonCount].longPressHandled = false;
+        return buttonCount++;
+    }
+    
+    return -1; // No space
+}
+
+bool read_button(uint8_t pin, uint64_t time_now) {
+    int index = getButtonIndex(pin);
+    if (index == -1) return false; // Too many buttons
+    
+    ButtonState* btn = &buttonStates[index];
+    
+    bool pressed = false;
+    bool state = digitalRead(pin);   // LOW = pressed (active LOW)
+
+    // Button pressed (HIGH → LOW transition)
+    if (state == LOW && btn->lastState == HIGH) {
+        btn->pressStart = time_now;
+        btn->longPressHandled = false;
+    }
+
+    // Long press detected (2.2 seconds)
+    if (state == LOW &&
+        !btn->longPressHandled &&
+        (time_now - btn->pressStart >= 2200ULL))
+    {
+        pressed = true;
+        btn->longPressHandled = true;
+        buzzer.beep(1, 50, 0);
+        
+        // Optional: Add pin-specific debug
+        Serial.print("Button on pin ");
+        Serial.print(pin);
+        Serial.println(" activated!");
+    }
+
+    // Button released (LOW → HIGH transition)
+    if (state == HIGH && btn->lastState == LOW) {
+        btn->longPressHandled = false;
+    }
+
+    btn->lastState = state;
+    return pressed;
+}
+
+/*
+// --- Flash pattern generator ---
+void flash(uint64_t flash_time, uint8_t heartbeat,
+           uint16_t ON_1, uint16_t OFF_1,
+           uint16_t ON_2, uint16_t OFF_2) {
+    
+    // Make these static to persist between calls for each LED
+    static uint64_t previe = 0;
+    static uint8_t phase = 0;
+    static int k = 1;
+    
+    if(otaStarted) { 
+        //Serial.println(k); 
+        k++; 
+    }
+    
+    uint64_t interval = 0;
+    switch (phase) {
+        case 0: interval = ON_1; break;
+        case 1: interval = OFF_1; break;
+        case 2: interval = ON_2; break;
+        case 3: interval = OFF_2; break;
+    }
+
+    if ((flash_time - previe) >= interval) {
+        previe = flash_time;
+        phase = (phase + 1) % 4;
+        bool ledState = (phase == 0 || phase == 2);
+        digitalWrite(heartbeat, ledState ? HIGH : LOW);
+    }
+}
+*/
+
+// replace switch_radio_to_espnow() with the version from the "Fix B" snippet above
+// and replace OnSensorData_received with the safer copy version above
+
 
 /*
 ACTIVE LOW
@@ -2464,44 +2924,6 @@ bool read_button(uint8_t pin, uint64_t time_now){
   return pressed;
 }
 */
-
-bool read_button(uint8_t pin, uint64_t time_now)
-{
-    static uint64_t pressStart = 0;
-    static bool lastState = HIGH;    // idle is HIGH with INPUT_PULLUP
-    static bool longPressHandled = false;
-
-    bool pressed = false;
-    bool state = digitalRead(pin);   // LOW = pressed (active LOW)
-
-    // Button pressed (HIGH → LOW transition)
-    if (state == LOW && lastState == HIGH) {
-        pressStart = time_now;
-        longPressHandled = false;
-    }
-
-    // Long press detected (3 seconds)
-    if (state == LOW &&
-        !longPressHandled &&
-        (time_now - pressStart >= 3000ULL))
-    {
-        pressed = true;
-        longPressHandled = true;
-        buzzer.beep(1, 50, 0);
-    }
-
-    // Button released (LOW → HIGH transition)
-    if (state == HIGH && lastState == LOW) {
-        longPressHandled = false;
-    }
-
-    lastState = state;
-    return pressed;
-}
-
-// replace switch_radio_to_espnow() with the version from the "Fix B" snippet above
-// and replace OnSensorData_received with the safer copy version above
-
 
 
 #define ESPNOW_MAX_RETRIES 3
@@ -3819,37 +4241,6 @@ void monitor_box_conditions() {
 
 
 
-// --- Flash pattern generator ---
-void flash(uint64_t flash_time, uint8_t heartbeat,
-           uint16_t ON_1, uint16_t OFF_1,
-           uint16_t ON_2, uint16_t OFF_2) {
-    
-    // Make these static to persist between calls for each LED
-    static uint64_t previe = 0;
-    static uint8_t phase = 0;
-    static int k = 1;
-    
-    if(otaStarted) { 
-        Serial.println(k); 
-        k++; 
-    }
-    
-    uint64_t interval = 0;
-    switch (phase) {
-        case 0: interval = ON_1; break;
-        case 1: interval = OFF_1; break;
-        case 2: interval = ON_2; break;
-        case 3: interval = OFF_2; break;
-    }
-
-    if ((flash_time - previe) >= interval) {
-        previe = flash_time;
-        phase = (phase + 1) % 4;
-        bool ledState = (phase == 0 || phase == 2);
-        digitalWrite(heartbeat, ledState ? HIGH : LOW);
-    }
-}
-
 
 uint8_t wifi_connect_attempts = 0;
 //DRAM_ATTR char wifi_log[200]; // force globals into RAM instead of flash
@@ -4833,7 +5224,7 @@ void update_display(){
         case 10: otaPage(); // showing OTA mode, WiFi, and IP
             break;
 
-        default: errorPage();
+        default: sleepPage();
         break;
     }
 
@@ -5512,8 +5903,12 @@ void tablePage(){
 
 }
 
+ // ===== Colors =====
+        uint16_t accentRed = (LCD.epd2.hasColor ? GxEPD_RED : GxEPD_BLACK);
+        uint16_t accentBlack = GxEPD_BLACK;
+        
 
-void errorPage(){
+void sleepPage(){
          LCD.firstPage();
   do {
                
@@ -5522,6 +5917,286 @@ void errorPage(){
     } while (LCD.nextPage());
 }
 
+void cloud_icon(int connectionY){ // CLOUD SERVER
+            // ===== CONNECTION ICON (Cloud to Device) =====
+        // Left side - Cloud (server)
+        int cloudX = 30;
+        int cloudY = connectionY + 10;
+        //SERVER
+       // LCD.fillRect(1, cloudY, 30, 100, accentBlack);
+        // Main cloud body - overlapping circles/bubbles
+        // Bottom layer - largest cloud puffs
+        LCD.fillCircle(cloudX + 25, cloudY + 10, 18, accentBlack);      // Main base
+        LCD.fillCircle(cloudX + 45, cloudY + 5, 15, accentBlack);       // Right puff
+        LCD.fillCircle(cloudX + 5, cloudY + 5, 14, accentBlack);        // Left puff
+        LCD.fillCircle(cloudX + 15, cloudY - 5, 12, accentBlack);       // Top left puff
+        LCD.fillCircle(cloudX + 35, cloudY - 8, 14, accentBlack);       // Top right puff
+
+        // Highlight circles (white) to create depth and cloud-like appearance
+        LCD.fillCircle(cloudX + 20, cloudY + 5, 8, GxEPD_WHITE);        // Highlight on main base
+        LCD.fillCircle(cloudX + 40, cloudY, 7, GxEPD_WHITE);            // Highlight on right puff
+        LCD.fillCircle(cloudX + 10, cloudY, 6, GxEPD_WHITE);            // Highlight on left puff
+        LCD.fillCircle(cloudX + 25, cloudY - 8, 5, GxEPD_WHITE);        // Highlight on top
+
+        // Tiny accent circles (red) for detail
+        LCD.fillCircle(cloudX + 30, cloudY - 2, 3, accentRed);          // Small red accent
+        LCD.fillCircle(cloudX + 15, cloudY + 8, 2, accentRed);          // Tiny red dot
+
+        // Connection waves (data flowing from cloud to device)
+        for (int i = 0; i < 3; i++) {
+            int waveX = 120 + i * 30;
+            int waveHeight = 15 + i * 8;
+            
+            // Wave lines in red
+            LCD.drawLine(waveX, connectionY + 15, 
+                        waveX + 15, connectionY + 15 - waveHeight, accentRed);
+            LCD.drawLine(waveX + 15, connectionY + 15 - waveHeight, 
+                        waveX + 30, connectionY + 15, accentRed);
+            
+            // Small data packet dots
+            LCD.fillCircle(waveX + 7, connectionY + 10, 2, accentRed);
+            LCD.fillCircle(waveX + 22, connectionY + 5, 2, accentRed);
+        }
+
+        // Small arrow indicators showing direction (device → cloud)
+            LCD.fillTriangle(210, connectionY + 5, 
+                        200, connectionY, 
+                        200, connectionY + 10, accentRed);
+            LCD.fillTriangle(210, connectionY + 25, 
+                        200, connectionY + 20, 
+                        200, connectionY + 30, accentRed);
+                
+} 
+
+
+void otaPage() {
+           
+    LCD.firstPage();
+    do {
+        LCD.fillScreen(GxEPD_WHITE);
+        
+        // ===== Constants for responsive scaling =====
+        const int screenWidth = 400;
+        const int screenHeight = 300;
+        const int margin = 20;
+        const int headerHeight = 60;
+        
+
+        
+        // ===== HEADER with decorative elements =====
+        LCD.fillRect(0, 0, screenWidth, 4, accentRed);  // Top accent line
+        
+        // Title with shadow effect
+        LCD.setFont(&FreeSansBold24pt7b);
+        LCD.setTextColor(accentBlack);
+        LCD.setCursor(58, 48);  // Shadow
+        LCD.print("OTA MODE");
+        LCD.setTextColor(accentRed);
+        LCD.setCursor(55, 45);  // Main text
+        LCD.print("OTA MODE");
+        
+        // Decorative elements
+       // LCD.fillCircle(360, 45, 8, accentRed);
+        //LCD.fillCircle(380, 45, 4, accentBlack);
+        
+        // ===== MAIN CONTAINER (visual grouping) =====
+        // Connection visualization area
+        int connectionY = headerHeight + 20;
+        
+        // ===== CONNECTION ICON (Laptop/Server to Device) =====
+        // Left side - Server/Laptop
+        // Laptop body
+       // LCD.fillRoundRect(30, connectionY, 50, 65, 5, accentBlack);
+        //LCD.fillRoundRect(35, connectionY - 15, 50, 8, 3, accentBlack);  // Laptop lid
+        
+        cloud_icon(connectionY);
+    
+        /*
+        // Laptop screen (displaying signal)
+        LCD.fillRect(43, connectionY - 4, 30, 10, GxEPD_WHITE);
+        LCD.drawLine(65, connectionY - 2, 75, connectionY - 2, accentRed);
+        LCD.drawLine(67, connectionY - 4, 77, connectionY - 4, accentRed);
+
+        
+        // Small arrow indicators
+        LCD.fillTriangle(220, connectionY + 5, 
+                        230, connectionY, 
+                        230, connectionY + 10, accentRed);
+        LCD.fillTriangle(220, connectionY + 25, 
+                        230, connectionY + 20, 
+                        230, connectionY + 30, accentRed);
+        
+        */
+
+        /*
+        
+        // Right side - Device (ESP32 rectangle)
+        // Device body (scaled to represent your 24cmx17cm device)
+        LCD.fillRoundRect(260, connectionY - 15, 100, 65, 2, accentBlack);
+
+        // Screen (representing 9cmx7.5cm screen)
+        LCD.fillRoundRect(290, connectionY - 5, 40, 30, 4, GxEPD_WHITE);
+
+        // Screen content - tiny "OTA" text to show it's updating
+        LCD.setFont(&FreeSans6pt7b);
+        LCD.setTextColor(accentBlack);
+        LCD.setCursor(298, connectionY + 12);
+        LCD.print("OTA");
+
+        // Button (representing the 1.6cm round button)
+        LCD.drawLine(260, connectionY + 40, 340, connectionY + 40, GxEPD_WHITE);  // Base line
+        LCD.fillCircle(310, connectionY + 35, 8, accentRed);                       // Outer ring
+        LCD.fillCircle(310, connectionY + 35, 5, GxEPD_WHITE);                     // Inner circle
+
+        // Small LED indicator on device
+        LCD.fillCircle(340, connectionY - 5, 3, accentRed);                        // Status LED
+        */
+
+
+        // Right side - Device 
+        // Device body (scaled to represent your 24cmx17cm device)
+        LCD.fillRoundRect(260, connectionY - 15, 100, 65, 2, accentBlack);
+        // Screen (representing 9cmx7.5cm screen)
+        LCD.fillRoundRect(290, connectionY - 5, 40, 30, 4, GxEPD_WHITE);
+        // Button (representing the 1.6cm round button)
+        LCD.drawLine(275, connectionY + 45, 340, connectionY + 45, GxEPD_WHITE);
+        LCD.fillCircle(310, connectionY + 37, 6, accentRed);
+        LCD.fillCircle(310, connectionY + 37, 4, GxEPD_WHITE);
+        
+        // Connection animation (signal waves)
+        for (int i = 0; i < 3; i++) {
+            int waveX = 150 + i * 30;
+            int waveHeight = 15 + i * 10;
+            LCD.drawLine(waveX, connectionY + 15, 
+                        waveX + 15, connectionY + 15 - waveHeight, accentRed);
+            LCD.drawLine(waveX + 15, connectionY + 15 - waveHeight, 
+                        waveX + 30, connectionY + 15, accentRed);
+        }
+        
+
+        // ===== INFORMATION CARDS =====
+        int cardY = connectionY + 80;
+        int cardWidth = (screenWidth - 3 * margin) / 2;
+        
+        // Left card - Network Info
+        LCD.drawRoundRect(margin, cardY, cardWidth, 90, 5, accentBlack);
+        LCD.fillRoundRect(margin + 2, cardY + 2, cardWidth - 4, 25, 3, accentRed);
+        
+        LCD.setFont(&FreeSans9pt7b);
+        LCD.setTextColor(GxEPD_WHITE);
+        LCD.setCursor(margin + 20, cardY + 20);
+        LCD.print("NETWORK");
+        
+        LCD.setTextColor(accentBlack);
+        LCD.setFont(&FreeSans9pt7b);
+        LCD.setCursor(margin + 10, cardY + 50);
+        LCD.print("SSID:");
+        LCD.setCursor(margin + 60, cardY + 50);
+        LCD.print(WiFi.SSID().substring(0, 10));
+        
+        LCD.setCursor(margin + 10, cardY + 80);
+        LCD.print("IP:");
+        LCD.setCursor(margin + 40, cardY + 80);
+        LCD.print(WiFi.localIP());
+        
+        // Right card - Device Info
+        int rightCardX = screenWidth - cardWidth - margin;
+        LCD.drawRoundRect(rightCardX, cardY, cardWidth, 90, 5, accentBlack);
+        LCD.fillRoundRect(rightCardX + 2, cardY + 2, cardWidth - 4, 25, 3, accentBlack);
+        
+        LCD.setTextColor(GxEPD_WHITE);
+        LCD.setCursor(rightCardX + 30, cardY + 20);
+        LCD.print("DEVICE");
+        
+        LCD.setTextColor(accentBlack);
+        LCD.setCursor(rightCardX + 10, cardY + 50);
+        //LCD.print("Name:");
+        LCD.setCursor(rightCardX + 10, cardY + 50);
+        LCD.print(devicename);
+        
+        LCD.setCursor(rightCardX + 10, cardY + 80);
+        LCD.print("Status:");
+        LCD.setCursor(rightCardX + 60, cardY + 80);
+        LCD.print(otaModeActive ? "ACTIVE" : "IDLE");
+        
+        // ===== OTA STATUS BAR =====
+        int statusY = screenHeight - 40;
+        
+        // Progress bar background
+        LCD.drawRoundRect(margin, statusY, screenWidth - 2 * margin, 25, 5, accentBlack);
+        
+        // Progress fill (if OTA in progress)
+        if (otaProgress > 0) {
+            int progressWidth = map(otaProgress, 0, 100, 0, screenWidth - 2 * margin - 4);
+            LCD.fillRoundRect(margin + 2, statusY + 2, progressWidth, 21, 4, accentRed);
+        }
+        
+        // Progress text
+        LCD.setFont(&FreeSans9pt7b);
+        LCD.setTextColor(accentBlack);
+        LCD.setCursor(margin + 10, statusY + 20);
+        
+        // Dynamic status messages
+        if (otaStarted) {
+            LCD.print("DOWNLOADING... ");
+            if (otaProgress > 0) {
+                LCD.print(otaProgress);
+                LCD.print("%");
+            }
+        } else if (otaFinished) {
+            LCD.setTextColor(accentRed);
+            LCD.print("UPDATE COMPLETE! ✓");
+        } else if (otaError) {
+            LCD.setTextColor(accentRed);
+            LCD.print("UPDATE FAILED! ✗");
+        } else {
+            LCD.print("READY FOR UPDATE");
+        }
+        
+        // ===== STATUS LOG =====
+        LCD.setFont(&FreeSans9pt7b);
+        LCD.setTextColor(accentBlack);
+        LCD.setCursor(margin, statusY + 45);
+        LCD.print(ota_log);
+        
+        // ===== TIMEOUT INDICATOR =====
+        if (otaModeActive) {
+            int timeoutX = screenWidth - 100;
+            int timeoutY = statusY - 15;
+            
+            // Timer circle
+          //  LCD.drawCircle(timeoutX, timeoutY, 12, accentBlack);
+            
+            // Time remaining calculation (assuming OTA_TIMEOUT is 5 minutes = 300000ms)
+            int remainingSeconds = (OTA_TIMEOUT - (now_now_ms - otaStartTime)) / 1000;
+            if (remainingSeconds < 0) remainingSeconds = 0;
+            
+            LCD.setCursor(timeoutX - 5, timeoutY + 35);
+            LCD.setFont(&FreeSans9pt7b);
+            if (remainingSeconds < 60) {
+                LCD.print(remainingSeconds);
+                LCD.print("s");
+            } else {
+                LCD.print(remainingSeconds / 60);
+                LCD.print("m");
+            }
+        }
+        
+        /*
+        // ===== FOOTER =====
+        LCD.fillRect(0, screenHeight - 10, screenWidth, 2, accentRed);
+        
+        // Small instruction text
+        LCD.setFont(&FreeSans9pt7b);
+        LCD.setTextColor(accentBlack);
+        LCD.setCursor(screenWidth - 150, screenHeight - 25);
+        //LCD.print("Long press button to exit");
+        */
+        
+    } while (LCD.nextPage());
+}
+
+/*
 void otaPage(){
       LCD.firstPage();
   do {
@@ -5577,6 +6252,7 @@ void otaPage(){
    // LCD.display();
      } while (LCD.nextPage());
 }
+*/
 
 
 
@@ -5585,8 +6261,110 @@ void otaPage(){
 
 
 char macAddressStr[32]; // Format: XX:XX:XX:XX:XX:XX + null terminator
-
 void Boot(){
+  ESPInfo();
+  LCD.setRotation(2);
+  LCD.setFullWindow();
+
+  int16_t tbx, tby; uint16_t tbw, tbh; 
+  int16_t tbx2, tby2; uint16_t tbw2, tbh2;
+  int16_t tbx3, tby3; uint16_t tbw3, tbh3;
+  int16_t tbx4, tby4; uint16_t tbw4, tbh4;
+  int16_t tbx5, tby5; uint16_t tbw5, tbh5;
+  int16_t tbx6, tby6; uint16_t tbw6, tbh6;
+  int16_t tbx7, tby7; uint16_t tbw7, tbh7;
+
+  snprintf(macAddressStr, sizeof(macAddressStr), 
+           "Address=>[%02X:%02x:%02x:%02x:%02x:%02x]",
+           SystemAddress[0], SystemAddress[1], SystemAddress[2],
+           SystemAddress[3], SystemAddress[4], SystemAddress[5]);
+
+  // --- Measure all text ---
+  LCD.setFont(&FreeSansBold24pt7b);
+  LCD.getTextBounds(Manufacturer, 0, 0, &tbx, &tby, &tbw, &tbh);
+
+  LCD.setFont(&FreeSans12pt7b);
+  LCD.getTextBounds(DeviceID, 0, 0, &tbx2, &tby2, &tbw2, &tbh2);
+
+  LCD.setFont();
+  LCD.getTextBounds(ESP_IDF_VER, 0, 0, &tbx6, &tby6, &tbw6, &tbh6);
+  LCD.getTextBounds(ARD_CORE_VER, 0, 0, &tbx7, &tby7, &tbw7, &tbh7);
+
+  LCD.setFont(&FreeMonoBold9pt7b);
+  LCD.getTextBounds(DeviceClient, 0, 0, &tbx3, &tby3, &tbw3, &tbh3);
+
+  LCD.setFont(&FreeSans9pt7b);
+  LCD.getTextBounds(macAddressStr, 0, 0, &tbx4, &tby4, &tbw4, &tbh4);
+  LCD.getTextBounds(storage_status_log, 0, 0, &tbx5, &tby5, &tbw5, &tbh5);
+
+  // --- Center X positions ---
+  uint16_t x1 = ((SCREEN_W - tbw) / 2) - tbx;
+  uint16_t x2 = ((SCREEN_W - tbw2) / 2) - tbx2;
+  uint16_t x3 = ((SCREEN_W - tbw3) / 2) - tbx3;
+  uint16_t x4 = ((SCREEN_W - tbw4) / 2) - tbx4;
+  uint16_t x5 = ((SCREEN_W - tbw5) / 2) - tbx5;
+  uint16_t x6 = ((SCREEN_W - tbw6) / 2) - tbx6;
+  uint16_t x7 = ((SCREEN_W - tbw7) / 2) - tbx7;
+
+  // --- Vertical Layout (balanced distribution) ---
+  const uint16_t y1 = 55;   // Manufacturer
+  const uint16_t y2 = 110;  // DeviceID
+  const uint16_t y6 = 145;  // ESP_IDF_VER
+  const uint16_t y7 = 165;  // ARD_CORE_VER
+  const uint16_t y3 = 205;  // Client
+  const uint16_t y4 = 235;  // MAC
+  const uint16_t y5 = 265;  // Storage
+
+  delay(10);
+
+  LCD.firstPage();
+  do{
+      LCD.fillScreen(GxEPD_WHITE);
+
+      // Manufacturer
+      LCD.setFont(&FreeSansBold24pt7b);
+      LCD.setTextColor(LCD.epd2.hasColor ? GxEPD_RED : GxEPD_BLACK);
+      LCD.setCursor(x1, y1);
+      LCD.print(Manufacturer);
+
+      // Device ID
+      LCD.setFont(&FreeSans12pt7b);
+      LCD.setTextColor(GxEPD_BLACK);
+      LCD.setCursor(x2, y2);
+      LCD.print(DeviceID);
+
+      // ESP Versions (Centered Now)
+      LCD.setFont();
+      LCD.setCursor(x6, y6);
+      LCD.print(ESP_IDF_VER);
+
+      LCD.setCursor(x7, y7);
+      LCD.print(ARD_CORE_VER);
+
+      // Client Info
+      LCD.setFont(&FreeMonoBold9pt7b);
+      LCD.setCursor(x3, y3);
+      LCD.print(DeviceClient);
+
+      LCD.drawLine(60, y3 + 15, SCREEN_W - 60, y3 + 15, GxEPD_BLACK);
+
+      // MAC Address
+      LCD.setFont(&FreeSans9pt7b);
+      LCD.setTextColor(LCD.epd2.hasColor ? GxEPD_RED : GxEPD_BLACK);
+      LCD.setCursor(x4, y4);
+      LCD.print(macAddressStr);
+
+      // Storage status
+      LCD.setFont();
+      LCD.setTextColor(GxEPD_BLACK);
+      LCD.setCursor(x5, y5);
+      LCD.print(storage_status_log);
+
+  } while (LCD.nextPage());
+}
+/*
+void Boot(){
+  ESPInfo();
   LCD.setRotation(2);
   LCD.setFullWindow();
 
@@ -5596,7 +6374,7 @@ void Boot(){
   int16_t tbx2, tby2; uint16_t tbw2, tbh2;
   int16_t tbx3, tby3; uint16_t tbw3, tbh3;
   int16_t tbx4, tby4; uint16_t tbw4, tbh4;  // For fourth line
-  int16_t tbx5, tby5; uint16_t tbw5, tbh5;  // For fourth line
+  int16_t tbx5, tby5; uint16_t tbw5, tbh5;  // For fifth line
 
    // Format MAC address as string
     snprintf(macAddressStr, sizeof(macAddressStr), 
@@ -5654,8 +6432,8 @@ void Boot(){
         LCD.print(DeviceID);
         
         LCD.setFont();
-        LCD.setcursor(1, 150); LCD.println(ESP_IDF_VER); 
-         LCD.setcursor(1, 150); LCD.print(ARD_CORE_VER);
+        LCD.setCursor(10, 150); LCD.println(ESP_IDF_VER); 
+         LCD.setCursor(10, 170); LCD.print(ARD_CORE_VER);
         
         // Client Info - Black with monospace font for clean look
         LCD.setFont(&FreeMonoBold9pt7b);
@@ -5681,7 +6459,7 @@ void Boot(){
 
     }  while (LCD.nextPage());
 }
-
+*/
 
 
 void homepage() {
@@ -5833,7 +6611,7 @@ void footer(){
 
           //  LCD.setFont(&FreeMono9pt7b);
           //  LCD.setCursor(385, 292); LCD.print(DISP_MODE);
-*/
+ */
    //footer with upward curve
             LCD.fillRect(0, 260, 400, 40, GxEPD_BLACK); // GxEPD_BLACK
             LCD.fillRoundRect(2, 255, 396, 15, 8, GxEPD_WHITE);
@@ -5871,7 +6649,7 @@ void footer(){
           //  LCD.setFont(&FreeMono9pt7b);
           //  LCD.setCursor(385, 292); LCD.print(DISP_MODE);
 
- }
+}
 
 
 
