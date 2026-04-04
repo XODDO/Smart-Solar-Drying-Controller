@@ -1,8 +1,8 @@
-/* WIRELESS DRYER DATALOGGING SYSTEM FOR SUSAN MBACHO, FOR THE 13mX6m DRYER IN MUARIK*/
+/* WIRELESS DRYER DATALOGGING SYSTEM FOR SUSAN MBACHO, FOR THE 13mX7m DRYER IN MUARIK*/
 
 const char *OTA_PASS = "12!34";
-const char *devicename = "Dryer_Controller";
-const char *server_address = "https://webofiot.com/dryer/muarik/server.php";
+const char *devicename = "Dryer_Datalogger";
+const char *server_address = "https://webofiot.com/dryers/muarik/susan_databank/server.php";
 
 const char Manufacturer[15] = "IntelliSys UG";
 const char DeviceID[32] = "Dryer Monitoring System";
@@ -11,25 +11,19 @@ const int SystemAddress[] = {0x68, 0xFE, 0x71, 0x88, 0x1A, 0x6C};
 
 //const char *file_heading = "Report,for,Hybrid,Solar,Dryer,at,Makerere,University,Agricultural,Research,Institute, Kabanyolo,(MUARIK)\n";
 
-const char *file_heading = "Data Report for the 12mx6m Hybrid Solar Dryer at Makerere University Agricultural Research Institute Kabanyolo [MUARIK]\n";
+const char *file_heading = "Data Report for the 13mx7m Hybrid Solar Dryer at Makerere University Agricultural Research Institute Kabanyolo [MUARIK]\n";
 char file_creation_date[64] = "File created:,,,";
 char logging_interval[52] = "Logging Interval (HH:MM:SS):,,,00:01:00,minute(s)\n"; // once every minute
 const char data_points_log[200] = "Data Points:Temperature Relative Humidity Barometric Pressure inside the Dryer (Sensor 1-11) and ambient / Temperature Relative Humidity Barometric Pressure outside the dryer (Sensor 12)";
 const char units_of_data[180] = "Temperature is taken in Celcius Degrees (°C) | Relative Humidity in percent (%) | Barometric Pressure in kilopascals (kPa)";
 const char additional_entries[156] = "Microclimatic conditions measured: (2) wind speed in metres per second (m/s) and solar radiation in Watts per square metres (W/m²)";
 
-size_t bytesWritten = 0;
 bool writeSuccess = false;
   
 static char *csv_file = "/data.csv";
 char new_name[64];
 static char json_log_file[64] = "/data.json"; // primary storage file
 static char csv_log_file[64] = "/data.csv"; // secondary storage file
-
-static const size_t MAX_FILE_SIZE = 20 * 1024 * 1024; // 20 MB per file
-static const size_t MAX_CSV_FILE_SIZE = 20 * 1024 * 1024; 
-static const size_t MAX_TOTAL_SIZE = 100 * 1024 * 1024; // 100 MB total limit
-
 
 char apiKeyValue[12] = "DRYER_006"; //MUARIK TOKEN
 
@@ -48,7 +42,7 @@ char FW_VERSION[50] = "v3.3.5-Dryer_Datalogger";
 
 #include <stdlib.h>
 #include <math.h>
-#include "RTClib.h"
+//#include "RTClib.h"
 
 #include "Adafruit_GFX.h"
 #include <GxEPD2_BW.h>
@@ -67,16 +61,20 @@ char FW_VERSION[50] = "v3.3.5-Dryer_Datalogger";
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 
+#include "Buzzer.h"
+#include "time_keeper_2.h"
+#include "packet_handler.h"
+
 #include "credentials.h"
 #include "WiFi_Manager.h"
 #include "upload.h"
-#include "Buzzer.h"
-#include "timer_keeper.h"
+
 
 #include <ArduinoJson.h>
 StaticJsonDocument<2000> JSON_data;
 //JsonDocument JSON_data; // for dynamic amounts of data
-StaticJsonDocument<4096> JSON_sendable;
+StaticJsonDocument<8000> JSON_sendable;
+//JsonDocument JSON_sendable
 
 #include <Fonts/FreeSans9pt7b.h>
 #include <Fonts/FreeMono9pt7b.h>
@@ -91,10 +89,19 @@ StaticJsonDocument<4096> JSON_sendable;
 
 #include <Preferences.h>
 Preferences prefs;
-
-
 // File system instance 
 //extern fs::FS &fs;  // Could be SD, SPIFFS, or LittleFS
+
+
+PacketHandler packetHandler;
+
+// 2 tasks on core 0: PacketHandler and UART sender
+// PACKET DETAILS parameters
+const int PACKET_TASK_CORE = 0; 
+const int PACKET_TASK_PRIORITY = 3; // Higher than normal tasks
+const int PACKET_STACK_SIZE = 12288; // 12kB
+TaskHandle_t packetTaskHandle = NULL;
+
 
 
 // For debug logging
@@ -126,6 +133,13 @@ uint64_t ota_timeout_time = 0;
 uint64_t ota_start_time = 0;
 
 
+static const size_t MAX_FILE_SIZE = 10 * 1024 * 1024; // 10 MB per file
+static const size_t MAX_CSV_FILE_SIZE = 10 * 1024 * 1024; 
+static const size_t MAX_TOTAL_SIZE = 100 * 1024 * 1024; // 100 MB total limit
+
+volatile size_t bytesWritten = 0;
+
+
 
 const int64_t wifi_checK_interval = (2ULL * 1000ULL);
 
@@ -144,9 +158,6 @@ uint64_t dynamic_interval = power_excellent_delay;
 
 //JASON
 //JsonDocument JSON_data;
-
-//REALTIME CLOCK
-RTC_DS3231 real_time;
 
 static const uint16_t SCREEN_W = 400;
 static const uint16_t SCREEN_H = 300;
@@ -247,12 +258,19 @@ char last_upload_time[32] = "Never!";
 char upload_error_code[100] = "";
 
 
-int keyIndex = 0;            // your network key Index number (needed only for WEP)
-WiFiClient  client;
+
+float aggregate_sensor_humidities();
+float aggregate_sensor_temperatures();
 
 
-// Power management pins
 
+TimerKeeper sawa;
+
+bool clock_is_working = false;
+char clock_status_msg[64] = "Not Started!";
+
+bool esp_now_initialized = false;
+char esp_now_status_msg[64] = "Not Started";
 
 float cabin_temperature = 0.0f;
 bool innerFan_ON = false;
@@ -278,15 +296,11 @@ char  time_stamps[10][12] = {"--:--", "--:--"};
 char last_json_save_time[32] = "JSON Never Saved!";
 char last_csv_save_time[32] = "CSV Never Saved!";
 
-char printable_temp_resp[10] = "_";
-char printable_humi_resp[10] = "_";
-
 
 float average_wind_speed = 0.0f; char wind_speed_str[10] = ".";
 float average_solar_radiation = 0.0f; char solar_rad_str[10] = ".";
 
 
-upload Uploader(wifi_led, server_address);
 
 //example datapack
 //char httpsData[2000] = "{\"PassKey\":\"Rwebi_Weather\", \"Air_Speed\":14.7, \"Air_Temperature\":35.1, \"Air_Humidity\":56.7, \"Sunlight\":1500}";
@@ -302,7 +316,6 @@ char storage_size_char[64];
 
 uint8_t hr = 0, mint = 0, sec = 0, day_ = 0, mth = 0, yr = 0; uint16_t mwaka = 2000; 
 
-char ShortDate[24] = "26-08-2025"; 
 
 
 
@@ -332,6 +345,18 @@ float pressure_readings[12] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
 float sensor_1_temp_readings[30];
 float sensor_1_humi_readings[30];
 float sensor_1_press_readings[30];
+
+float highest_temperature = -100.0f; // initialize to a very low value to ensure any valid reading will be higher
+float lowest_temperature = 200.0f; // initialize to a very high value to ensure
+
+float lowest_humidity = 200.0f; // initialize to a very high value to ensure any valid reading will be lower
+float highest_humidity = -100.0f; // initialize to a very low value to ensure any valid reading will be higher
+
+float temperature_range = 0.0f; // to track the range of temperatures across the sensors, to detect if there is a large discrepancy that might indicate a malfunctioning sensor
+float humidity_range = 0.0f; // same for humidity
+
+float temperature_deviation = 0.0f; // to track how much the current temperature deviates from the average of the sensors, to detect if one sensor is giving a wildly different reading that might indicate a malfunction
+float humidity_deviation = 0.0f; // same for humidity
 
 
 uint64_t last_seen[12] = {0, 0, 0, 0, 0, 0};
@@ -390,12 +415,17 @@ char sensor_1_last_seen[12] = "--:--"; char sensor_2_last_seen[12] = "--:--"; ch
 char sensor_5_last_seen[12] = "--:--"; char sensor_6_last_seen[12] = "--:--"; char sensor_7_last_seen[12] = "--:--"; char sensor_8_last_seen[12] = "--:--";
 char sensor_9_last_seen[12] = "--:--"; char sensor_10_last_seen[12] = "--:--"; char sensor_11_last_seen[12] = "--:--"; char sensor_12_last_seen[12] = "--:--";
 
+
+uint64_t sensor_1_last_seen_ms = 0; uint64_t sensor_2_last_seen_ms = 0; uint64_t sensor_3_last_seen_ms = 0; uint64_t sensor_4_last_seen_ms = 0;
+uint64_t sensor_5_last_seen_ms = 0; uint64_t sensor_6_last_seen_ms = 0; uint64_t sensor_7_last_seen_ms = 0; uint64_t sensor_8_last_seen_ms = 0;
+uint64_t sensor_9_last_seen_ms = 0; uint64_t sensor_10_last_seen_ms = 0; uint64_t sensor_11_last_seen_ms = 0; uint64_t sensor_12_last_seen_ms = 0;
+
+
 bool otaModeActive = false;
                       
 
 //function prototypes
 void read_temperatures();
-void query_rtc();
 void update_display();
 void Boot();
 void homepage();
@@ -415,7 +445,6 @@ bool initialize_sd_card(); //USES HSPI HARDWARE SERIAL
 
 bool save_csv_to_sd_card();
 bool save_json_to_sd_card();
-void initialize_RTC();
 
 void ESPInfo() {
     snprintf(ESP_IDF_VER, sizeof(ESP_IDF_VER), "ESP-IDF Version: %s", esp_get_idf_version());
@@ -444,15 +473,20 @@ void initializeOTA();
 void MonitorBattery();
 void update_power_settings();
 
+//bool shouldRotateScreen(uint64_t screen_time_ms);
 
 Buzzer buzzer(buzzerpin); // pin 12
 WiFi_Manager wifi_obj(wifi_led); // pin 2
+upload Uploader(wifi_led, server_address);
+//upload Uploader;
 
-bool can_send = false; bool data_sent = false; // how to log missed sends
+
+bool data_sent = false; // how to log missed sends
 char upload_log[150] = "Nothing Yet Uploaded!";
-char ShortTime[12] = "12:45"; char ShortTime_am_pm[32] = "12:45pm"; char SystemTime[50] = "13:45:21";
-char SystemDate[32] = "Mon 18th August, 2025";; // char fullDate[50] = "Wednesday 17th November, 2025";
 
+char time_of_weather[32] = "--:--";
+
+void monitor_weather();
 
 void flash(uint64_t time_now, uint8_t heartbeat,
            uint16_t ON_1, uint16_t OFF_1,
@@ -466,16 +500,9 @@ dryerData fetch;
 
 
 
-bool cooling_fan_on = false; uint32_t cooling_fans_duration = 0;
-bool humi_fan_on = false; uint32_t humi_fans_duration = 0;
-
-char humi_fans_start_time_str[12];  char humi_fan_stop_time_str[] = "hh:mm:ss"; char humi_fan_duration[12] = "";
-char cooling_fans_start_time_str[12];     char cooling_fan_stop_time_str[] = "HH:MM:SS"; char cooling_fan_duration[12] = "";
-
 uint8_t side_scroll = 1; // default = 1
 
 
-uint64_t humi_fans_started = 0, cooling_fans_started = 0;
 
 uint64_t now_now_ms = 0, prev = 0, last_read_time_ms = 0, last_refresh_time_ms = 0; // for DUE, millis() times out at [4.9Bn] 4,294,967.295 seconds which is 49.7 days
 uint64_t otaStartTime = 0; 
@@ -486,14 +513,47 @@ volatile uint64_t totalBytes = 0; /// = SD.totalBytes();
 volatile uint64_t usedBytes = 0; //  = SD.usedBytes();
 volatile uint64_t save_counter = 0; // uint8_t save_counter = 0;
 
-volatile bool packet_received = false;
 
-char sendable_to_cloud_db[3000] = ""; 
 char sendable_to_sd_card[4000] = ""; // JSON ~3kiB
 char sendable_to_sd_card_csv[3000] = "";
 char storage_status_log[512] = "NO SD";
 
+void BuzzingTask(void * pvParams);
+
+
+volatile bool packet_received = false;
+void esp_now_packet_handler_task(void * pvParams);
+
 #define PWRKEY 0
+
+/*
+// Define the packet structure that matches your sender ESPs
+typedef struct __attribute__((packed)) {
+    uint8_t sensor_id;           // 1-12
+    float temperature;
+    float humidity;
+    float pressure;
+    uint32_t timestamp;
+    uint16_t battery_voltage;    // Optional: if sensors send battery status
+    uint8_t rssi;                // Optional: signal strength
+} ReceivedPacket;
+
+
+
+//using queuing instead of polling 1,000X every second.
+// Queue for packet processing
+QueueHandle_t packetQueue;
+const int QUEUE_SIZE = 20; // Buffer for up to 20 packets
+
+// Task parameters
+const int PACKET_TASK_PRIORITY = 3; // Higher than normal tasks
+const int PACKET_TASK_CORE = 0; 
+const int PACKET_STACK_SIZE = 16384;
+void extract_readings_from_packet(ReceivedPacket *packet);
+*/
+
+volatile bool display_needs_update = false;
+
 
 void setup() { delay(50); // for OTA to fully hand over
        Serial.begin(115200); Serial.print(devicename); Serial.println(" Booting..."); // while (!Serial) delay(100);   // wait for native usb
@@ -522,9 +582,8 @@ void setup() { delay(50); // for OTA to fully hand over
         sd_initialized = initialize_sd_card(); //USES HSPI HARDWARE SERIAL
 
 
-        if (sd_initialized) {
-            check_storage_files();
-        }
+        if (sd_initialized)     check_storage_files();
+        
         delay(1000);
 
             // Initialize Preferences and load counter
@@ -565,22 +624,31 @@ void setup() { delay(50); // for OTA to fully hand over
 
 
 
-      pinMode(batteryPin, INPUT);
+    pinMode(batteryPin, INPUT);
+    pinMode(wind_speed_pin, INPUT);
+    pinMode(solar_rad_pin, INPUT);
 
-    pinMode(innerFAN, OUTPUT); digitalWrite(innerFAN, LOW); 
+    // set to 12bit resolution
+    // set to 3.3V AREF
+
+
+      pinMode(innerFAN, OUTPUT); digitalWrite(innerFAN, LOW); 
     
     
-    Serial.print("Starting Realtime Clock...");
-    initialize_RTC(); delay(100);
-    query_rtc(); delay(100);
+      clock_is_working = sawa.initialize_RTC();
+      snprintf(clock_status_msg, sizeof(clock_status_msg), "RTC Clock: %s", clock_is_working ? "Initialized Successfully" : "Initialization Failed!");
+
+    /*
+        Serial.print("Starting Realtime Clock...");
+        initialize_RTC(); delay(100);
+        query_rtc(); delay(100);
+    */
 
 
 
-
-        // WiFi.begin();
-  
-   
-  WiFi.mode(WIFI_STA);    
+    /*
+    // WiFi.begin();
+       WiFi.mode(WIFI_STA);    
       
   // Initilize ESP-NOW
       if(esp_now_init() != ESP_OK) {
@@ -590,16 +658,53 @@ void setup() { delay(50); // for OTA to fully hand over
 
       else {
         Serial.println("ESPNOW successfully initialized");
-        
         // Register callback function
           esp_err_t result = esp_now_register_recv_cb(esp_now_recv_cb_t(OnSensorData_received)); // Serial.print("CALLBACK: ");Serial.println(result);
           if(result == ESP_OK) Serial.println("Call Back of Call Back successfully set!"); 
-      }
+      }        delay(1000);
 
-        delay(1000);
+        // Create queue before starting task
+        packetQueue = xQueueCreate(QUEUE_SIZE, sizeof(ReceivedPacket));
+    
 
-  
+                UBaseType_t highWaterMark = uxTaskGetStackHighWaterMark(NULL);
+
+
+    // Check free memory before task creation
+    Serial.printf("Heap Before Task: Free=%u bytes, Min=%u bytes\n",
+                 esp_get_free_heap_size(),
+                 esp_get_minimum_free_heap_size());
+    
+    // Create task on Core 0 with priority 7 (highest, below interrupt handler)
+    BaseType_t result = xTaskCreatePinnedToCore(
+        esp_now_packet_handler_task,      // Function
+        "PacketHandler",                   // Name (for debugging)
+        PACKET_STACK_SIZE,                             // Stack size (16KB)
+        NULL,                              // Parameters
+        PACKET_TASK_PRIORITY,                                 // Priority (0-24, higher = more priority)
+        NULL,                              // Task handle
+        PACKET_TASK_CORE                   // Core 0 (leaves Core 1 for loop())
+    );
+
+
+    if (result != pdPASS) {
+        Serial.println("[ERROR] Failed to create packet handler task!");
+        Serial.printf("Reason: %d\n", result);
+    } else {
+        Serial.println("[OK] Packet handler task created successfully");
+    }
+    
+    Serial.printf("Heap After Task: Free=%u bytes\n", esp_get_free_heap_size());
+    
+    */
+
+
+        esp_now_initialized = packetHandler.begin(); // pinned to core 0: has espnow, callbacks, and queue creation inside
+    if (!esp_now_initialized) snprintf(esp_now_status_msg, sizeof(esp_now_status_msg), "Failed to initialize packet handler!");
         
+    else     snprintf(esp_now_status_msg, sizeof(esp_now_status_msg), "ESP-NOW Initialization Successful!");
+    // HANDLES onDataReceived
+    
 
         digitalWrite(blinker, HIGH); delay(1000);
         digitalWrite(blinker, LOW);
@@ -630,11 +735,13 @@ void setup() { delay(50); // for OTA to fully hand over
 
                 
     }
+    /*
         uint16_t poll = 0;
         while(poll<2000){ // keep a bit here for 2 seconds
             delay(1); poll++;
-            if(packet_received) { /*buzzer.beep(1,50,0);*/  extract_readings(); packet_received = false; }
+            if(packet_received) { extract_readings(); packet_received = false; }
         }
+        */
 
         monitor_box_conditions();
 
@@ -653,7 +760,7 @@ void setup() { delay(50); // for OTA to fully hand over
         pinMode(ota_button, INPUT_PULLUP);
         pinMode(wifi_toggler, INPUT_PULLUP);
 
-        powerOnSIM();
+      //  powerOnSIM();
         
          buzzer.beep(2,50,50);  // END OF BOOT
          Serial.println("Done Booting!");
@@ -662,17 +769,6 @@ void setup() { delay(50); // for OTA to fully hand over
 }
 
 
-void powerOnSIM() {
-  pinMode(PWRKEY, OUTPUT);
-
-  digitalWrite(PWRKEY, HIGH);
-  delay(100);
-
-  digitalWrite(PWRKEY, LOW);   // Pull LOW
-  delay(1500);                 // Hold 1–2 seconds
-  digitalWrite(PWRKEY, HIGH);  // Release
-  delay(5000);                 // Wait for boot
-}
 
 void BuzzingTask(void * pvParams) { 
   uint8_t checkin_frequency = 10; 
@@ -682,6 +778,42 @@ void BuzzingTask(void * pvParams) {
     vTaskDelay(xDelay);
   }
 }
+
+/*
+void esp_now_packet_handler_task(void * pvParams) { 
+  uint8_t checkin_frequency = 1; // check each millisecond to ensure no packet is lost
+ TickType_t prev_check_time = xTaskGetTickCount();
+
+  const TickType_t xDelay = pdMS_TO_TICKS(checkin_frequency);
+  while (true) {
+      if(packet_received) {  extract_readings(); packet_received = false; buzzer.beep(1,50,0);  } //this runs async but what happens when all crossfire
+      vTaskDelay(xDelay); // or use vTashdelayUntil
+  }
+} 
+
+*/
+
+/*
+void esp_now_packet_handler_task(void *pvParams) {
+    ReceivedPacket packet;
+
+    while (true) {
+        if (xQueueReceive(packetQueue, &packet, portMAX_DELAY) == pdTRUE) {
+
+            extract_readings_from_packet(&packet);
+
+            buzzer.beep(1, 50, 0);
+
+        }
+    }
+}
+*/
+
+
+uint64_t    packet_loss_counter = 1;
+uint64_t total_packets_received = 0;
+
+
 size_t jsonSize = 0; // base file ...  before rotating
 size_t csvSize  = 0; // base file ...  before rotating
 
@@ -700,6 +832,18 @@ void enable_display(){
     digitalWrite(SD_Chip_Select, HIGH); delay(10);
     digitalWrite(SCREEN_CS, LOW);        
 
+}
+
+void powerOnSIM() {
+  pinMode(PWRKEY, OUTPUT);
+
+  digitalWrite(PWRKEY, HIGH);
+  delay(100);
+
+  digitalWrite(PWRKEY, LOW);   // Pull LOW
+  delay(1500);                 // Hold 1–2 seconds
+  digitalWrite(PWRKEY, HIGH);  // Release
+  delay(5000);                 // Wait for boot
 }
 
     
@@ -875,12 +1019,12 @@ bool check_storage_files() {
 
 File create_another_file() {
     // Make sure ShortDate and ShortTime are defined and valid
-    if (strlen(ShortDate) == 0 || strlen(ShortTime) == 0) {
+    if (strlen(sawa.ShortDate) == 0 || strlen(sawa.ShortTime) == 0) {
         // Use timestamp as fallback
         snprintf(new_name, sizeof(new_name), "/data_%lu.json", millis());
     } else {
         snprintf(new_name, sizeof(new_name), "/data_%s_%s.json", 
-                 ShortDate, ShortTime);
+                 sawa.ShortDate, sawa.ShortTime);
         
         // Replace invalid characters for FAT compatibility
         for (char *p = new_name; *p; p++) {
@@ -1030,7 +1174,7 @@ bool save_json_to_sd_card() {
     // =========================================================
     json_currentSize += bytesWritten;
 
-    snprintf(last_json_save_time, sizeof(last_json_save_time), "%s", SystemTime);
+    snprintf(last_json_save_time, sizeof(last_json_save_time), "%s", sawa.SystemTime);
 
     save_counter++;
 
@@ -1425,7 +1569,7 @@ bool save_csv_to_sd_card() {
     if (csv_currentSize <= 90) {
 
         snprintf(file_creation_date, sizeof(file_creation_date),
-                 "Log File Created:,,,%s,%s", ShortDate, ShortTime_am_pm);
+                 "Log File Created:,,,%s,%s", sawa.ShortDate, sawa.ShortTime);
 
         file.println(file_heading);
        // file.println("#########################################################");
@@ -1484,7 +1628,7 @@ bool save_csv_to_sd_card() {
         snprintf(last_csv_save_time,
                  sizeof(last_csv_save_time),
                  "%s",
-                 SystemTime);
+                 sawa.SystemTime);
     }
 
     // =========================================================
@@ -1663,7 +1807,7 @@ File create_another_csv_file() {
     // =========================================================
     // 1️⃣ Generate Filename
     // =========================================================
-    if (strlen(ShortDate) == 0 || strlen(ShortTime) == 0) {
+    if (strlen(sawa.ShortDate) == 0 || strlen(sawa.ShortTime) == 0) {
 
         // Fallback to uptime timestamp
         snprintf(new_name, sizeof(new_name),
@@ -1674,7 +1818,7 @@ File create_another_csv_file() {
 
         snprintf(new_name, sizeof(new_name),
                  "/data_%s_%s.csv",
-                 ShortDate, ShortTime);
+                 sawa.ShortDate, sawa.ShortTime);
 
         // FAT filesystem invalid character sanitization
         for (char *p = new_name; *p; p++) {
@@ -1736,7 +1880,7 @@ void write_csv_header(File &file) {
 
     snprintf(file_creation_date, sizeof(file_creation_date),
              "Log File Created:,,,%s,%s",
-             ShortDate, ShortTime_am_pm);
+             sawa.ShortDate, sawa.ShortTime);
 
     file.println(file_heading);
     file.println("#########################################################");
@@ -2358,6 +2502,11 @@ bool currently_uploading = false;
 char activity_log[1024];
 bool is_night_time = false;
 bool is_at_peak_sunshine = false;
+bool screen_is_changing = false;
+
+bool ten_min = false; // alarm for 10 minute event (UPLOADS)
+bool five_min = false;
+bool hour_marked = false;
 
 void loop() {
     now_now_ms = esp_timer_get_time() / 1000ULL; // us to ms
@@ -2371,40 +2520,49 @@ void loop() {
    }         
  
   else  {  // !otaModeActive 
-            if(currently_uploading){ handle_upload(); return; } // should wifi be time based or trigger based?
+          //  if(currently_uploading){ handle_upload(); /* return; */ }
+        //  handle_upload(); // has early exits
         
             flash(now_now_ms, blinker, 50, 75, 50, 1500); // normal
 
-          //  wifi_triggered = read_button(wifi_toggler, now_now_ms);
-
-            otaTriggered = read_button(ota_button, now_now_ms);
-
-            if (otaTriggered && !otaModeActive) toggle_ota();
-         
-       //  if(wifi_triggered && !currently_uploading) currently_uploading = true;
- 
-           
-    if(packet_received) { buzzer.beep(1,50,0);  extract_readings(); packet_received = false; }
+    //this is handled by a queuing task on core 0;
+            
+   // if(packet_received) { buzzer.beep(1,50,0);  extract_readings(); packet_received = false; } // this is called every loop cycle
+    
     // Sensor readings
     if ((now_now_ms - last_read_time_ms) >= data_update_interval) { // 60 seconds if power is good for 24 hours:: 1,440 saved packets/day
         last_read_time_ms = now_now_ms;  // Update FIRST to prevent race conditions
         
           //most recent parameters
           
-          query_rtc();      
-          is_night_time = (hr >= 20 || hr < 7);  // 8pm to 7am... time for idling
+          if(!sawa.isClockWorking()) return; 
+          else sawa.update();    
+          ten_min          = sawa.is10MinuteMarker();
+          five_min         = sawa.is5MinuteMarker();
+          hour_marked      = sawa.isHourlyMarker();
+
+          char time_snap[20];
+          strncpy(time_snap, sawa.SystemTime, sizeof(time_snap));
+
+            // dynamically establish refresh rate
+          hr  = sawa.getCurrentHour();
+          is_night_time = (hr >= 20 || hr < 7);  // if 24 hour system: 8pm to 7am... time for idling
           is_at_peak_sunshine = (hr > 9 && hr < 18); // 9am to 3pm...[and if solar radiation>1000W/m2]...time for peak peformance
         
           if(is_night_time) screen_refresh_interval = (60ULL*60ULL*1000ULL); //  refresh once every hour...maybe between light sleeps
           else {
-            if(is_at_peak_sunshine) screen_refresh_interval = (60ULL*1000ULL); // refresh once every minute
-            else screen_refresh_interval = (10ULL*60ULL*1000ULL); // refresh once every 10 minutes
+                if(is_at_peak_sunshine) screen_refresh_interval = (60ULL*1000ULL); // refresh once every minute
+                else screen_refresh_interval = (10ULL*60ULL*1000ULL); // refresh once every 10 minutes
           }
+          
+
+          // screen_refresh_interval = (1ULL*60ULL*1000ULL);
 
           MonitorBattery(); // battery voltage
           
-          monitor_box_conditions(); // internal temp and fan state
+          monitor_box_conditions(); // internal temp and fan state only if rtc is working
           monitor_dryer_readings(); 
+          monitor_weather();
           
           //check_meta_data(); // column headers for CSV
            json_bound_successfully = bind_dynamic_data_into_json();
@@ -2413,24 +2571,38 @@ void loop() {
           json_data_logged = save_json_to_sd_card(); delay(500);
           csv_data_logged  = save_csv_to_sd_card(); delay(500);
 
-        if(json_data_logged && csv_data_logged)  buzzer.beep(2, 50, 0);
+        if(json_data_logged && csv_data_logged)  buzzer.beep(2, 100, 0);
 
           snprintf(activity_log, sizeof(activity_log), 
-              "\nLoopCount:%lu\nUptime: %llu, Reading complete! Power mode: %d, Voltage: %.1fV\njson_data_logged: %s",     
-              loop_count, last_read_time_ms/1000, current_power, voltage, json_data_logged?"YES":"NO"
+                    "\nLoopCount:%lu\nUptime: %llu, Reading complete! Power mode: %d, Voltage: %.1fV\njson_data_logged: %s",     
+                    loop_count, last_read_time_ms/1000, current_power, voltage, json_data_logged?"YES":"NO"
               );
 
           LOG(activity_log);
-      }
+       }
     
-
     }
      
+            wifi_triggered = read_button(wifi_toggler, now_now_ms);
+
+            otaTriggered = read_button(ota_button, now_now_ms);
+
+            if (otaTriggered && !otaModeActive) toggle_ota();
+
+            if(wifi_triggered && !screen_is_changing) { //shouldRotateScreen(now_now_ms);
+                    if(currentScreen > 5) currentScreen = 1;
+                  else currentScreen++;
+        
+             special_call = true;} // go to next screen
+         
+       //  if(wifi_triggered && !currently_uploading) currently_uploading = true;
+ 
          
         update_display(); // this returns 99.9% of the time and only updates screen ever 5, or 30mins
 
         loop_count++;
-         delay(10); // make the loop less tight when not polling ota
+        // delay(10); // make the loop less tight when not polling ota
+         vTaskDelay(10 / portTICK_PERIOD_MS);
 
          
 
@@ -2448,53 +2620,35 @@ void loop() {
 /// loop()
 
 
-void handle_upload(){
+void monitor_weather(){
+    //measure wind speed
+    uint16_t direct_reading = analogRead(wind_speed_pin);
 
-   flash(now_now_ms, blinker, 500, 500, 0, 0); // TELEMETRY MODE
-  /*
-   currentScreen = 9; special_call = true;
-   update_display(); // set the upload screen
-  */
-    if((now_now_ms - last_upload_time_ms) > upload_frequency_ms){ // either every 10mins or at the tenth minute
-      if(can_send){ // when using WiFi to upload
-      
-                esp_err_t result = esp_now_deinit();
-            if (result != ESP_OK) {
-                Serial.printf("ESP-NOW deinit failed: %d\n", result);
-                 switch_radio_to_espnow();
-                return;
-            }
-     
-     switch_radio_to_wifi(); 
-     wifi_connected = wifi_obj.ensure_wifi();
-     if(!wifi_connected) {Serial.println("WiFi connection failure, switching back");
-        switch_radio_to_espnow();
-        return;
-     }
+    average_wind_speed = (float)direct_reading; 
+    average_wind_speed = average_wind_speed/4096.0;
+    average_wind_speed = average_wind_speed * 60.0;
+    snprintf(wind_speed_str, sizeof(wind_speed_str), "%.2f", average_wind_speed);
 
-       delay(1000);
-         if (wifi_connected) {
-                Serial.println("Initializing uploader...");
-                Uploader.begin(); // leave it because it uses WiFi
-                Serial.println("Uploading data...");
-                Uploader.upload_to_web_of_iot(sendable_to_cloud_db);
-                //UploadStatus st Uploader.upload_to_web_of_iot(sendable_to_cloud_db);
-              //  Serial.printf("[Upload Task] upload status=%d; report=%s\n", (int)st, Uploader.get_upload_report());
-                snprintf(last_upload_time, sizeof(last_upload_time), "%s", SystemTime);
-                snprintf(upload_error_code, sizeof(upload_error_code), 
-                            "Uploaded at %s on %s", ShortTime_am_pm, SystemDate);
-                LOG(upload_error_code);
+     Serial.print("Wind Speed Direct Read: "); Serial.println(direct_reading);
+     Serial.print("\tWind Speed: "); Serial.println(average_wind_speed);
 
-                data_sent = true;
-                currently_uploading = false;
-                last_upload_time_ms = now_now_ms;
-            }
-        delay(2000);
-        switch_radio_to_espnow();
+    // measure solar radiation
+    uint16_t direct_solar_reading = analogRead(solar_rad_pin);
+    average_solar_radiation = (float)direct_solar_reading;
+    average_solar_radiation = average_solar_radiation/4096.0;
+    average_solar_radiation = average_solar_radiation * 1800.0;
+    snprintf(solar_rad_str, sizeof(solar_rad_str), "%.1f", average_solar_radiation);
 
-      }
-    }
+     Serial.print("Solar Rad, Direct Read: "); Serial.println(direct_solar_reading);
+      Serial.print("\Solar Radition: "); Serial.println(average_solar_radiation);
+
+    snprintf(time_of_weather, sizeof(time_of_weather), "%s", sawa.ShortTime);
+
 }
+
+
+
+
 
 void toggle_ota(){
 
@@ -2564,7 +2718,7 @@ void handle_ota(uint64_t running_time) {
     
     if (otaFinished) {
         strcpy(ota_log, "Update complete!");
-        snprintf(LastOTAUpdate, sizeof(LastOTAUpdate), "On Date: %s, at %s", SystemDate, ShortTime);
+        snprintf(LastOTAUpdate, sizeof(LastOTAUpdate), "On Date: %s, at %s", sawa.SystemDate, sawa.ShortTime);
         buzzer.beep(2, 500, 200);
         otaFinished = false;
         current_ota_state = OTA_STATE_SUCCESS;
@@ -2931,12 +3085,6 @@ bool read_button(uint8_t pin, uint64_t time_now){
 bool switch_radio_to_espnow() {
   Serial.println("Switching radio to ESP-NOW...");
 
-  /*
-      // Proper cleanup
-    if (esp_now_deinit() != ESP_OK) {
-        Serial.println("Warning: ESP-NOW deinit had issues");
-    }
-  */  
     WiFi.disconnect(true);
     delay(100);
     WiFi.mode(WIFI_OFF);
@@ -2944,549 +3092,22 @@ bool switch_radio_to_espnow() {
     
     WiFi.mode(WIFI_STA); Serial.printf("WiFi channel: %d\n", WiFi.channel());
 
-  for (uint8_t attempt = 1; attempt <= ESPNOW_MAX_RETRIES; attempt++) {
-      if (esp_now_init() == ESP_OK) { 
-            Serial.printf("✓ ESP-NOW initialized successfully (attempt %d/%d)\n", attempt, ESPNOW_MAX_RETRIES);
-      
-   // Register callback function
-          esp_err_t result = esp_now_register_recv_cb(esp_now_recv_cb_t(OnSensorData_received)); // Serial.print("CALLBACK: ");Serial.println(result);
-          if(result == ESP_OK) Serial.println("Call Back of Call Back successfully set!"); 
-           
-        } else {
-           // print that Wireless Radio is faulty
-            //return;
-            delay(100 * attempt); // Exponential backoff
-        }
+     esp_now_initialized = packetHandler.begin(); // pinned to core 0: has espnow, callbacks, and queue creation inside
+    if (!esp_now_initialized) snprintf(esp_now_status_msg, sizeof(esp_now_status_msg), "Failed to initialize packet handler!");
         
-    }
+    else     snprintf(esp_now_status_msg, sizeof(esp_now_status_msg), "ESP-NOW Initialization Successful!");
+    // HANDLES onDataReceived
     
-    
-    Serial.println("!!! ESP-NOW initialization failed after retries");
-    return false;
-}
-
-
-
-/*
-✔ Only copy
-✔ Set a flag
-✔ Exit ASAP
-This is exactly what ESP-NOW callbacks should do.
-*/
-
-void OnSensorData_received(const uint8_t * mac, const uint8_t *incomingData, int len){
-     //   memcpy(&fetch, incomingData, min(len, sizeof(dryerData))); // no matching function for call to 'min(int&, unsigned int)'
-        // The compiler will complain because len is an int, while sizeof(dryerData) is an unsigned int (size_t).
- // The template deduction for std::min() fails when the two arguments are of different signedness.
-
-        //Since memcpy length must be size_t, it’s best to cast explicitly: ... no template fights.
-        size_t weight_of_packet = (len < (int)sizeof(dryerData)) ? (size_t)len : sizeof(dryerData); // either sizeof of len
-        memcpy(&fetch, incomingData, weight_of_packet);
-
-        uint32_t size_of_packet = sizeof(dataPack);
-
-  //   memcpy(&fetch, incomingData, sizeof(dryerData)); //If len < sizeof(dryerData), memcpy will copy beyond valid incomingData.
- //    strcpy(dataPack, fetch.received_data_bundle); // If the buffer is not null-terminated, strcpy() will read past the end.
-
-        strncpy(dataPack, fetch.received_data_bundle, size_of_packet-1); // Only copy and queue the packet in the callback:
-        dataPack[size_of_packet-1] = '\0';
-     // Serial.print("Size of received BUFF: "); Serial.println(size_of_packet);
-
-      //Serial.print("Received => "); Serial.println(dataPack);  delay(50);
-      packet_received = true;
-
-      //extract_readings();
-      //beep(1, 0); //flash();
-    // ESP-NOW callback should be FAST (this is critical)
-    //exit ASAP
-     
-}
-
-void extract_readings(){
-      if(!packet_received) { LOG("No packet received!"); return; }  // this never runs, but just in case 
-      digitalWrite(sensor_indicator, HIGH); delay(50); digitalWrite(sensor_indicator, LOW); 
-       DeserializationError err = deserializeJson(JSON_data, dataPack);
-
-        if (err) {
-            Serial.print("JSON Deserialization Error: ");
-            Serial.println(err.c_str());
-            return;
-        }
-       // LOG(dataPack); // SEE WHAT HAS BEEN RECEIVED!
-
-          
-    const char * sensor_ID = JSON_data["S_ID"] | "unknown";
-
-     //fastest approach... as switch is Extremely fast for consecutive integers
-
   /*
-  📊 Direct Performance Rankings (Fastest to Slowest)
-      switch with consecutive integers ⚡ Fastest
-
-      else if chain with integer comparisons 🚀 Fast
-
-      if statements with integer comparisons 🏃 Medium
-
-      else if chain with string comparisons 🐌 Slow
-
-    if statements with string comparisons 🐌🐌 Slowest
-  */
-
-
- int sensor_index_num = extract_sensor_number(sensor_ID); 
-  
-          switch (sensor_index_num) {
-              case 1: {
-                sensor_1_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
-                sensor_1_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
-                sensor_1_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
-                sensor_1_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
-                sensor_1_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
-                sensor_1_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
-                sensor_1_packet_size = JSON_data["PKT"] | 0;
-            
-                strncpy(sensor_1_transmissions,  JSON_data["Sends"], sizeof(sensor_1_transmissions)); // up to 11 bytes: e.g., "1234567890"
-                strncpy(sensor_1_CPU_freq,  JSON_data["CPU"], sizeof(sensor_1_CPU_freq)); // 11 bytes: "80MHz CPU"
-                
-                temperature_readings[0] = sensor_1_temp; humidity_readings[0] = sensor_1_humidity;  // arrays or indexes
-                strncpy(sensor_1_last_seen, SystemTime, sizeof(sensor_1_last_seen));      sensor_1_last_seen[sizeof(sensor_1_last_seen) - 1] = '\0'; 
-   
-              }
-                 break;
-              case 2:  {
-                    sensor_2_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
-                    sensor_2_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
-                    sensor_2_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
-                    sensor_2_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
-                    sensor_2_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
-                    sensor_2_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
-                    sensor_2_packet_size = JSON_data["PKT"] | 0;
-                
-                    strncpy(sensor_2_transmissions,  JSON_data["Sends"], sizeof(sensor_2_transmissions)); // up to 11 bytes: e.g., "1234567890"
-                    strncpy(sensor_2_CPU_freq,  JSON_data["CPU"], sizeof(sensor_2_CPU_freq)); // 11 bytes: "80MHz CPU"
-                    
-                    temperature_readings[0] = sensor_2_temp; humidity_readings[0] = sensor_2_humidity;  // arrays or indexes
-                    strncpy(sensor_2_last_seen, SystemTime, sizeof(sensor_2_last_seen));      sensor_2_last_seen[sizeof(sensor_2_last_seen) - 1] = '\0'; 
-   
-              }
-              break;
-
-                  case 3: {
-                      sensor_3_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
-                      sensor_3_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
-                      sensor_3_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
-                      sensor_3_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
-                      sensor_3_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
-                      sensor_3_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
-                      sensor_3_packet_size = JSON_data["PKT"] | 0;
-                  
-                      strncpy(sensor_3_transmissions, JSON_data["Sends"], sizeof(sensor_3_transmissions)); // up to 11 bytes: e.g., "1234567890"
-                      strncpy(sensor_3_CPU_freq, JSON_data["CPU"], sizeof(sensor_3_CPU_freq)); // 11 bytes: "80MHz CPU"
-                      
-                      temperature_readings[2] = sensor_3_temp; humidity_readings[2] = sensor_3_humidity;  // arrays or indexes
-                      strncpy(sensor_3_last_seen, SystemTime, sizeof(sensor_3_last_seen)); sensor_3_last_seen[sizeof(sensor_3_last_seen) - 1] = '\0'; 
-                  }
-                  break;
-                  
-                  case 4: {
-                      sensor_4_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
-                      sensor_4_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
-                      sensor_4_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
-                      sensor_4_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
-                      sensor_4_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
-                      sensor_4_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
-                      sensor_4_packet_size = JSON_data["PKT"] | 0;
-                  
-                      strncpy(sensor_4_transmissions, JSON_data["Sends"], sizeof(sensor_4_transmissions)); // up to 11 bytes: e.g., "1234567890"
-                      strncpy(sensor_4_CPU_freq, JSON_data["CPU"], sizeof(sensor_4_CPU_freq)); // 11 bytes: "80MHz CPU"
-                      
-                      temperature_readings[3] = sensor_4_temp; humidity_readings[3] = sensor_4_humidity;  // arrays or indexes
-                      strncpy(sensor_4_last_seen, SystemTime, sizeof(sensor_4_last_seen)); sensor_4_last_seen[sizeof(sensor_4_last_seen) - 1] = '\0'; 
-                  }
-                  break;
-                  
-                  case 5: {
-                      sensor_5_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
-                      sensor_5_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
-                      sensor_5_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
-                      sensor_5_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
-                      sensor_5_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
-                      sensor_5_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
-                      sensor_5_packet_size = JSON_data["PKT"] | 0;
-                  
-                      strncpy(sensor_5_transmissions, JSON_data["Sends"], sizeof(sensor_5_transmissions)); // up to 11 bytes: e.g., "1234567890"
-                      strncpy(sensor_5_CPU_freq, JSON_data["CPU"], sizeof(sensor_5_CPU_freq)); // 11 bytes: "80MHz CPU"
-                      
-                      temperature_readings[4] = sensor_5_temp; humidity_readings[4] = sensor_5_humidity;  // arrays or indexes
-                      strncpy(sensor_5_last_seen, SystemTime, sizeof(sensor_5_last_seen)); sensor_5_last_seen[sizeof(sensor_5_last_seen) - 1] = '\0'; 
-                  }
-                  break;
-                  
-                  case 6: {
-                      sensor_6_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
-                      sensor_6_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
-                      sensor_6_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
-                      sensor_6_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
-                      sensor_6_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
-                      sensor_6_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
-                      sensor_6_packet_size = JSON_data["PKT"] | 0;
-                  
-                      strncpy(sensor_6_transmissions, JSON_data["Sends"], sizeof(sensor_6_transmissions)); // up to 11 bytes: e.g., "1234567890"
-                      strncpy(sensor_6_CPU_freq, JSON_data["CPU"], sizeof(sensor_6_CPU_freq)); // 11 bytes: "80MHz CPU"
-                      
-                      temperature_readings[5] = sensor_6_temp; humidity_readings[5] = sensor_6_humidity;  // arrays or indexes
-                      strncpy(sensor_6_last_seen, SystemTime, sizeof(sensor_6_last_seen)); sensor_6_last_seen[sizeof(sensor_6_last_seen) - 1] = '\0'; 
-                  }
-                  break;
-                  
-                  case 7: {
-                      sensor_7_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
-                      sensor_7_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
-                      sensor_7_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
-                      sensor_7_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
-                      sensor_7_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
-                      sensor_7_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
-                      sensor_7_packet_size = JSON_data["PKT"] | 0;
-                  
-                      strncpy(sensor_7_transmissions, JSON_data["Sends"], sizeof(sensor_7_transmissions)); // up to 11 bytes: e.g., "1234567890"
-                      strncpy(sensor_7_CPU_freq, JSON_data["CPU"], sizeof(sensor_7_CPU_freq)); // 11 bytes: "80MHz CPU"
-                      
-                      temperature_readings[6] = sensor_7_temp; humidity_readings[6] = sensor_7_humidity;  // arrays or indexes
-                      strncpy(sensor_7_last_seen, SystemTime, sizeof(sensor_7_last_seen)); sensor_7_last_seen[sizeof(sensor_7_last_seen) - 1] = '\0'; 
-                  }
-                  break;
-                  
-                  case 8: {
-                      sensor_8_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
-                      sensor_8_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
-                      sensor_8_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
-                      sensor_8_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
-                      sensor_8_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
-                      sensor_8_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
-                      sensor_8_packet_size = JSON_data["PKT"] | 0;
-                  
-                      strncpy(sensor_8_transmissions, JSON_data["Sends"], sizeof(sensor_8_transmissions)); // up to 11 bytes: e.g., "1234567890"
-                      strncpy(sensor_8_CPU_freq, JSON_data["CPU"], sizeof(sensor_8_CPU_freq)); // 11 bytes: "80MHz CPU"
-                      
-                      temperature_readings[7] = sensor_8_temp; humidity_readings[7] = sensor_8_humidity;  // arrays or indexes
-                      strncpy(sensor_8_last_seen, SystemTime, sizeof(sensor_8_last_seen)); sensor_8_last_seen[sizeof(sensor_8_last_seen) - 1] = '\0'; 
-                  }
-                  break;
-                  
-                  case 9: {
-                      sensor_9_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
-                      sensor_9_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
-                      sensor_9_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
-                      sensor_9_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
-                      sensor_9_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
-                      sensor_9_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
-                      sensor_9_packet_size = JSON_data["PKT"] | 0;
-                  
-                      strncpy(sensor_9_transmissions, JSON_data["Sends"], sizeof(sensor_9_transmissions)); // up to 11 bytes: e.g., "1234567890"
-                      strncpy(sensor_9_CPU_freq, JSON_data["CPU"], sizeof(sensor_9_CPU_freq)); // 11 bytes: "80MHz CPU"
-                      
-                      temperature_readings[8] = sensor_9_temp; humidity_readings[8] = sensor_9_humidity;  // arrays or indexes
-                      strncpy(sensor_9_last_seen, SystemTime, sizeof(sensor_9_last_seen)); sensor_9_last_seen[sizeof(sensor_9_last_seen) - 1] = '\0'; 
-                  }
-                  break;
-                  
-                  case 10: {
-                      sensor_10_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
-                      sensor_10_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
-                      sensor_10_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
-                      sensor_10_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
-                      sensor_10_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
-                      sensor_10_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
-                      sensor_10_packet_size = JSON_data["PKT"] | 0;
-                  
-                      strncpy(sensor_10_transmissions, JSON_data["Sends"], sizeof(sensor_10_transmissions)); // up to 11 bytes: e.g., "1234567890"
-                      strncpy(sensor_10_CPU_freq, JSON_data["CPU"], sizeof(sensor_10_CPU_freq)); // 11 bytes: "80MHz CPU"
-                      
-                      temperature_readings[9] = sensor_10_temp; humidity_readings[9] = sensor_10_humidity;  // arrays or indexes
-                      strncpy(sensor_10_last_seen, SystemTime, sizeof(sensor_10_last_seen)); sensor_10_last_seen[sizeof(sensor_10_last_seen) - 1] = '\0'; 
-                  }
-                  break;
-                  
-                  case 11: {
-                      sensor_11_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
-                      sensor_11_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
-                      sensor_11_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
-                      sensor_11_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
-                      sensor_11_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
-                      sensor_11_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
-                      sensor_11_packet_size = JSON_data["PKT"] | 0;
-                  
-                      strncpy(sensor_11_transmissions, JSON_data["Sends"], sizeof(sensor_11_transmissions)); // up to 11 bytes: e.g., "1234567890"
-                      strncpy(sensor_11_CPU_freq, JSON_data["CPU"], sizeof(sensor_11_CPU_freq)); // 11 bytes: "80MHz CPU"
-                      
-                      temperature_readings[10] = sensor_11_temp; humidity_readings[10] = sensor_11_humidity;  // arrays or indexes
-                      strncpy(sensor_11_last_seen, SystemTime, sizeof(sensor_11_last_seen)); sensor_11_last_seen[sizeof(sensor_11_last_seen) - 1] = '\0'; 
-                  }
-                  break;
-                  
-                  case 12: {
-                      sensor_12_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
-                      sensor_12_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
-                      sensor_12_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
-                      sensor_12_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
-                      sensor_12_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
-                      sensor_12_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
-                      sensor_12_packet_size = JSON_data["PKT"] | 0;
-                  
-                      strncpy(sensor_12_transmissions, JSON_data["Sends"], sizeof(sensor_12_transmissions)); // up to 11 bytes: e.g., "1234567890"
-                      strncpy(sensor_12_CPU_freq, JSON_data["CPU"], sizeof(sensor_12_CPU_freq)); // 11 bytes: "80MHz CPU"
-                      
-                      temperature_readings[11] = sensor_12_temp; humidity_readings[11] = sensor_12_humidity;  // arrays or indexes
-                      strncpy(sensor_12_last_seen, SystemTime, sizeof(sensor_12_last_seen)); sensor_12_last_seen[sizeof(sensor_12_last_seen) - 1] = '\0'; 
-                  }
-                  break;
-                  
-                  default: {
-                      Serial.printf("Unknown sensor: %s\n", sensor_ID);
-                  }
-                  break;
-             
-           } // end of switch
-   
-} // end of extractor
- 
-
-
-      
-
-
-
-
-
-/*const char * sensor_2_ID = JSON_data["S_ID"] | "unknown";
+      // Proper cleanup
+        if (esp_now_deinit() != ESP_OK) {
+           Serial.println("Warning: ESP-NOW deinit had issues");
+         }
+  */  
     
-    const char * sensor_3_ID = JSON_data["S_ID"] | "unknown"; const char * sensor_4_ID = JSON_data["S_ID"] | "unknown";
-    
-    const char * sensor_5_ID = JSON_data["S_ID"] | "unknown"; const char * sensor_6_ID = JSON_data["S_ID"] | "unknown";
-    
-    const char * sensor_7_ID = JSON_data["S_ID"] | "unknown"; const char * sensor_8_ID = JSON_data["S_ID"] | "unknown";
-    
-    const char * sensor_9_ID = JSON_data["S_ID"] | "unknown";  const char * sensor_10_ID = JSON_data["S_ID"] | "unknown";
-   
-    const char * sensor_11_ID = JSON_data["S_ID"] | "unknown"; const char * sensor_12_ID = JSON_data["S_ID"] | "unknown";
-  */
-
-/*
-//deserialize to assign char[] and floats accordingly
-void extract_readings(){
-  if(!packet_received) { LOG("No packet received!"); return; }  // this never runs, but just in case 
-      
-       DeserializationError err = deserializeJson(JSON_data, dataPack);
-
-        if (err) {
-            Serial.print("JSON Deserialization Error: ");
-            Serial.println(err.c_str());
-            return;
-        }
-       // LOG(dataPack); // SEE WHAT HAS BEEN RECEIVED!
-
-          
-    const char * sensor_ID = JSON_data["S_ID"] | "unknown"; 
-
-        if(strcmp(sensor_ID, "T_1") == 0){
-            sensor_1_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
-            sensor_1_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
-            sensor_1_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
-            sensor_1_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
-            sensor_1_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
-            sensor_1_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
-            sensor_1_packet_size = JSON_data["PKT"] | 0;
-        
-            strncpy(sensor_1_transmissions,  JSON_data["Sends"], sizeof(sensor_1_transmissions)); // up to 11 bytes: e.g., "1234567890"
-            strncpy(sensor_1_CPU_freq,  JSON_data["CPU"], sizeof(sensor_1_CPU_freq)); // 11 bytes: "80MHz CPU"
-            
-            temperature_readings[0] = sensor_1_temp; humidity_readings[0] = sensor_1_humidity;  // arrays or indexes
-            strncpy(sensor_1_last_seen, ShortTime, sizeof(sensor_1_last_seen));      sensor_1_last_seen[sizeof(sensor_1_last_seen) - 1] = '\0'; 
-      }
-
-      else if(strcmp(sensor_ID, "T_2") == 0){
-                  sensor_2_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
-                  sensor_2_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
-                  sensor_2_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
-                  sensor_2_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
-                  sensor_2_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
-                  sensor_2_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
-                  sensor_2_packet_size = JSON_data["PKT"] | 0;
-              
-                  strncpy(sensor_2_transmissions,  JSON_data["Sends"], sizeof(sensor_2_transmissions)); // up to 11 bytes: e.g., "1234567890"
-                  strncpy(sensor_2_CPU_freq,  JSON_data["CPU"], sizeof(sensor_2_CPU_freq)); // 11 bytes: "80MHz CPU"
-                  
-                  temperature_readings[0] = sensor_2_temp; humidity_readings[0] = sensor_2_humidity;  // arrays or indexes
-                  strncpy(sensor_2_last_seen, ShortTime, sizeof(sensor_2_last_seen));      sensor_2_last_seen[sizeof(sensor_2_last_seen) - 1] = '\0'; 
-      }
-
-      else if(strcmp(sensor_ID, "T_3") == 0){
-                  sensor_3_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
-                  sensor_3_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
-                  sensor_3_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
-                  sensor_3_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
-                  sensor_3_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
-                  sensor_3_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
-                  sensor_3_packet_size = JSON_data["PKT"] | 0;
-              
-                  strncpy(sensor_3_transmissions,  JSON_data["Sends"], sizeof(sensor_3_transmissions)); // up to 11 bytes: e.g., "1234567890"
-                  strncpy(sensor_3_CPU_freq,  JSON_data["CPU"], sizeof(sensor_3_CPU_freq)); // 11 bytes: "80MHz CPU"
-                  
-                  temperature_readings[2] = sensor_3_temp; humidity_readings[2] = sensor_3_humidity;  // arrays or indexes
-                  strncpy(sensor_3_last_seen, ShortTime, sizeof(sensor_3_last_seen));      sensor_3_last_seen[sizeof(sensor_3_last_seen) - 1] = '\0'; 
-      }
-
-      else if(strcmp(sensor_ID, "T_4") == 0){
-                  sensor_4_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
-                  sensor_4_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
-                  sensor_4_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
-                  sensor_4_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
-                  sensor_4_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
-                  sensor_4_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
-                  sensor_4_packet_size = JSON_data["PKT"] | 0;
-              
-                  strncpy(sensor_4_transmissions,  JSON_data["Sends"], sizeof(sensor_4_transmissions)); // up to 11 bytes: e.g., "1234567890"
-                  strncpy(sensor_4_CPU_freq,  JSON_data["CPU"], sizeof(sensor_4_CPU_freq)); // 11 bytes: "80MHz CPU"
-                  
-                  temperature_readings[3] = sensor_4_temp; humidity_readings[3] = sensor_4_humidity;  // arrays or indexes
-                  strncpy(sensor_4_last_seen, ShortTime, sizeof(sensor_4_last_seen));      sensor_4_last_seen[sizeof(sensor_4_last_seen) - 1] = '\0'; 
-      }
-
-      else if(strcmp(sensor_ID, "T_5") == 0){
-                  sensor_5_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
-                  sensor_5_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
-                  sensor_5_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
-                  sensor_5_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
-                  sensor_5_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
-                  sensor_5_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
-                  sensor_5_packet_size = JSON_data["PKT"] | 0;
-              
-                  strncpy(sensor_5_transmissions,  JSON_data["Sends"], sizeof(sensor_5_transmissions)); // up to 11 bytes: e.g., "1234567890"
-                  strncpy(sensor_5_CPU_freq,  JSON_data["CPU"], sizeof(sensor_5_CPU_freq)); // 11 bytes: "80MHz CPU"
-                  
-                  temperature_readings[4] = sensor_5_temp; humidity_readings[4] = sensor_5_humidity;  // arrays or indexes
-                  strncpy(sensor_5_last_seen, ShortTime, sizeof(sensor_5_last_seen));      sensor_5_last_seen[sizeof(sensor_5_last_seen) - 1] = '\0'; 
-      }
-
-      else if(strcmp(sensor_ID, "T_6") == 0){
-                  sensor_6_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
-                  sensor_6_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
-                  sensor_6_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
-                  sensor_6_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
-                  sensor_6_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
-                  sensor_6_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
-                  sensor_6_packet_size = JSON_data["PKT"] | 0;
-              
-                  strncpy(sensor_6_transmissions,  JSON_data["Sends"], sizeof(sensor_6_transmissions)); // up to 11 bytes: e.g., "1234567890"
-                  strncpy(sensor_6_CPU_freq,  JSON_data["CPU"], sizeof(sensor_6_CPU_freq)); // 11 bytes: "80MHz CPU"
-                  
-                  temperature_readings[5] = sensor_6_temp; humidity_readings[5] = sensor_6_humidity;  // arrays or indexes
-                  strncpy(sensor_6_last_seen, ShortTime, sizeof(sensor_6_last_seen));      sensor_6_last_seen[sizeof(sensor_6_last_seen) - 1] = '\0'; 
-      }
-
-      else if(strcmp(sensor_ID, "T_7") == 0){
-                  sensor_7_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
-                  sensor_7_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
-                  sensor_7_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
-                  sensor_7_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
-                  sensor_7_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
-                  sensor_7_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
-                  sensor_7_packet_size = JSON_data["PKT"] | 0;
-              
-                  strncpy(sensor_7_transmissions,  JSON_data["Sends"], sizeof(sensor_7_transmissions)); // up to 11 bytes: e.g., "1234567890"
-                  strncpy(sensor_7_CPU_freq,  JSON_data["CPU"], sizeof(sensor_7_CPU_freq)); // 11 bytes: "80MHz CPU"
-                  
-                  temperature_readings[6] = sensor_7_temp; humidity_readings[6] = sensor_7_humidity;  // arrays or indexes
-                  strncpy(sensor_7_last_seen, ShortTime, sizeof(sensor_7_last_seen));      sensor_7_last_seen[sizeof(sensor_7_last_seen) - 1] = '\0'; 
-      }
-
-      else if(strcmp(sensor_ID, "T_8") == 0){
-                  sensor_8_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
-                  sensor_8_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
-                  sensor_8_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
-                  sensor_8_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
-                  sensor_8_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
-                  sensor_8_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
-                  sensor_8_packet_size = JSON_data["PKT"] | 0;
-              
-                  strncpy(sensor_8_transmissions,  JSON_data["Sends"], sizeof(sensor_8_transmissions)); // up to 11 bytes: e.g., "1234567890"
-                  strncpy(sensor_8_CPU_freq,  JSON_data["CPU"], sizeof(sensor_8_CPU_freq)); // 11 bytes: "80MHz CPU"
-                  
-                  temperature_readings[7] = sensor_8_temp; humidity_readings[7] = sensor_8_humidity;  // arrays or indexes
-                  strncpy(sensor_8_last_seen, ShortTime, sizeof(sensor_8_last_seen));      sensor_8_last_seen[sizeof(sensor_8_last_seen) - 1] = '\0'; 
-      }
-
-      else if(strcmp(sensor_ID, "T_9") == 0){
-                  sensor_9_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
-                  sensor_9_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
-                  sensor_9_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
-                  sensor_9_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
-                  sensor_9_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
-                  sensor_9_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
-                  sensor_9_packet_size = JSON_data["PKT"] | 0;
-              
-                  strncpy(sensor_9_transmissions,  JSON_data["Sends"], sizeof(sensor_9_transmissions)); // up to 11 bytes: e.g., "1234567890"
-                  strncpy(sensor_9_CPU_freq,  JSON_data["CPU"], sizeof(sensor_9_CPU_freq)); // 11 bytes: "80MHz CPU"
-                  
-                  temperature_readings[8] = sensor_9_temp; humidity_readings[8] = sensor_9_humidity;  // arrays or indexes
-                  strncpy(sensor_9_last_seen, ShortTime, sizeof(sensor_9_last_seen));      sensor_9_last_seen[sizeof(sensor_9_last_seen) - 1] = '\0'; 
-      }
-
-      else if(strcmp(sensor_ID, "T_10") == 0){
-                  sensor_10_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
-                  sensor_10_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
-                  sensor_10_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
-                  sensor_10_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
-                  sensor_10_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
-                  sensor_10_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
-                  sensor_10_packet_size = JSON_data["PKT"] | 0;
-              
-                  strncpy(sensor_10_transmissions,  JSON_data["Sends"], sizeof(sensor_10_transmissions)); // up to 11 bytes: e.g., "1234567890"
-                  strncpy(sensor_10_CPU_freq,  JSON_data["CPU"], sizeof(sensor_10_CPU_freq)); // 11 bytes: "80MHz CPU"
-                  
-                  temperature_readings[9] = sensor_10_temp; humidity_readings[9] = sensor_10_humidity;  // arrays or indexes
-                  strncpy(sensor_10_last_seen, ShortTime, sizeof(sensor_10_last_seen));      sensor_10_last_seen[sizeof(sensor_10_last_seen) - 1] = '\0'; 
-      }
-
-      else if(strcmp(sensor_ID, "T_11") == 0){
-                  sensor_11_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
-                  sensor_11_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
-                  sensor_11_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
-                  sensor_11_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
-                  sensor_11_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
-                  sensor_11_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
-                  sensor_11_packet_size = JSON_data["PKT"] | 0;
-              
-                  strncpy(sensor_11_transmissions,  JSON_data["Sends"], sizeof(sensor_11_transmissions)); // up to 11 bytes: e.g., "1234567890"
-                  strncpy(sensor_11_CPU_freq,  JSON_data["CPU"], sizeof(sensor_11_CPU_freq)); // 11 bytes: "80MHz CPU"
-                  
-                  temperature_readings[10] = sensor_11_temp; humidity_readings[10] = sensor_11_humidity;  // arrays or indexes
-                  strncpy(sensor_11_last_seen, ShortTime, sizeof(sensor_11_last_seen));      sensor_11_last_seen[sizeof(sensor_11_last_seen) - 1] = '\0'; 
-      }
-
-      else if(strcmp(sensor_ID, "T_12") == 0){
-                  sensor_12_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
-                  sensor_12_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
-                  sensor_12_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
-                  sensor_12_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
-                  sensor_12_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
-                  sensor_12_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
-                  sensor_12_packet_size = JSON_data["PKT"] | 0;
-              
-                  strncpy(sensor_12_transmissions,  JSON_data["Sends"], sizeof(sensor_12_transmissions)); // up to 11 bytes: e.g., "1234567890"
-                  strncpy(sensor_12_CPU_freq,  JSON_data["CPU"], sizeof(sensor_12_CPU_freq)); // 11 bytes: "80MHz CPU"
-                  
-                  temperature_readings[11] = sensor_12_temp; humidity_readings[11] = sensor_12_humidity;  // arrays or indexes
-                  strncpy(sensor_12_last_seen, ShortTime, sizeof(sensor_12_last_seen));      sensor_12_last_seen[sizeof(sensor_12_last_seen) - 1] = '\0'; 
-      }
-
-        else {
-               Serial.printf("Unknown sensor: %s\n", sensor_ID);
-             }
-
+    return esp_now_initialized;
 }
 
-*/
 
 
 int extract_sensor_number(const char *identity){
@@ -3504,43 +3125,10 @@ uint8_t reading_count = 0;
 // now_now_ms
 void monitor_dryer_readings(){
 
-  average_temp = 0.00;
-  average_humi = 0.00;
-  active_sensors = 0;
-  average_press = 0.0;
-  average_elev = 0.0;
-
-  average_press = sensor_1_pressure + sensor_2_pressure + sensor_3_pressure + sensor_4_pressure + sensor_5_pressure + sensor_6_pressure
-                + sensor_7_pressure + sensor_8_pressure + sensor_9_pressure + sensor_10_pressure + sensor_11_pressure + sensor_12_pressure;
-
-  average_elev = sensor_1_elevation + sensor_2_elevation + sensor_3_elevation + sensor_4_elevation + sensor_5_elevation + sensor_6_elevation
-               + sensor_7_elevation + sensor_8_elevation + sensor_9_elevation + sensor_10_elevation + sensor_11_elevation + sensor_12_elevation;
-
-  for(int i=0; i<(sizeof(temperature_readings)/sizeof(temperature_readings[0])); i++){
-    if(temperature_readings[i] >= 2.00){
-      active_sensors++;
-      average_temp += temperature_readings[i];
-      average_humi += humidity_readings[i];
-    }
-  }
-
-  Serial.print("Active Sensors: "); Serial.println(active_sensors);
-
-  if(active_sensors <= 0){
-      average_temp = 0.00;
-      average_humi = 0.00;
-      average_press = 0.00;
-      average_elev = 0.00;
-  }
-  else{
-      average_temp /= active_sensors;
-      average_humi /= active_sensors;
-      average_press /= active_sensors;
-      average_elev /= active_sensors;
-  }
-
+    average_temp = aggregate_sensor_temperatures(); // brings average temp and average humi
+    
   // ==============================
-  // STORE HISTORY (Refined Block)
+  // STORE HISTORICALS
   // ==============================
 
   if(new_average_temp != average_temp){
@@ -3554,12 +3142,12 @@ void monitor_dryer_readings(){
           strcpy(time_stamps[i], time_stamps[i-1]);
       }
 
-      // insert newest at index 0
+      // UPDATE HISTORICALS
       historical_temperature_readings[0] = average_temp;
       historical_outside_temperatures[0] = sensor_12_temp;
       historical_humidity_readings[0]    = average_humi;
-      historical_pressure_readings[0]    = average_press;
-      strcpy(time_stamps[0], ShortTime); // HH:MM
+     // historical_pressure_readings[0]    = average_press;
+      strcpy(time_stamps[0], sawa.ShortTime); // HH:MM
 
       if(reading_count < 10) reading_count++;
 
@@ -3573,7 +3161,121 @@ void monitor_dryer_readings(){
 
   Serial.print("Average Temp: "); Serial.println(average_temp);
   Serial.print("Average Humi: "); Serial.println(average_humi);
+  Serial.print("Active Sensors: "); Serial.println(active_sensors);
+
 }
+
+
+char temps_log[256];
+char humis_log[256];
+
+float aggregate_sensor_temperatures() {
+
+    float avg_temp = 0.0f;
+
+    active_sensors = 0;
+
+    highest_temperature = -100.0f;
+    lowest_temperature  = 200.0f;
+
+    highest_humidity = -100.0f;
+    lowest_humidity  = 200.0f;
+
+    float total_temp = 0.0f;
+    float total_humi = 0.0f;
+    
+    /*
+    Serial.print("Sensor 2 Temp: "); Serial.println(sensor_2_temp);
+    Serial.print("Sensor 8 Temp: "); Serial.println(sensor_8_temp);
+    Serial.print("Sensor 12 Temp: "); Serial.println(sensor_12_temp);
+    */
+
+
+    float temperature_readings[11] = {
+        sensor_1_temp, sensor_2_temp, sensor_3_temp, sensor_4_temp,
+        sensor_5_temp, sensor_6_temp, sensor_7_temp, sensor_8_temp,
+        sensor_9_temp, sensor_10_temp, sensor_11_temp
+    };
+
+    float humidity_readings[11] = {
+        sensor_1_humidity, sensor_2_humidity, sensor_3_humidity, sensor_4_humidity,
+        sensor_5_humidity, sensor_6_humidity, sensor_7_humidity, sensor_8_humidity,
+        sensor_9_humidity, sensor_10_humidity, sensor_11_humidity
+    };
+
+    bool valid_sensor[11] = {false};
+
+    // PASS 1 — collect valid sensors
+    for(int i = 0; i < 11; i++){
+
+        float t = temperature_readings[i];
+        float h = humidity_readings[i];
+
+        if((!isnan(t) || !isnan(h)) && (t > 1.0f || h > 1.0f)){ 
+            // if either temp or humidity is valid, consider the sensor valid. 
+            //This allows us to still use the temp reading from a sensor even if its humidity reading is bad, and vice versa, which can be common in real-world conditions. 
+            //We just have to be careful in PASS 2 to only check deviations for the valid reading types per sensor.  
+            //  if(!isnan(t) && !isnan(h) && t > 1.0f && h > 1.0f){
+
+            valid_sensor[i] = true;
+
+            total_temp += t;
+            total_humi += h;
+
+            active_sensors++;
+
+            if(t > highest_temperature) highest_temperature = t;
+            if(t < lowest_temperature)  lowest_temperature  = t;
+
+            if(h > highest_humidity) highest_humidity = h;
+            if(h < lowest_humidity)  lowest_humidity  = h;
+        }
+    }
+
+    if(active_sensors == 0){
+        return NAN;
+    }
+
+    avg_temp = total_temp / active_sensors;
+    average_humi    = total_humi / active_sensors;
+
+    temperature_range = highest_temperature - lowest_temperature;
+    humidity_range    = highest_humidity - lowest_humidity;
+
+    // PASS 2 — detect deviations and dead zones
+    for(int i = 0; i < 11; i++){
+
+        if(!valid_sensor[i]) continue;
+
+        float t = temperature_readings[i];
+        float h = humidity_readings[i];
+
+        temperature_deviation = t - avg_temp;
+        humidity_deviation    = h - average_humi;
+
+        // Dead-zone detection
+        if(temperature_deviation < -2.0f && humidity_deviation > 5.0f){
+            snprintf(temps_log, sizeof(temps_log), "Dead zone suspected near sensor %u", i+1);
+            Serial.println(temps_log);
+        }
+
+        // Sensor malfunction detection
+        if(abs(temperature_deviation) > 8.0f){
+
+            snprintf(temps_log, sizeof(temps_log), "Temperature sensor deviation too large at sensor %u", i+1);
+            Serial.println(temps_log);
+        }
+
+        if(abs(humidity_deviation) > 15.0f){
+
+            snprintf(humis_log, sizeof(humis_log), "Humidity sensor deviation too large at sensor %u", i+1);
+            Serial.println(humis_log);
+        }
+    }
+
+    return avg_temp;
+}
+
 
 
 
@@ -3589,8 +3291,8 @@ void write_json_metadata(File &file) {
     JsonObject System = metaDoc["System"].to<JsonObject>();
     System["FW_Version"] = FW_VERSION;
     System["Device_ID"] = devicename; // Assuming you have a device ID
-    System["Created_Date"] = SystemDate;
-    System["Created_Time"] = SystemTime;
+    System["Created_Date"] = sawa.SystemDate;
+    System["Created_Time"] = sawa.SystemTime;
     System["Max_File_Size_MB"] = MAX_FILE_SIZE / (1024 * 1024);
     System["Max_Total_Size_MB"] = MAX_TOTAL_SIZE / (1024 * 1024);
     
@@ -3659,8 +3361,8 @@ bool bind_dynamic_data_into_json() {
     // ================= SYSTEM RUNTIME DATA =================
     JsonObject System = JSON_sendable["System"].to<JsonObject>();
     System["Uptime"] = (now_now_ms / 1000);
-    System["Date"] = SystemDate;
-    System["Time"] = SystemTime;
+    System["Date"] = sawa.SystemDate;
+    System["Time"] = sawa.SystemTime;
     System["Datalog_Count"] = save_counter;
     System["Voltage"] = voltage;
     System["Internal_Temp"] = cabin_temperature;
@@ -3785,9 +3487,9 @@ bool bind_dynamic_data_into_json() {
                 // ================= SERIALIZATION =================
 
             size_t len_sd   = serializeJsonPretty(JSON_sendable, sendable_to_sd_card); // serializeJsonPretty
-            size_t len_cloud = serializeJson(JSON_sendable, sendable_to_cloud_db);
+          //  size_t len_cloud = serializeJson(JSON_sendable, sendable_to_cloud_db);
 
-            if (len_sd == 0 || len_cloud == 0) {
+            if (len_sd == 0) {
                 snprintf(serialization_log,
                         sizeof(serialization_log),
                         "[JSON] Serialization failed!");
@@ -3795,9 +3497,10 @@ bool bind_dynamic_data_into_json() {
                 return false;
             }
 
+            /*
+
             // Optional: detect truncation (ArduinoJson does NOT null-terminate if truncated)
-            if (len_sd >= sizeof(sendable_to_sd_card) ||
-                len_cloud >= sizeof(sendable_to_cloud_db))
+            if (len_sd >= sizeof(sendable_to_sd_card) ||    len_cloud >= sizeof(sendable_to_cloud_db))
             {
                 snprintf(serialization_log,
                         sizeof(serialization_log),
@@ -3805,13 +3508,15 @@ bool bind_dynamic_data_into_json() {
                 LOG(serialization_log);
             }
 
+            */
+
             bound_successfully = true;
 
             snprintf(serialization_log,
                     sizeof(serialization_log),
-                    "[JSON] Serialized OK | SD: %u bytes | Cloud: %u bytes",
-                    (unsigned int)len_sd,
-                    (unsigned int)len_cloud);
+                    "[JSON] Serialized OK | SD: %u bytes",// | Cloud: %u bytes",
+                    (unsigned int)len_sd);
+                   // (unsigned int)len_cloud);
 
             LOG(serialization_log);
 
@@ -3820,9 +3525,24 @@ bool bind_dynamic_data_into_json() {
 }
 
 
+//  only bind existing values, 
+//  leave out the zeros
+
+uint8_t copied_entry = 0;
+bool data_ready_for_upload = false;
+
+// ── Tuneable constants ──────────────────────────────────────────────────────
+static const size_t UPLOAD_BUFFER_SIZE     = 20000; // 10-20 sendable_to_sd_card_csv entries
+static const size_t UPLOAD_BUFFER_DANGER   = 18000; // ~90% full → force clear oldest
+static const uint8_t ENTRIES_PER_UPLOAD    = 5; // 10;
+static const uint8_t MAX_UPLOAD_FAILS = 3; // after 3 misses, drop oldest batch or else buffer chokes
+uint8_t upload_fail_count = 0;
+
+char sendable_to_cloud_db[UPLOAD_BUFFER_SIZE] = ""; 
 
 
 bool bind_dynamic_data_into_csv(){
+
 
     bool bound_successfully = false;
 
@@ -3852,8 +3572,8 @@ bool bind_dynamic_data_into_csv(){
         "%.2f,%.2f,%llu,%.2f\n",                     // Environment [solar, wind], uptime, voltage
 
         // ================= VALUES =================
-        SystemDate,
-        ShortTime_am_pm, //ShortTime, //SystemTime, 
+        sawa.SystemDate,
+        sawa.ShortTime, //ShortTime, //SystemTime, 
         // average_temp,
        // average_humi,
        // average_press,
@@ -3901,238 +3621,183 @@ bool bind_dynamic_data_into_csv(){
              "[CSV] Serialized OK | %u bytes",
              (unsigned int)len);
 
+
     LOG(csv_bind_log);
+
+    // ── Accumulate into upload buffer ────────────────────────────────────────
+    size_t current_fill = strlen(sendable_to_cloud_db);
+    size_t row_size     = (size_t)len;
+    size_t remaining    = UPLOAD_BUFFER_SIZE - current_fill - 1;
+
+    // Near-choke: buffer over danger threshold — drop the oldest half
+    // This only happens if repeated upload failures have let it fill up
+    if (current_fill >= UPLOAD_BUFFER_DANGER) {
+        size_t half = UPLOAD_BUFFER_SIZE / 2;
+        // Shift second half to front, preserving the more recent entries
+        memmove(sendable_to_cloud_db, sendable_to_cloud_db + half,
+                UPLOAD_BUFFER_SIZE - half);
+        memset(sendable_to_cloud_db + (UPLOAD_BUFFER_SIZE - half), 0, half);
+        current_fill = strlen(sendable_to_cloud_db);
+        remaining    = UPLOAD_BUFFER_SIZE - current_fill - 1;
+        // Adjust entry count estimate (we dropped roughly half)
+        copied_entry = (copied_entry > ENTRIES_PER_UPLOAD / 2)
+                       ? (copied_entry - ENTRIES_PER_UPLOAD / 2)
+                       : 0;
+        LOG("[CSV] Upload buffer near-full: dropped oldest half");
+    }
+
+    if (remaining < row_size) {
+        // Still no room after choke-clear — this should never happen
+        // with 30kB, but log and skip rather than corrupt
+        LOG("[CSV] Upload buffer full — row dropped");
+        return false;
+    }
+
+    strncat(sendable_to_cloud_db, sendable_to_sd_card_csv, remaining);
+    copied_entry++;
+
+    snprintf(csv_bind_log, sizeof(csv_bind_log),
+             "[CSV] OK %u bytes | entry %u/%u | buf %u/%u B",
+             (unsigned int)row_size, copied_entry, ENTRIES_PER_UPLOAD,
+             (unsigned int)strlen(sendable_to_cloud_db),
+             (unsigned int)UPLOAD_BUFFER_SIZE);
+    LOG(csv_bind_log);
+
+    // Flag ready when we have a full batch
+    if (copied_entry >= ENTRIES_PER_UPLOAD) {
+        data_ready_for_upload = true;
+    }
 
     return bound_successfully;
 }
 
+//this is declared way up among the gulobals
+//const uint64_t upload_frequency_ms   = (10ULL * 60ULL * 1000ULL); // 10 minutes
 
+char _10minute_marked[128] = "10-min marker at "; //   HH:MM:SS
+bool time_to_upload = false;
+void handle_upload(){
+   
+     // ── Determine if it is time ──────────────────────────────────────────────
+    if (!sawa.isClockWorking()) {
+        time_to_upload = (now_now_ms - last_upload_time_ms) > upload_frequency_ms;
+    } else {
+        //  if (!ten_min) return;   // not a 10-minute boundary — exit immediately
+        if(!five_min) return;
+        time_to_upload = true;
+        snprintf(_10minute_marked, sizeof(_10minute_marked),
+                 "10-min marker at %s", sawa.SystemTime);
+        Serial.println(_10minute_marked);
+    }
 
-/*
-bool bind_dynamic_data_into_json(){
-  bool bound_successfully = false;
-           JSON_sendable.clear();
-           save_counter++; // save this into EEPROM or SPIFFS
+    if (!time_to_upload)  return;
+    if (!data_ready_for_upload) {
+        // Not enough entries yet — just update the last-checked timestamp
+        // so the esp_timer fallback doesn't drift
+        last_upload_time_ms = now_now_ms;
+        Serial.printf("[Upload] Skipping — only %u/%u entries ready\n",
+                      copied_entry, ENTRIES_PER_UPLOAD);
+        return;
+    }
 
-    // SYSTEM PARAMETERS
-        JsonObject System      = JSON_sendable["System"].to<JsonObject>();
-        System["FW_Version"]       = FW_VERSION;
-        System["Uptime"]           = (now_now_ms/1000); // convert into seconds
-        System["Date"] = SystemDate;
-        System["Time"] = SystemTime;
-        System["Datalog_Count"] = save_counter; 
-        System["Voltage"] = voltage;
-        System["Internal_Temp"] = cabin_temperature;
-        System["Internal_Fan"] = inner_fan_status;
-        System["OTA_Status"] = ota_log;
-        System["LastOTA_Update"] = LastOTAUpdate;
-
-        System["SD_REMAINING_SPACE"] = storage;
-
-        // SNAPSHOTS OF READINGS AT A CERTAIN TIME, NOT CUMMULATED MEDIANS/MEANS
-        JsonObject Dryer_Conditions      = JSON_sendable["Dryer_Conditions"].to<JsonObject>();
-        Dryer_Conditions["Active_Sensors"] = active_sensors;
-        Dryer_Conditions["Average_Temperature"] = average_temp;
-        Dryer_Conditions["Average_Humidity"] = average_humi;
-        Dryer_Conditions["Average_Pressure"] = average_press;
-
-        
-        //ALL SENSOR COMBINED SENSOR PARAMETERS
-        JsonObject All_Sensors      = JSON_sendable["All_Sensors"].to<JsonObject>();
-    for(int i = 0; i < active_sensors; i++){ 
-        All_Sensors["Temperature_Readings"][i] = historical_temperature_readings[i];
-        All_Sensors["Humidity_Readings"][i] = historical_humidity_readings[i];
-        All_Sensors["Pressure_Readings"][i] = historical_pressure_readings[i];
-        All_Sensors["Time"][i] = time_stamps[i];
-    }   
-
-        // ---------------- INDIVIDUAL SENSORS ----------------
-        // SENSOR 1 PARAMETERS
-      JsonObject Sensor_1    = JSON_sendable["Sensor_1"].to<JsonObject>();
-          Sensor_1["Position"]     = "AIR INLET 1";
-          Sensor_1["Temp"]      =   sensor_1_temp;
-          Sensor_1["Humi"]      =   sensor_1_humidity;
-          Sensor_1["Pressure"]  =   sensor_1_pressure;
-          Sensor_1["Last_Seen"] =   sensor_1_last_seen;
-          Sensor_1["Sends"]     =   sensor_1_transmissions;
 
   
-        // SENSOR 2 PARAMETERS
-      JsonObject Sensor_2    = JSON_sendable["Sensor_2"].to<JsonObject>();
-          Sensor_2["Position"]     = "AIR INLET 2";
-          Sensor_2["Temp"]      =   sensor_2_temp;
-          Sensor_2["Humi"]      =   sensor_2_humidity;
-          Sensor_2["Pressure"]  =   sensor_2_pressure;
-          Sensor_2["Last_Seen"] =   sensor_2_last_seen;
-          Sensor_2["Sends"]     =   sensor_2_transmissions;
-
-
-        // SENSOR 3 PARAMETERS
-      JsonObject Sensor_3    = JSON_sendable["Sensor_3"].to<JsonObject>();
-          Sensor_3["Position"]     = "AIR OUTLET 1";
-          Sensor_3["Temp"]      =   sensor_3_temp;
-          Sensor_3["Humi"]      =   sensor_3_humidity;
-          Sensor_3["Pressure"]  =   sensor_3_pressure;
-          Sensor_3["Last_Seen"] =   sensor_3_last_seen;
-          Sensor_3["Sends"]     =   sensor_3_transmissions;
-
-
-        // SENSOR 4 PARAMETERS
-      JsonObject Sensor_4    = JSON_sendable["Sensor_4"].to<JsonObject>();
-          Sensor_4["Position"]     = "AIR OUTLET 2";
-          Sensor_4["Temp"]      =   sensor_4_temp;
-          Sensor_4["Humi"]      =   sensor_4_humidity;
-          Sensor_4["Pressure"]  =   sensor_4_pressure;
-          Sensor_4["Last_Seen"] =   sensor_4_last_seen;
-          Sensor_4["Sends"]     =   sensor_4_transmissions;
-
-
-        // SENSOR 5 PARAMETERS
-      JsonObject Sensor_5    = JSON_sendable["Sensor_5"].to<JsonObject>();
-          Sensor_5["Position"]     = "DRYING BED LOWEST";
-          Sensor_5["Temp"]      =   sensor_5_temp;
-          Sensor_5["Humi"]      =   sensor_5_humidity;
-          Sensor_5["Pressure"]  =   sensor_5_pressure;
-          Sensor_5["Last_Seen"] =   sensor_5_last_seen;
-          Sensor_5["Sends"]     =   sensor_5_transmissions;
-
-        // SENSOR 5 PARAMETERS
-      JsonObject Sensor_6    = JSON_sendable["Sensor_6"].to<JsonObject>();
-          Sensor_6["Position"]     = "DRYING BED MIDDLE";
-          Sensor_6["Temp"]      =   sensor_6_temp;
-          Sensor_6["Humi"]      =   sensor_6_humidity;
-          Sensor_6["Pressure"]  =   sensor_6_pressure;
-          Sensor_6["Last_Seen"] =   sensor_6_last_seen;
-          Sensor_6["Sends"]     =   sensor_6_transmissions;
-
-        // SENSOR 7 PARAMETERS
-      JsonObject Sensor_7    = JSON_sendable["Sensor_7"].to<JsonObject>();
-          Sensor_7["Position"]     = "DRYING BED TOP";
-          Sensor_7["Temp"]      =   sensor_7_temp;
-          Sensor_7["Humi"]      =   sensor_7_humidity;
-          Sensor_7["Pressure"]  =   sensor_7_pressure;
-          Sensor_7["Last_Seen"] =   sensor_7_last_seen;
-          Sensor_7["Sends"]     =   sensor_7_transmissions;
-
-        // SENSOR 5 PARAMETERS
-      JsonObject Sensor_8    = JSON_sendable["Sensor_8"].to<JsonObject>();
-          Sensor_8["Position"]     = "DRYING BED MIDDLE ZONE";
-          Sensor_8["Temp"]      =   sensor_8_temp;
-          Sensor_8["Humi"]      =   sensor_8_humidity;
-          Sensor_8["Pressure"]  =   sensor_8_pressure;
-          Sensor_8["Last_Seen"] =   sensor_8_last_seen;
-          Sensor_8["Sends"]     =   sensor_8_transmissions;
-
-        // SENSOR 5 PARAMETERS
-      JsonObject Sensor_9    = JSON_sendable["Sensor_9"].to<JsonObject>();
-          Sensor_9["Position"]     = "DRYING BED ENTRY ZONE";
-          Sensor_9["Temp"]      =   sensor_9_temp;
-          Sensor_9["Humi"]      =   sensor_9_humidity;
-          Sensor_9["Pressure"]  =   sensor_9_pressure;
-          Sensor_9["Last_Seen"] =   sensor_9_last_seen;
-          Sensor_9["Sends"]     =   sensor_9_transmissions;
-
-        // SENSOR 10 PARAMETERS
-      JsonObject Sensor_10    = JSON_sendable["Sensor_10"].to<JsonObject>();
-          Sensor_10["Position"]     = "DRYING BED EXIT ZONE";
-          Sensor_10["Temp"]      =   sensor_10_temp;
-          Sensor_10["Humi"]      =   sensor_10_humidity;
-          Sensor_10["Pressure"]  =   sensor_10_pressure;
-          Sensor_10["Last_Seen"] =   sensor_10_last_seen;
-          Sensor_10["Sends"]     =   sensor_10_transmissions;
-
-        // SENSOR 11 PARAMETERS
-      JsonObject Sensor_11    = JSON_sendable["Sensor_11"].to<JsonObject>();
-          Sensor_11["Position"]     = "DRYING BED RANDOM POSITION";
-          Sensor_11["Temp"]      =   sensor_11_temp;
-          Sensor_11["Humi"]      =   sensor_11_humidity;
-          Sensor_11["Pressure"]  =   sensor_11_pressure;
-          Sensor_11["Last_Seen"] =   sensor_11_last_seen;
-          Sensor_11["Sends"]     =   sensor_11_transmissions;
-
-        // SENSOR 12 PARAMETERS
-      JsonObject Sensor_12    = JSON_sendable["Sensor_12"].to<JsonObject>();
-          Sensor_12["Position"]     = "DRYING BED AMBIENT ZONE";
-          Sensor_12["Temp"]      =   sensor_12_temp;
-          Sensor_12["Humi"]      =   sensor_12_humidity;
-          Sensor_12["Pressure"]  =   sensor_12_pressure;
-          Sensor_12["Last_Seen"] =   sensor_12_last_seen;
-          Sensor_12["Sends"]     =   sensor_12_transmissions;
-
-          // SOLAR RADIATION DATA // WIND SPEED DATA
-      JsonObject Environment    = JSON_sendable["Environment"].to<JsonObject>();
-          Environment["Solar_Radiation"]     = average_solar_radiation;
-          Environment["Wind_Speed"]     = average_wind_speed;
-          
-          // --- Serialize into a buffer or string ---
-           size_t len = serializeJsonPretty(JSON_sendable, sendable_to_sd_card); /// to save to data.json, then as dada.csv
-           serializeJson(JSON_sendable, sendable_to_cloud_db);  // to send via the 4G SIM to upload_to_web_of_iot(sendable_to_cloud_db)
-
+   // if(data_ready_for_upload && time_to_upload){ // only when there is data and time has reached
       
-          if (active_sensors <= 0) { // to prevent garbage writes when sensors fail.
-              LOG("[JSON] No active sensors. Skipping bind.");
-              return false;
-          }
-          
+    // ── Radio switch ─────────────────────────────────────────────────────────
+    flash(now_now_ms, blinker, 500, 500, 0, 0);
 
-          if (len <= 0) {
-              LOG("[JSON] Serialization failed!");
-              return false;
-          }
+    if (esp_now_deinit() != ESP_OK) {
+        Serial.println("[Upload] ESP-NOW deinit failed — aborting");
+        switch_radio_to_espnow();
+        return;
+    }
 
-               
-          if (len > 0) {
-            bound_successfully = true;
-            
-            LOG("[JSON] Serialization successful.");
-            LOG("[JSON] Payload size: " + String(len) + " bytes");
-            LOG("[JSON] --- Payload Preview ---");
-            LOG(sendable_to_sd_card); // optional: can be commented out if too large//
-          } 
-          
-  return bound_successfully;
+    if (!switch_radio_to_wifi()) {
+        Serial.println("[Upload] WiFi switch failed — preserving buffer");
+        switch_radio_to_espnow();
+        upload_fail_count++;
+        return;   // buffer intact, copied_entry intact, will retry next cycle
+    }
 
- 
+    wifi_connected = wifi_obj.ensure_wifi();
+    if (!wifi_connected) {
+        Serial.println("[Upload] WiFi connect failed — preserving buffer");
+        switch_radio_to_espnow();
+        upload_fail_count++;
+        return;
+    }
+
+    delay(1000);
+
+    // ── Attempt upload ───────────────────────────────────────────────────────
+    Uploader.begin();
+    strncpy(upload_log, "Uploading CSV batch...", sizeof(upload_log));
+    Serial.println(upload_log);
+
+    // Call once — the first call was being discarded
+    UploadStatus st = Uploader.upload_to_web_of_iot(sendable_to_cloud_db);
+
+    currentScreen = 19; special_call = true;
+    update_display();
+
+    Serial.printf("[Upload] status=%d report=%s\n",
+                  (int)st, Uploader.get_upload_report());
+
+    if (st == UPLOAD_SUCCESS) {   // replace UPLOAD_OK with whatever your enum uses for success
+        // ── Success: clear buffer and reset counters ──────────────────────
+        snprintf(last_upload_time,    sizeof(last_upload_time),     "%s", sawa.SystemTime);
+        snprintf(upload_error_code,   sizeof(upload_error_code),    "Uploaded %u entries at %s on %s",  copied_entry, sawa.ShortTime, sawa.SystemDate);
+        LOG(upload_error_code);
+
+        sendable_to_cloud_db[0] = '\0';   // clear buffer
+        copied_entry    = 0;
+        data_ready_for_upload = false;
+        upload_fail_count = 0;
+        data_sent       = true;
+        last_upload_time_ms = now_now_ms;
+
+    } else {
+        // ── Failure: preserve buffer, increment fail counter ──────────────
+        upload_fail_count++;
+        snprintf(upload_error_code, sizeof(upload_error_code),
+                 "Upload FAILED (attempt %u) at %s",
+                 upload_fail_count, sawa.ShortTime);
+        LOG(upload_error_code);
+
+        // After MAX_UPLOAD_FAILS consecutive failures, drop the oldest batch
+        // so we don't permanently stall accumulation
+        if (upload_fail_count >= MAX_UPLOAD_FAILS) {
+            LOG("[Upload] Max retries reached — dropping oldest batch from buffer");
+            // Drop first ENTRIES_PER_UPLOAD rows by finding the Nth newline
+            char* p = sendable_to_cloud_db;
+            for (uint8_t n = 0; n < ENTRIES_PER_UPLOAD && *p; n++) {
+                p = strchr(p, '\n');
+                if (!p) break;
+                p++;   // move past the newline
+            }
+            if (p && *p) {
+                memmove(sendable_to_cloud_db, p,
+                        strlen(p) + 1);   // +1 for null terminator
+            } else {
+                sendable_to_cloud_db[0] = '\0';
+            }
+            copied_entry    = (copied_entry >= ENTRIES_PER_UPLOAD)
+                              ? (copied_entry - ENTRIES_PER_UPLOAD) : 0;
+            data_ready_for_upload = (copied_entry >= ENTRIES_PER_UPLOAD);
+            upload_fail_count = 0;
+        }
+        data_sent = false;
+        last_upload_time_ms = now_now_ms;
+    }
+
+    delay(2000);
+    switch_radio_to_espnow();
+    currently_uploading = false;
+
 }
-*/
-
-/* LOG SENSOR DROPOUTS AS WELL
-"Events": [
-  {"Type":"FAN_ON","Fan":"Cooling","Time":"14:32:10"},
-  {"Type":"SENSOR_LOST","Sensor":"S3","Duration_s":120}
-]
-*/
-
-/*
-
-void prepare_JSON_file(){ // bundle of JOY
-strcpy(httpsData, "");
-
-     JSON_data["PassKey"] = "Dryer_Kima";
-     JSON_data["Air_Temperature"] = temp1;  // float, env't temp, rs485
-     JSON_data["Air_Humidity"] = humidity;  // float, env't humi, rs485
-     JSON_data["Air_Speed"] =  wind_speed; // float, env't speed, rs485
-
-     JSON_data["Atmospheric_Pressure"] = atm_pressure;
-     JSON_data["Internal_Temp"] = cabin_temperature; 
-     JSON_data["Internal_Fan"] = innerFan_ON; 
-     JSON_data["Night_Light"] = night_Light_ON;
-
-     JSON_data["Voltage"] =  voltage;
-
-     JSON_data["ON_TIME"] = now_now_ms;
-     JSON_data["Hour"] = hr; 
-     JSON_data["Minute"] = mint;  
-     JSON_data["Second"] =  sec;
-     JSON_data["Date"] =  SystemDate;
 
 
-    serializeJson(JSON_data, httpsData);  //Serial.println(output);
-
-      
-}  
-
-*/
 
 power_state_t get_power_state(float voltage) {
     if (voltage <= 11.0f) return POWER_CRITICAL;
@@ -4195,16 +3860,16 @@ void update_power_settings() {
 void monitor_box_conditions() {
 
     // --- Read internal temperature ---
-    cabin_temperature = real_time.getTemperature();
+    cabin_temperature = sawa.temp_reading; //real_time.getTemperature();
 
     // ---------- FAN CONTROL (with hysteresis) ----------
     
-    if (cabin_temperature >= 29.5f && !innerFan_ON) { // turn fan ON
+    if (cabin_temperature >= 30.5f && !innerFan_ON) { // turn fan ON
         digitalWrite(innerFAN, HIGH);
         innerFan_ON = true;
         buzzer.beep(1, 50, 0);
     }
-    else if (cabin_temperature <= 27.0f && innerFan_ON) { // turn fan OFF
+    else if (cabin_temperature <= 27.0f && innerFan_ON) { // turn fan OFF // with hystersis
         digitalWrite(innerFAN, LOW);
         innerFan_ON = false;
         buzzer.beep(2, 300, 200);
@@ -4250,11 +3915,14 @@ char IP_Addr[50] = "NULL";
 
 #define WIFI_SWITCH_TIMEOUT_MS 10000
 #define WIFI_RECONNECT_DELAY_MS 500
+char wifi_connection_log[128] = "...";
 
 bool switch_radio_to_wifi() {
   
   // WiFi initialization with timeout
-  Serial.println("📶 Initializing WiFi...");
+  //snprintf(wifi_log, sizeof(wifi_log), "%s", " Initializing WiFi...");
+ // Serial.println(wifi_log);
+
   unsigned long startTime = now_now_ms;
   
   WiFi.disconnect(true, true); // Full cleanup
@@ -4264,7 +3932,10 @@ bool switch_radio_to_wifi() {
   
   // Set WiFi mode before initialization
   WiFi.mode(WIFI_STA);
-  Serial.printf("📊 WiFi channel: %d\n", WiFi.channel());
+
+//  snprintf(wifi_log, sizeof(wifi_log), " WiFi channel: %d\n", WiFi.channel());
+
+  //Serial.println(wifi_log);
   
   // Initialize WiFi with timeout protection
   bool wifiSuccess = false;
@@ -4683,165 +4354,10 @@ void enter_light_sleep(uint64_t sleep_time, const char* mode) {
 }
 
 
-bool clock_is_working = false;
-
-void initialize_RTC(){
-  uint8_t trial = 0;
-
-  while(trial < 10){
-
-      clock_is_working = real_time.begin();
-      if(clock_is_working) { Serial.println("RTC FOUND!"); break; }
-
-    trial++; delay(100);
-  }
-
-  if(!clock_is_working)  { Serial.println("RTC not found"); return; }
-
-  else {
-      if (real_time.lostPower()) {
-                Serial.println("RTC lost power, let's set the time!"); // When time needs to be set on a new device, or after a power loss, the
-                
-                real_time.adjust(DateTime(F(__DATE__), F(__TIME__)));  // This line sets the RTC with an explicit date & time, for example to set 
-                // rtc.adjust(DateTime(2025, 9, 4, 3, 0, 0));
-                
-                Serial.println("Clock Started and time set!");
-        }
-
-    }
-
-        //   real_time.adjust(DateTime(2025, 12, 18, 13, 55, 0)); // ONLY SET TIME ONCE
-
-}
 
 
 
 
-void query_rtc(){
-
-    char root[5] = "th";
-
-    char daysOfTheWeek[7][12] = {"Sun", "Mon", "Tue", "Wed", "Thur", "Fri", "Sat"};
-    char Moonth[12][12] = {"January", "February", "March", "April", "May", "June",
-                           "July", "August", "September", "October", "November", "December"};
-    char short_Month[12][10] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
-                                "Jul", "Aug", "Sept", "Oct", "Nov", "Dec"};
-
-    char hr_str[5] = "";
-    char min_str[5] = "";
-    char sec_str[5] = "";
-    char day_str[15] = "";
-    char date_str[10] = "";
-    char mth_str[15] = "";
-    char short_mth_str[12] = "";
-    char yr_str[7] = "";
-
-    uint8_t datey = 0;
-    uint8_t reminder = 0;
-
-    if(clock_is_working){
-
-        DateTime time_now = real_time.now();
-
-        hr = time_now.hour();
-        mint = time_now.minute();
-        sec = time_now.second();
-
-        datey = time_now.day();
-        mth   = time_now.month();
-        mwaka = time_now.year();
-        day_  = time_now.dayOfTheWeek();
-
-        cabin_temperature = real_time.getTemperature();
-
-        if(hr > 24){
-            hr = 24; mint = 59; sec = 59;
-            Serial.println("Time Chip Failed!");
-        }
-
-        // ---- 12 hour correction ----
-        reminder = (hr % 12);
-        uint8_t display_hr = (hr <= 12) ? hr : reminder;
-        if(display_hr == 0) display_hr = 12;  // midnight case
-
-        // ---- Safe numeric conversions with zero padding ----
-        snprintf(hr_str,  sizeof(hr_str),  "%02u", display_hr);
-        snprintf(min_str, sizeof(min_str), "%02u", mint);
-        snprintf(sec_str, sizeof(sec_str), "%02u", sec);
-        snprintf(date_str,sizeof(date_str),"%02u", datey);
-        snprintf(yr_str,  sizeof(yr_str),  "%u", mwaka);
-
-        // ---- Copy text safely ----
-        snprintf(day_str,        sizeof(day_str),        "%s", daysOfTheWeek[day_]);
-        snprintf(mth_str,        sizeof(mth_str),        "%s", Moonth[mth-1]);
-        snprintf(short_mth_str,  sizeof(short_mth_str),  "%s", short_Month[mth-1]);
-
-        // ===============================
-        // Construct Time Strings
-        // ===============================
-
-        snprintf(ShortTime, sizeof(ShortTime), "%s:%s", hr_str, min_str);
-        snprintf(SystemTime, sizeof(SystemTime), "%s:%s", ShortTime, sec_str);
-        snprintf(ShortTime_am_pm, sizeof(ShortTime_am_pm),
-                 "%s %s", ShortTime, (hr < 12) ? "am" : "pm");
-
-        // ===============================
-        // Date suffix logic (fixed bug)
-        // ===============================
-        if(datey == 1 || datey == 21 || datey == 31)
-            snprintf(root, sizeof(root), "st");
-        else if(datey == 2 || datey == 22)
-            snprintf(root, sizeof(root), "nd");
-        else if(datey == 3 || datey == 23)
-            snprintf(root, sizeof(root), "rd");
-        else
-            snprintf(root, sizeof(root), "th");
-
-        // ===============================
-        // Construct Date Strings
-        // ===============================
-
-        snprintf(SystemDate, sizeof(SystemDate),
-                 "%s %s%s %s %s",
-                 day_str, date_str, root, mth_str, yr_str);
-
-        snprintf(ShortDate, sizeof(ShortDate),
-                 "%s-%s-%s",
-                 date_str, short_mth_str, yr_str);
-
-        // ===============================
-        // Debug Output
-        // ===============================
-        Serial.println();
-        Serial.print("Internal Temperature: "); Serial.println(cabin_temperature);
-        Serial.print("Short Time: "); Serial.println(ShortTime);
-        Serial.print("Short Time AM/PM: "); Serial.println(ShortTime_am_pm);
-        Serial.print("Full System Time: "); Serial.print(SystemTime);
-        Serial.print("\tSystem Date: "); Serial.println(SystemDate);
-        Serial.println();
-
-        // ===============================
-        // 10-Minute Trigger Logic
-        // ===============================
-        if(mint % 10 == 0){
-            if(!data_sent) can_send = true;
-            else can_send = false;
-        }
-        else{
-            data_sent = false;
-        }
-    }
-
-    // ===============================
-    // Fallback Timing Mode
-    // ===============================
-    else{
-        if(now_now_ms - last_upload_time_ms >= upload_fequency){
-            can_send = true;
-            last_upload_time_ms = now_now_ms;
-        }
-    }
-}
 
 
 uint16_t box_width  = 150;
@@ -5194,7 +4710,7 @@ bool shouldRotateScreen(uint64_t screen_time_ms = 0) {
 }
 
 void update_display(){
-
+    screen_is_changing = true;
     if((!shouldRotateScreen(now_now_ms)) && (!special_call)) // Most of the time: subtraction, compasison, branch, return...Calling a function every loop that usually returns immediately...microseconds
         return;
     //  proceed either only after timer expiring or after receiving a special call 
@@ -5224,12 +4740,31 @@ void update_display(){
         case 10: otaPage(); // showing OTA mode, WiFi, and IP
             break;
 
+        case 19: uploadScreen();
+            break;
+
         default: sleepPage();
         break;
     }
 
     LCD.hibernate();
     if(special_call)   special_call = false;  // reset after handling
+
+ screen_is_changing = false;
+
+}
+
+void uploadScreen(){
+        LCD.firstPage();
+    do {
+            LCD.fillScreen(GxEPD_WHITE);
+
+            LCD.setFont(&FreeSans12pt7b);
+            LCD.setTextColor(GxEPD_WHITE);
+            LCD.setCursor(20, 28);
+            LCD.print("Cloud Connectivity");
+
+    } while (LCD.nextPage());
 
 }
 
@@ -5326,7 +4861,7 @@ void cloudPage(){
 
         LCD.setFont(&FreeMono9pt7b);
         LCD.setCursor(10, y);
-        LCD.print(Uploader.get_upload_report());
+        //LCD.print(Uploader.get_upload_report());
 
         y += 20;
 
@@ -5335,7 +4870,7 @@ void cloudPage(){
         y += 15;
 
         LCD.setCursor(10, y);
-        LCD.print(Uploader.get_error_code());
+        //LCD.print(Uploader.get_error_code());
 
         footer();
 
@@ -5546,7 +5081,7 @@ void graphPage(){  //GRAPHS, CHARTS etc ----
     }
 
      LCD.setFont(&FreeMono9pt7b); LCD.setTextColor(GxEPD_RED); //FreeMono9pt7b
-     LCD.setCursor(70, 70); LCD.print(active_sensors); LCD.print(" sensors active");
+     LCD.setCursor(70, 70); LCD.print(active_sensors); LCD.print(" internal sensors active");
 
 
   } while (LCD.nextPage());
@@ -6116,7 +5651,7 @@ void otaPage() {
         
         LCD.setCursor(rightCardX + 10, cardY + 80);
         LCD.print("Status:");
-        LCD.setCursor(rightCardX + 60, cardY + 80);
+        LCD.setCursor(rightCardX + 70, cardY + 80);
         LCD.print(otaModeActive ? "ACTIVE" : "IDLE");
         
         // ===== OTA STATUS BAR =====
@@ -6625,7 +6160,7 @@ void footer(){
             LCD.setTextColor(GxEPD_WHITE);
     
             //DATE
-            LCD.setCursor(2, 290);  LCD.print(SystemDate); 
+            LCD.setCursor(2, 290);  LCD.print(clock_is_working?sawa.SystemDate:"Clock not working"); 
 
             //NETWORK BARS  // WIFI & UPLOADS
             LCD.fillRect(230, 293, 6, 5, GxEPD_WHITE); LCD.fillRect(240, 283, 6, 15, GxEPD_WHITE); LCD.fillRect(250, 274, 6, 25, GxEPD_WHITE);
@@ -6644,13 +6179,771 @@ void footer(){
             //TIME
             LCD.setTextColor(GxEPD_WHITE);
             LCD.setFont(&FreeSans9pt7b); //FreeMono12pt7b
-            LCD.setCursor(320, 290); LCD.print(ShortTime_am_pm);
-
+            LCD.setCursor(320, 290); LCD.print(sawa.ShortTime);
           //  LCD.setFont(&FreeMono9pt7b);
           //  LCD.setCursor(385, 292); LCD.print(DISP_MODE);
+}
+
+
+
+
+/*
+bool bind_dynamic_data_into_json(){
+  bool bound_successfully = false;
+           JSON_sendable.clear();
+           save_counter++; // save this into EEPROM or SPIFFS
+
+    // SYSTEM PARAMETERS
+        JsonObject System      = JSON_sendable["System"].to<JsonObject>();
+        System["FW_Version"]       = FW_VERSION;
+        System["Uptime"]           = (now_now_ms/1000); // convert into seconds
+        System["Date"] = SystemDate;
+        System["Time"] = SystemTime;
+        System["Datalog_Count"] = save_counter; 
+        System["Voltage"] = voltage;
+        System["Internal_Temp"] = cabin_temperature;
+        System["Internal_Fan"] = inner_fan_status;
+        System["OTA_Status"] = ota_log;
+        System["LastOTA_Update"] = LastOTAUpdate;
+
+        System["SD_REMAINING_SPACE"] = storage;
+
+        // SNAPSHOTS OF READINGS AT A CERTAIN TIME, NOT CUMMULATED MEDIANS/MEANS
+        JsonObject Dryer_Conditions      = JSON_sendable["Dryer_Conditions"].to<JsonObject>();
+        Dryer_Conditions["Active_Sensors"] = active_sensors;
+        Dryer_Conditions["Average_Temperature"] = average_temp;
+        Dryer_Conditions["Average_Humidity"] = average_humi;
+        Dryer_Conditions["Average_Pressure"] = average_press;
+
+        
+        //ALL SENSOR COMBINED SENSOR PARAMETERS
+        JsonObject All_Sensors      = JSON_sendable["All_Sensors"].to<JsonObject>();
+    for(int i = 0; i < active_sensors; i++){ 
+        All_Sensors["Temperature_Readings"][i] = historical_temperature_readings[i];
+        All_Sensors["Humidity_Readings"][i] = historical_humidity_readings[i];
+        All_Sensors["Pressure_Readings"][i] = historical_pressure_readings[i];
+        All_Sensors["Time"][i] = time_stamps[i];
+    }   
+
+        // ---------------- INDIVIDUAL SENSORS ----------------
+        // SENSOR 1 PARAMETERS
+      JsonObject Sensor_1    = JSON_sendable["Sensor_1"].to<JsonObject>();
+          Sensor_1["Position"]     = "AIR INLET 1";
+          Sensor_1["Temp"]      =   sensor_1_temp;
+          Sensor_1["Humi"]      =   sensor_1_humidity;
+          Sensor_1["Pressure"]  =   sensor_1_pressure;
+          Sensor_1["Last_Seen"] =   sensor_1_last_seen;
+          Sensor_1["Sends"]     =   sensor_1_transmissions;
+
+  
+        // SENSOR 2 PARAMETERS
+      JsonObject Sensor_2    = JSON_sendable["Sensor_2"].to<JsonObject>();
+          Sensor_2["Position"]     = "AIR INLET 2";
+          Sensor_2["Temp"]      =   sensor_2_temp;
+          Sensor_2["Humi"]      =   sensor_2_humidity;
+          Sensor_2["Pressure"]  =   sensor_2_pressure;
+          Sensor_2["Last_Seen"] =   sensor_2_last_seen;
+          Sensor_2["Sends"]     =   sensor_2_transmissions;
+
+
+        // SENSOR 3 PARAMETERS
+      JsonObject Sensor_3    = JSON_sendable["Sensor_3"].to<JsonObject>();
+          Sensor_3["Position"]     = "AIR OUTLET 1";
+          Sensor_3["Temp"]      =   sensor_3_temp;
+          Sensor_3["Humi"]      =   sensor_3_humidity;
+          Sensor_3["Pressure"]  =   sensor_3_pressure;
+          Sensor_3["Last_Seen"] =   sensor_3_last_seen;
+          Sensor_3["Sends"]     =   sensor_3_transmissions;
+
+
+        // SENSOR 4 PARAMETERS
+      JsonObject Sensor_4    = JSON_sendable["Sensor_4"].to<JsonObject>();
+          Sensor_4["Position"]     = "AIR OUTLET 2";
+          Sensor_4["Temp"]      =   sensor_4_temp;
+          Sensor_4["Humi"]      =   sensor_4_humidity;
+          Sensor_4["Pressure"]  =   sensor_4_pressure;
+          Sensor_4["Last_Seen"] =   sensor_4_last_seen;
+          Sensor_4["Sends"]     =   sensor_4_transmissions;
+
+
+        // SENSOR 5 PARAMETERS
+      JsonObject Sensor_5    = JSON_sendable["Sensor_5"].to<JsonObject>();
+          Sensor_5["Position"]     = "DRYING BED LOWEST";
+          Sensor_5["Temp"]      =   sensor_5_temp;
+          Sensor_5["Humi"]      =   sensor_5_humidity;
+          Sensor_5["Pressure"]  =   sensor_5_pressure;
+          Sensor_5["Last_Seen"] =   sensor_5_last_seen;
+          Sensor_5["Sends"]     =   sensor_5_transmissions;
+
+        // SENSOR 5 PARAMETERS
+      JsonObject Sensor_6    = JSON_sendable["Sensor_6"].to<JsonObject>();
+          Sensor_6["Position"]     = "DRYING BED MIDDLE";
+          Sensor_6["Temp"]      =   sensor_6_temp;
+          Sensor_6["Humi"]      =   sensor_6_humidity;
+          Sensor_6["Pressure"]  =   sensor_6_pressure;
+          Sensor_6["Last_Seen"] =   sensor_6_last_seen;
+          Sensor_6["Sends"]     =   sensor_6_transmissions;
+
+        // SENSOR 7 PARAMETERS
+      JsonObject Sensor_7    = JSON_sendable["Sensor_7"].to<JsonObject>();
+          Sensor_7["Position"]     = "DRYING BED TOP";
+          Sensor_7["Temp"]      =   sensor_7_temp;
+          Sensor_7["Humi"]      =   sensor_7_humidity;
+          Sensor_7["Pressure"]  =   sensor_7_pressure;
+          Sensor_7["Last_Seen"] =   sensor_7_last_seen;
+          Sensor_7["Sends"]     =   sensor_7_transmissions;
+
+        // SENSOR 5 PARAMETERS
+      JsonObject Sensor_8    = JSON_sendable["Sensor_8"].to<JsonObject>();
+          Sensor_8["Position"]     = "DRYING BED MIDDLE ZONE";
+          Sensor_8["Temp"]      =   sensor_8_temp;
+          Sensor_8["Humi"]      =   sensor_8_humidity;
+          Sensor_8["Pressure"]  =   sensor_8_pressure;
+          Sensor_8["Last_Seen"] =   sensor_8_last_seen;
+          Sensor_8["Sends"]     =   sensor_8_transmissions;
+
+        // SENSOR 5 PARAMETERS
+      JsonObject Sensor_9    = JSON_sendable["Sensor_9"].to<JsonObject>();
+          Sensor_9["Position"]     = "DRYING BED ENTRY ZONE";
+          Sensor_9["Temp"]      =   sensor_9_temp;
+          Sensor_9["Humi"]      =   sensor_9_humidity;
+          Sensor_9["Pressure"]  =   sensor_9_pressure;
+          Sensor_9["Last_Seen"] =   sensor_9_last_seen;
+          Sensor_9["Sends"]     =   sensor_9_transmissions;
+
+        // SENSOR 10 PARAMETERS
+      JsonObject Sensor_10    = JSON_sendable["Sensor_10"].to<JsonObject>();
+          Sensor_10["Position"]     = "DRYING BED EXIT ZONE";
+          Sensor_10["Temp"]      =   sensor_10_temp;
+          Sensor_10["Humi"]      =   sensor_10_humidity;
+          Sensor_10["Pressure"]  =   sensor_10_pressure;
+          Sensor_10["Last_Seen"] =   sensor_10_last_seen;
+          Sensor_10["Sends"]     =   sensor_10_transmissions;
+
+        // SENSOR 11 PARAMETERS
+      JsonObject Sensor_11    = JSON_sendable["Sensor_11"].to<JsonObject>();
+          Sensor_11["Position"]     = "DRYING BED RANDOM POSITION";
+          Sensor_11["Temp"]      =   sensor_11_temp;
+          Sensor_11["Humi"]      =   sensor_11_humidity;
+          Sensor_11["Pressure"]  =   sensor_11_pressure;
+          Sensor_11["Last_Seen"] =   sensor_11_last_seen;
+          Sensor_11["Sends"]     =   sensor_11_transmissions;
+
+        // SENSOR 12 PARAMETERS
+      JsonObject Sensor_12    = JSON_sendable["Sensor_12"].to<JsonObject>();
+          Sensor_12["Position"]     = "DRYING BED AMBIENT ZONE";
+          Sensor_12["Temp"]      =   sensor_12_temp;
+          Sensor_12["Humi"]      =   sensor_12_humidity;
+          Sensor_12["Pressure"]  =   sensor_12_pressure;
+          Sensor_12["Last_Seen"] =   sensor_12_last_seen;
+          Sensor_12["Sends"]     =   sensor_12_transmissions;
+
+
+          // SOLAR RADIATION DATA // WIND SPEED DATA
+      JsonObject Environment    = JSON_sendable["Environment"].to<JsonObject>();
+          Environment["Solar_Radiation"]     = average_solar_radiation;
+          Environment["Wind_Speed"]     = average_wind_speed;
+          
+          // --- Serialize into a buffer or string ---
+           size_t len = serializeJsonPretty(JSON_sendable, sendable_to_sd_card); /// to save to data.json, then as dada.csv
+           serializeJson(JSON_sendable, sendable_to_cloud_db);  // to send via the 4G SIM to upload_to_web_of_iot(sendable_to_cloud_db)
+
+      
+          if (active_sensors <= 0) { // to prevent garbage writes when sensors fail.
+              LOG("[JSON] No active sensors. Skipping bind.");
+              return false;
+          }
+          
+
+          if (len <= 0) {
+              LOG("[JSON] Serialization failed!");
+              return false;
+          }
+
+               
+          if (len > 0) {
+            bound_successfully = true;
+            
+            LOG("[JSON] Serialization successful.");
+            LOG("[JSON] Payload size: " + String(len) + " bytes");
+            LOG("[JSON] --- Payload Preview ---");
+            LOG(sendable_to_sd_card); // optional: can be commented out if too large//
+          } 
+          
+  return bound_successfully;
+
+ 
+}
+*/
+
+/* LOG SENSOR DROPOUTS AS WELL
+"Events": [
+  {"Type":"FAN_ON","Fan":"Cooling","Time":"14:32:10"},
+  {"Type":"SENSOR_LOST","Sensor":"S3","Duration_s":120}
+]
+*/
+
+/*
+
+void prepare_JSON_file(){ // bundle of JOY
+strcpy(httpsData, "");
+
+     JSON_data["PassKey"] = "Dryer_Kima";
+     JSON_data["Air_Temperature"] = temp1;  // float, env't temp, rs485
+     JSON_data["Air_Humidity"] = humidity;  // float, env't humi, rs485
+     JSON_data["Air_Speed"] =  wind_speed; // float, env't speed, rs485
+
+     JSON_data["Atmospheric_Pressure"] = atm_pressure;
+     JSON_data["Internal_Temp"] = cabin_temperature; 
+     JSON_data["Internal_Fan"] = innerFan_ON; 
+     JSON_data["Night_Light"] = night_Light_ON;
+
+     JSON_data["Voltage"] =  voltage;
+
+     JSON_data["ON_TIME"] = now_now_ms;
+     JSON_data["Hour"] = hr; 
+     JSON_data["Minute"] = mint;  
+     JSON_data["Second"] =  sec;
+     JSON_data["Date"] =  SystemDate;
+
+
+    serializeJson(JSON_data, httpsData);  //Serial.println(output);
+
+      
+}  
+
+*/
+
+
+
+
+/*
+✔ Only copy
+✔ Set a flag
+✔ Exit ASAP
+This is exactly what ESP-NOW callbacks should do.
+*/
+/*
+void OnSensorData_received(const uint8_t * mac, const uint8_t *incomingData, int len){
+     //   memcpy(&fetch, incomingData, min(len, sizeof(dryerData))); // no matching function for call to 'min(int&, unsigned int)'
+        // The compiler will complain because len is an int, while sizeof(dryerData) is an unsigned int (size_t).
+ // The template deduction for std::min() fails when the two arguments are of different signedness.
+
+        //Since memcpy length must be size_t, it’s best to cast explicitly: ... no template fights.
+        size_t weight_of_packet = (len < (int)sizeof(dryerData)) ? (size_t)len : sizeof(dryerData); // either sizeof of len
+        memcpy(&fetch, incomingData, weight_of_packet);
+
+        uint32_t size_of_packet = sizeof(dataPack);
+
+  //   memcpy(&fetch, incomingData, sizeof(dryerData)); //If len < sizeof(dryerData), memcpy will copy beyond valid incomingData.
+ //    strcpy(dataPack, fetch.received_data_bundle); // If the buffer is not null-terminated, strcpy() will read past the end.
+
+        strncpy(dataPack, fetch.received_data_bundle, size_of_packet-1); // Only copy and queue the packet in the callback:
+        dataPack[size_of_packet-1] = '\0';
+     // Serial.print("Size of received BUFF: "); Serial.println(size_of_packet);
+
+      //Serial.print("Received => "); Serial.println(dataPack);  delay(50);
+      packet_received = true;
+
+      //extract_readings();
+      //beep(1, 0); //flash();
+    // ESP-NOW callback should be FAST (this is critical)
+    //exit ASAP
+     
+}
+*/
+
+// this is called only when packet_received = true ... loop takes it back to false at the end of each
+  /*
+  📊 Direct Performance Rankings (Fastest to Slowest)
+      switch with consecutive integers ⚡ Fastest
+
+      else if chain with integer comparisons 🚀 Fast
+
+      if statements with integer comparisons 🏃 Medium
+
+      else if chain with string comparisons 🐌 Slow
+
+    if statements with string comparisons 🐌🐌 Slowest
+  */
+
+// how many milliseconds are used to execute this?
+/*
+void extract_readings(){
+      if(!packet_received) { LOG("No packet received!"); return; }  // this never runs, but just in case 
+       DeserializationError err = deserializeJson(JSON_data, dataPack);
+
+        if (err) {
+            Serial.print("JSON Deserialization Error: ");
+            Serial.println(err.c_str());
+            return;
+        }
+       // LOG(dataPack); // SEE WHAT HAS BEEN RECEIVED!
+
+          
+    const char * sensor_ID = JSON_data["S_ID"] | "unknown";
+
+     //fastest approach... as switch is Extremely fast for consecutive integers
+
+
+
+ int sensor_index_num = extract_sensor_number(sensor_ID); 
+  
+          switch (sensor_index_num) {
+              case 1: {
+                sensor_1_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
+                sensor_1_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
+                sensor_1_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
+                sensor_1_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
+                sensor_1_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
+                sensor_1_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
+                sensor_1_packet_size = JSON_data["PKT"] | 0;
+            
+                strncpy(sensor_1_transmissions,  JSON_data["Sends"], sizeof(sensor_1_transmissions)); // up to 11 bytes: e.g., "1234567890"
+                strncpy(sensor_1_CPU_freq,  JSON_data["CPU"], sizeof(sensor_1_CPU_freq)); // 11 bytes: "80MHz CPU"
+                
+                temperature_readings[0] = sensor_1_temp; humidity_readings[0] = sensor_1_humidity;  // arrays or indexes
+                strncpy(sensor_1_last_seen, SystemTime, sizeof(sensor_1_last_seen));      sensor_1_last_seen[sizeof(sensor_1_last_seen) - 1] = '\0'; 
+   
+              }
+                 break;
+              case 2:  {
+                    sensor_2_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
+                    sensor_2_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
+                    sensor_2_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
+                    sensor_2_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
+                    sensor_2_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
+                    sensor_2_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
+                    sensor_2_packet_size = JSON_data["PKT"] | 0;
+                
+                    strncpy(sensor_2_transmissions,  JSON_data["Sends"], sizeof(sensor_2_transmissions)); // up to 11 bytes: e.g., "1234567890"
+                    strncpy(sensor_2_CPU_freq,  JSON_data["CPU"], sizeof(sensor_2_CPU_freq)); // 11 bytes: "80MHz CPU"
+                    
+                    temperature_readings[0] = sensor_2_temp; humidity_readings[0] = sensor_2_humidity;  // arrays or indexes
+                    strncpy(sensor_2_last_seen, SystemTime, sizeof(sensor_2_last_seen));      sensor_2_last_seen[sizeof(sensor_2_last_seen) - 1] = '\0'; 
+   
+              }
+              break;
+
+                  case 3: {
+                      sensor_3_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
+                      sensor_3_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
+                      sensor_3_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
+                      sensor_3_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
+                      sensor_3_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
+                      sensor_3_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
+                      sensor_3_packet_size = JSON_data["PKT"] | 0;
+                  
+                      strncpy(sensor_3_transmissions, JSON_data["Sends"], sizeof(sensor_3_transmissions)); // up to 11 bytes: e.g., "1234567890"
+                      strncpy(sensor_3_CPU_freq, JSON_data["CPU"], sizeof(sensor_3_CPU_freq)); // 11 bytes: "80MHz CPU"
+                      
+                      temperature_readings[2] = sensor_3_temp; humidity_readings[2] = sensor_3_humidity;  // arrays or indexes
+                      strncpy(sensor_3_last_seen, SystemTime, sizeof(sensor_3_last_seen)); sensor_3_last_seen[sizeof(sensor_3_last_seen) - 1] = '\0'; 
+                  }
+                  break;
+                  
+                  case 4: {
+                      sensor_4_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
+                      sensor_4_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
+                      sensor_4_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
+                      sensor_4_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
+                      sensor_4_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
+                      sensor_4_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
+                      sensor_4_packet_size = JSON_data["PKT"] | 0;
+                  
+                      strncpy(sensor_4_transmissions, JSON_data["Sends"], sizeof(sensor_4_transmissions)); // up to 11 bytes: e.g., "1234567890"
+                      strncpy(sensor_4_CPU_freq, JSON_data["CPU"], sizeof(sensor_4_CPU_freq)); // 11 bytes: "80MHz CPU"
+                      
+                      temperature_readings[3] = sensor_4_temp; humidity_readings[3] = sensor_4_humidity;  // arrays or indexes
+                      strncpy(sensor_4_last_seen, SystemTime, sizeof(sensor_4_last_seen)); sensor_4_last_seen[sizeof(sensor_4_last_seen) - 1] = '\0'; 
+                  }
+                  break;
+                  
+                  case 5: {
+                      sensor_5_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
+                      sensor_5_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
+                      sensor_5_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
+                      sensor_5_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
+                      sensor_5_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
+                      sensor_5_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
+                      sensor_5_packet_size = JSON_data["PKT"] | 0;
+                  
+                      strncpy(sensor_5_transmissions, JSON_data["Sends"], sizeof(sensor_5_transmissions)); // up to 11 bytes: e.g., "1234567890"
+                      strncpy(sensor_5_CPU_freq, JSON_data["CPU"], sizeof(sensor_5_CPU_freq)); // 11 bytes: "80MHz CPU"
+                      
+                      temperature_readings[4] = sensor_5_temp; humidity_readings[4] = sensor_5_humidity;  // arrays or indexes
+                      strncpy(sensor_5_last_seen, SystemTime, sizeof(sensor_5_last_seen)); sensor_5_last_seen[sizeof(sensor_5_last_seen) - 1] = '\0'; 
+                  }
+                  break;
+                  
+                  case 6: {
+                      sensor_6_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
+                      sensor_6_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
+                      sensor_6_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
+                      sensor_6_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
+                      sensor_6_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
+                      sensor_6_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
+                      sensor_6_packet_size = JSON_data["PKT"] | 0;
+                  
+                      strncpy(sensor_6_transmissions, JSON_data["Sends"], sizeof(sensor_6_transmissions)); // up to 11 bytes: e.g., "1234567890"
+                      strncpy(sensor_6_CPU_freq, JSON_data["CPU"], sizeof(sensor_6_CPU_freq)); // 11 bytes: "80MHz CPU"
+                      
+                      temperature_readings[5] = sensor_6_temp; humidity_readings[5] = sensor_6_humidity;  // arrays or indexes
+                      strncpy(sensor_6_last_seen, SystemTime, sizeof(sensor_6_last_seen)); sensor_6_last_seen[sizeof(sensor_6_last_seen) - 1] = '\0'; 
+                  }
+                  break;
+                  
+                  case 7: {
+                      sensor_7_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
+                      sensor_7_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
+                      sensor_7_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
+                      sensor_7_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
+                      sensor_7_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
+                      sensor_7_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
+                      sensor_7_packet_size = JSON_data["PKT"] | 0;
+                  
+                      strncpy(sensor_7_transmissions, JSON_data["Sends"], sizeof(sensor_7_transmissions)); // up to 11 bytes: e.g., "1234567890"
+                      strncpy(sensor_7_CPU_freq, JSON_data["CPU"], sizeof(sensor_7_CPU_freq)); // 11 bytes: "80MHz CPU"
+                      
+                      temperature_readings[6] = sensor_7_temp; humidity_readings[6] = sensor_7_humidity;  // arrays or indexes
+                      strncpy(sensor_7_last_seen, SystemTime, sizeof(sensor_7_last_seen)); sensor_7_last_seen[sizeof(sensor_7_last_seen) - 1] = '\0'; 
+                  }
+                  break;
+                  
+                  case 8: {
+                      sensor_8_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
+                      sensor_8_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
+                      sensor_8_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
+                      sensor_8_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
+                      sensor_8_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
+                      sensor_8_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
+                      sensor_8_packet_size = JSON_data["PKT"] | 0;
+                  
+                      strncpy(sensor_8_transmissions, JSON_data["Sends"], sizeof(sensor_8_transmissions)); // up to 11 bytes: e.g., "1234567890"
+                      strncpy(sensor_8_CPU_freq, JSON_data["CPU"], sizeof(sensor_8_CPU_freq)); // 11 bytes: "80MHz CPU"
+                      
+                      temperature_readings[7] = sensor_8_temp; humidity_readings[7] = sensor_8_humidity;  // arrays or indexes
+                      strncpy(sensor_8_last_seen, SystemTime, sizeof(sensor_8_last_seen)); sensor_8_last_seen[sizeof(sensor_8_last_seen) - 1] = '\0'; 
+                  }
+                  break;
+                  
+                  case 9: {
+                      sensor_9_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
+                      sensor_9_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
+                      sensor_9_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
+                      sensor_9_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
+                      sensor_9_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
+                      sensor_9_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
+                      sensor_9_packet_size = JSON_data["PKT"] | 0;
+                  
+                      strncpy(sensor_9_transmissions, JSON_data["Sends"], sizeof(sensor_9_transmissions)); // up to 11 bytes: e.g., "1234567890"
+                      strncpy(sensor_9_CPU_freq, JSON_data["CPU"], sizeof(sensor_9_CPU_freq)); // 11 bytes: "80MHz CPU"
+                      
+                      temperature_readings[8] = sensor_9_temp; humidity_readings[8] = sensor_9_humidity;  // arrays or indexes
+                      strncpy(sensor_9_last_seen, SystemTime, sizeof(sensor_9_last_seen)); sensor_9_last_seen[sizeof(sensor_9_last_seen) - 1] = '\0'; 
+                  }
+                  break;
+                  
+                  case 10: {
+                      sensor_10_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
+                      sensor_10_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
+                      sensor_10_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
+                      sensor_10_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
+                      sensor_10_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
+                      sensor_10_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
+                      sensor_10_packet_size = JSON_data["PKT"] | 0;
+                  
+                      strncpy(sensor_10_transmissions, JSON_data["Sends"], sizeof(sensor_10_transmissions)); // up to 11 bytes: e.g., "1234567890"
+                      strncpy(sensor_10_CPU_freq, JSON_data["CPU"], sizeof(sensor_10_CPU_freq)); // 11 bytes: "80MHz CPU"
+                      
+                      temperature_readings[9] = sensor_10_temp; humidity_readings[9] = sensor_10_humidity;  // arrays or indexes
+                      strncpy(sensor_10_last_seen, SystemTime, sizeof(sensor_10_last_seen)); sensor_10_last_seen[sizeof(sensor_10_last_seen) - 1] = '\0'; 
+                  }
+                  break;
+                  
+                  case 11: {
+                      sensor_11_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
+                      sensor_11_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
+                      sensor_11_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
+                      sensor_11_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
+                      sensor_11_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
+                      sensor_11_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
+                      sensor_11_packet_size = JSON_data["PKT"] | 0;
+                  
+                      strncpy(sensor_11_transmissions, JSON_data["Sends"], sizeof(sensor_11_transmissions)); // up to 11 bytes: e.g., "1234567890"
+                      strncpy(sensor_11_CPU_freq, JSON_data["CPU"], sizeof(sensor_11_CPU_freq)); // 11 bytes: "80MHz CPU"
+                      
+                      temperature_readings[10] = sensor_11_temp; humidity_readings[10] = sensor_11_humidity;  // arrays or indexes
+                      strncpy(sensor_11_last_seen, SystemTime, sizeof(sensor_11_last_seen)); sensor_11_last_seen[sizeof(sensor_11_last_seen) - 1] = '\0'; 
+                  }
+                  break;
+                  
+                  case 12: {
+                      sensor_12_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
+                      sensor_12_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
+                      sensor_12_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
+                      sensor_12_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
+                      sensor_12_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
+                      sensor_12_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
+                      sensor_12_packet_size = JSON_data["PKT"] | 0;
+                  
+                      strncpy(sensor_12_transmissions, JSON_data["Sends"], sizeof(sensor_12_transmissions)); // up to 11 bytes: e.g., "1234567890"
+                      strncpy(sensor_12_CPU_freq, JSON_data["CPU"], sizeof(sensor_12_CPU_freq)); // 11 bytes: "80MHz CPU"
+                      
+                      temperature_readings[11] = sensor_12_temp; humidity_readings[11] = sensor_12_humidity;  // arrays or indexes
+                      strncpy(sensor_12_last_seen, SystemTime, sizeof(sensor_12_last_seen)); sensor_12_last_seen[sizeof(sensor_12_last_seen) - 1] = '\0'; 
+                  }
+                  break;
+                  
+                  default: {
+                      Serial.printf("Unknown sensor: %s\n", sensor_ID);
+                  }
+                  break;
+             
+         } // end of switch
+   
+    //  digitalWrite(sensor_indicator, HIGH); delay(50); digitalWrite(sensor_indicator, LOW);  // this delay might cause packet collisions
+    flash(now_now_ms, sensor_indicator, 50,0,0,0);
+    
+} // end of extractor
+ 
+*/
+
+      
+
+
+
+
+
+/*const char * sensor_2_ID = JSON_data["S_ID"] | "unknown";
+    
+    const char * sensor_3_ID = JSON_data["S_ID"] | "unknown"; const char * sensor_4_ID = JSON_data["S_ID"] | "unknown";
+    
+    const char * sensor_5_ID = JSON_data["S_ID"] | "unknown"; const char * sensor_6_ID = JSON_data["S_ID"] | "unknown";
+    
+    const char * sensor_7_ID = JSON_data["S_ID"] | "unknown"; const char * sensor_8_ID = JSON_data["S_ID"] | "unknown";
+    
+    const char * sensor_9_ID = JSON_data["S_ID"] | "unknown";  const char * sensor_10_ID = JSON_data["S_ID"] | "unknown";
+   
+    const char * sensor_11_ID = JSON_data["S_ID"] | "unknown"; const char * sensor_12_ID = JSON_data["S_ID"] | "unknown";
+  */
+
+/*
+//deserialize to assign char[] and floats accordingly
+void extract_readings(){
+  if(!packet_received) { LOG("No packet received!"); return; }  // this never runs, but just in case 
+      
+       DeserializationError err = deserializeJson(JSON_data, dataPack);
+
+        if (err) {
+            Serial.print("JSON Deserialization Error: ");
+            Serial.println(err.c_str());
+            return;
+        }
+       // LOG(dataPack); // SEE WHAT HAS BEEN RECEIVED!
+
+          
+    const char * sensor_ID = JSON_data["S_ID"] | "unknown"; 
+
+        if(strcmp(sensor_ID, "T_1") == 0){
+            sensor_1_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
+            sensor_1_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
+            sensor_1_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
+            sensor_1_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
+            sensor_1_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
+            sensor_1_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
+            sensor_1_packet_size = JSON_data["PKT"] | 0;
+        
+            strncpy(sensor_1_transmissions,  JSON_data["Sends"], sizeof(sensor_1_transmissions)); // up to 11 bytes: e.g., "1234567890"
+            strncpy(sensor_1_CPU_freq,  JSON_data["CPU"], sizeof(sensor_1_CPU_freq)); // 11 bytes: "80MHz CPU"
+            
+            temperature_readings[0] = sensor_1_temp; humidity_readings[0] = sensor_1_humidity;  // arrays or indexes
+            strncpy(sensor_1_last_seen, ShortTime, sizeof(sensor_1_last_seen));      sensor_1_last_seen[sizeof(sensor_1_last_seen) - 1] = '\0'; 
+      }
+
+      else if(strcmp(sensor_ID, "T_2") == 0){
+                  sensor_2_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
+                  sensor_2_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
+                  sensor_2_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
+                  sensor_2_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
+                  sensor_2_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
+                  sensor_2_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
+                  sensor_2_packet_size = JSON_data["PKT"] | 0;
+              
+                  strncpy(sensor_2_transmissions,  JSON_data["Sends"], sizeof(sensor_2_transmissions)); // up to 11 bytes: e.g., "1234567890"
+                  strncpy(sensor_2_CPU_freq,  JSON_data["CPU"], sizeof(sensor_2_CPU_freq)); // 11 bytes: "80MHz CPU"
+                  
+                  temperature_readings[0] = sensor_2_temp; humidity_readings[0] = sensor_2_humidity;  // arrays or indexes
+                  strncpy(sensor_2_last_seen, ShortTime, sizeof(sensor_2_last_seen));      sensor_2_last_seen[sizeof(sensor_2_last_seen) - 1] = '\0'; 
+      }
+
+      else if(strcmp(sensor_ID, "T_3") == 0){
+                  sensor_3_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
+                  sensor_3_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
+                  sensor_3_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
+                  sensor_3_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
+                  sensor_3_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
+                  sensor_3_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
+                  sensor_3_packet_size = JSON_data["PKT"] | 0;
+              
+                  strncpy(sensor_3_transmissions,  JSON_data["Sends"], sizeof(sensor_3_transmissions)); // up to 11 bytes: e.g., "1234567890"
+                  strncpy(sensor_3_CPU_freq,  JSON_data["CPU"], sizeof(sensor_3_CPU_freq)); // 11 bytes: "80MHz CPU"
+                  
+                  temperature_readings[2] = sensor_3_temp; humidity_readings[2] = sensor_3_humidity;  // arrays or indexes
+                  strncpy(sensor_3_last_seen, ShortTime, sizeof(sensor_3_last_seen));      sensor_3_last_seen[sizeof(sensor_3_last_seen) - 1] = '\0'; 
+      }
+
+      else if(strcmp(sensor_ID, "T_4") == 0){
+                  sensor_4_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
+                  sensor_4_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
+                  sensor_4_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
+                  sensor_4_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
+                  sensor_4_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
+                  sensor_4_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
+                  sensor_4_packet_size = JSON_data["PKT"] | 0;
+              
+                  strncpy(sensor_4_transmissions,  JSON_data["Sends"], sizeof(sensor_4_transmissions)); // up to 11 bytes: e.g., "1234567890"
+                  strncpy(sensor_4_CPU_freq,  JSON_data["CPU"], sizeof(sensor_4_CPU_freq)); // 11 bytes: "80MHz CPU"
+                  
+                  temperature_readings[3] = sensor_4_temp; humidity_readings[3] = sensor_4_humidity;  // arrays or indexes
+                  strncpy(sensor_4_last_seen, ShortTime, sizeof(sensor_4_last_seen));      sensor_4_last_seen[sizeof(sensor_4_last_seen) - 1] = '\0'; 
+      }
+
+      else if(strcmp(sensor_ID, "T_5") == 0){
+                  sensor_5_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
+                  sensor_5_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
+                  sensor_5_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
+                  sensor_5_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
+                  sensor_5_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
+                  sensor_5_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
+                  sensor_5_packet_size = JSON_data["PKT"] | 0;
+              
+                  strncpy(sensor_5_transmissions,  JSON_data["Sends"], sizeof(sensor_5_transmissions)); // up to 11 bytes: e.g., "1234567890"
+                  strncpy(sensor_5_CPU_freq,  JSON_data["CPU"], sizeof(sensor_5_CPU_freq)); // 11 bytes: "80MHz CPU"
+                  
+                  temperature_readings[4] = sensor_5_temp; humidity_readings[4] = sensor_5_humidity;  // arrays or indexes
+                  strncpy(sensor_5_last_seen, ShortTime, sizeof(sensor_5_last_seen));      sensor_5_last_seen[sizeof(sensor_5_last_seen) - 1] = '\0'; 
+      }
+
+      else if(strcmp(sensor_ID, "T_6") == 0){
+                  sensor_6_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
+                  sensor_6_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
+                  sensor_6_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
+                  sensor_6_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
+                  sensor_6_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
+                  sensor_6_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
+                  sensor_6_packet_size = JSON_data["PKT"] | 0;
+              
+                  strncpy(sensor_6_transmissions,  JSON_data["Sends"], sizeof(sensor_6_transmissions)); // up to 11 bytes: e.g., "1234567890"
+                  strncpy(sensor_6_CPU_freq,  JSON_data["CPU"], sizeof(sensor_6_CPU_freq)); // 11 bytes: "80MHz CPU"
+                  
+                  temperature_readings[5] = sensor_6_temp; humidity_readings[5] = sensor_6_humidity;  // arrays or indexes
+                  strncpy(sensor_6_last_seen, ShortTime, sizeof(sensor_6_last_seen));      sensor_6_last_seen[sizeof(sensor_6_last_seen) - 1] = '\0'; 
+      }
+
+      else if(strcmp(sensor_ID, "T_7") == 0){
+                  sensor_7_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
+                  sensor_7_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
+                  sensor_7_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
+                  sensor_7_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
+                  sensor_7_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
+                  sensor_7_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
+                  sensor_7_packet_size = JSON_data["PKT"] | 0;
+              
+                  strncpy(sensor_7_transmissions,  JSON_data["Sends"], sizeof(sensor_7_transmissions)); // up to 11 bytes: e.g., "1234567890"
+                  strncpy(sensor_7_CPU_freq,  JSON_data["CPU"], sizeof(sensor_7_CPU_freq)); // 11 bytes: "80MHz CPU"
+                  
+                  temperature_readings[6] = sensor_7_temp; humidity_readings[6] = sensor_7_humidity;  // arrays or indexes
+                  strncpy(sensor_7_last_seen, ShortTime, sizeof(sensor_7_last_seen));      sensor_7_last_seen[sizeof(sensor_7_last_seen) - 1] = '\0'; 
+      }
+
+      else if(strcmp(sensor_ID, "T_8") == 0){
+                  sensor_8_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
+                  sensor_8_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
+                  sensor_8_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
+                  sensor_8_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
+                  sensor_8_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
+                  sensor_8_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
+                  sensor_8_packet_size = JSON_data["PKT"] | 0;
+              
+                  strncpy(sensor_8_transmissions,  JSON_data["Sends"], sizeof(sensor_8_transmissions)); // up to 11 bytes: e.g., "1234567890"
+                  strncpy(sensor_8_CPU_freq,  JSON_data["CPU"], sizeof(sensor_8_CPU_freq)); // 11 bytes: "80MHz CPU"
+                  
+                  temperature_readings[7] = sensor_8_temp; humidity_readings[7] = sensor_8_humidity;  // arrays or indexes
+                  strncpy(sensor_8_last_seen, ShortTime, sizeof(sensor_8_last_seen));      sensor_8_last_seen[sizeof(sensor_8_last_seen) - 1] = '\0'; 
+      }
+
+      else if(strcmp(sensor_ID, "T_9") == 0){
+                  sensor_9_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
+                  sensor_9_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
+                  sensor_9_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
+                  sensor_9_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
+                  sensor_9_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
+                  sensor_9_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
+                  sensor_9_packet_size = JSON_data["PKT"] | 0;
+              
+                  strncpy(sensor_9_transmissions,  JSON_data["Sends"], sizeof(sensor_9_transmissions)); // up to 11 bytes: e.g., "1234567890"
+                  strncpy(sensor_9_CPU_freq,  JSON_data["CPU"], sizeof(sensor_9_CPU_freq)); // 11 bytes: "80MHz CPU"
+                  
+                  temperature_readings[8] = sensor_9_temp; humidity_readings[8] = sensor_9_humidity;  // arrays or indexes
+                  strncpy(sensor_9_last_seen, ShortTime, sizeof(sensor_9_last_seen));      sensor_9_last_seen[sizeof(sensor_9_last_seen) - 1] = '\0'; 
+      }
+
+      else if(strcmp(sensor_ID, "T_10") == 0){
+                  sensor_10_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
+                  sensor_10_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
+                  sensor_10_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
+                  sensor_10_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
+                  sensor_10_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
+                  sensor_10_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
+                  sensor_10_packet_size = JSON_data["PKT"] | 0;
+              
+                  strncpy(sensor_10_transmissions,  JSON_data["Sends"], sizeof(sensor_10_transmissions)); // up to 11 bytes: e.g., "1234567890"
+                  strncpy(sensor_10_CPU_freq,  JSON_data["CPU"], sizeof(sensor_10_CPU_freq)); // 11 bytes: "80MHz CPU"
+                  
+                  temperature_readings[9] = sensor_10_temp; humidity_readings[9] = sensor_10_humidity;  // arrays or indexes
+                  strncpy(sensor_10_last_seen, ShortTime, sizeof(sensor_10_last_seen));      sensor_10_last_seen[sizeof(sensor_10_last_seen) - 1] = '\0'; 
+      }
+
+      else if(strcmp(sensor_ID, "T_11") == 0){
+                  sensor_11_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
+                  sensor_11_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
+                  sensor_11_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
+                  sensor_11_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
+                  sensor_11_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
+                  sensor_11_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
+                  sensor_11_packet_size = JSON_data["PKT"] | 0;
+              
+                  strncpy(sensor_11_transmissions,  JSON_data["Sends"], sizeof(sensor_11_transmissions)); // up to 11 bytes: e.g., "1234567890"
+                  strncpy(sensor_11_CPU_freq,  JSON_data["CPU"], sizeof(sensor_11_CPU_freq)); // 11 bytes: "80MHz CPU"
+                  
+                  temperature_readings[10] = sensor_11_temp; humidity_readings[10] = sensor_11_humidity;  // arrays or indexes
+                  strncpy(sensor_11_last_seen, ShortTime, sizeof(sensor_11_last_seen));      sensor_11_last_seen[sizeof(sensor_11_last_seen) - 1] = '\0'; 
+      }
+
+      else if(strcmp(sensor_ID, "T_12") == 0){
+                  sensor_12_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
+                  sensor_12_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
+                  sensor_12_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
+                  sensor_12_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
+                  sensor_12_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
+                  sensor_12_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
+                  sensor_12_packet_size = JSON_data["PKT"] | 0;
+              
+                  strncpy(sensor_12_transmissions,  JSON_data["Sends"], sizeof(sensor_12_transmissions)); // up to 11 bytes: e.g., "1234567890"
+                  strncpy(sensor_12_CPU_freq,  JSON_data["CPU"], sizeof(sensor_12_CPU_freq)); // 11 bytes: "80MHz CPU"
+                  
+                  temperature_readings[11] = sensor_12_temp; humidity_readings[11] = sensor_12_humidity;  // arrays or indexes
+                  strncpy(sensor_12_last_seen, ShortTime, sizeof(sensor_12_last_seen));      sensor_12_last_seen[sizeof(sensor_12_last_seen) - 1] = '\0'; 
+      }
+
+        else {
+               Serial.printf("Unknown sensor: %s\n", sensor_ID);
+             }
 
 }
 
+*/
 
 
 
