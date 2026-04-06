@@ -1,12 +1,14 @@
-/* WIRELESS DRYER DATALOGGING SYSTEM FOR SUSAN MBACHO, FOR THE 13mX7m DRYER IN MUARIK*/
+#include <Arduino.h>
+
+/* WIRELESS DRYER DATALOGGING SYSTEM FOR SUSAN MBACHO, FOR THE 13mX6m DRYER IN MUARIK*/
 
 const char *OTA_PASS = "12!34";
 const char *devicename = "Dryer_Datalogger";
-const char *server_address = "https://webofiot.com/dryers/muarik/susan_databank/server.php";
+const char *server_address = "https://webofiot.com/dryers/muarik/susan_databank/api/server.php/";
 
 const char Manufacturer[15] = "IntelliSys UG";
 const char DeviceID[32] = "Dryer Monitoring System";
-const char DeviceClient[36] = "Susan M PhD Project, MUARIK";
+const char DeviceClient[36] = "Susan Mbacho PhD, MUARIK";
 const int SystemAddress[] = {0x68, 0xFE, 0x71, 0x88, 0x1A, 0x6C}; 
 
 //const char *file_heading = "Report,for,Hybrid,Solar,Dryer,at,Makerere,University,Agricultural,Research,Institute, Kabanyolo,(MUARIK)\n";
@@ -25,6 +27,9 @@ char new_name[64];
 static char json_log_file[64] = "/data.json"; // primary storage file
 static char csv_log_file[64] = "/data.csv"; // secondary storage file
 
+static const char* UPLOAD_QUEUE_FILE  = "/upload_q.csv";
+
+
 char apiKeyValue[12] = "DRYER_006"; //MUARIK TOKEN
 
 char ESP_IDF_VER[50] = "ESP-IDF Version: ";
@@ -34,7 +39,6 @@ char FW_VERSION[50] = "v3.3.5-Dryer_Datalogger";
 #define USE_VSPI_FOR_SD
 #define USE_HSPI_FOR_EPD
 
-#include <Arduino.h>
 #include "Wire.h"
 #include "SPI.h"
 #include "FS.h"
@@ -69,6 +73,8 @@ char FW_VERSION[50] = "v3.3.5-Dryer_Datalogger";
 #include "WiFi_Manager.h"
 #include "upload.h"
 
+#include "esp_task_wdt.h"
+// WATCH DOG SHOULD THERE BE A HANG ESP IN CONNECTIVITY
 
 #include <ArduinoJson.h>
 StaticJsonDocument<2000> JSON_data;
@@ -102,6 +108,7 @@ const int PACKET_TASK_PRIORITY = 3; // Higher than normal tasks
 const int PACKET_STACK_SIZE = 12288; // 12kB
 TaskHandle_t packetTaskHandle = NULL;
 
+uint64_t upload_interval_ms = 60ULL * 60ULL * 1000ULL; // 1 hour
 
 
 // For debug logging
@@ -190,7 +197,6 @@ const uint8_t night_Light = //27; // 27 is taken
 
 
 
-
  //HSPI (Second hardware SPI bus)
 //SCK → GPIO 14, MISO → GPIO 12, MOSI → GPIO 13, CS → GPIO 15
 // REMAPPED TO  MOSI:25, CS:4 SCK:26
@@ -238,7 +244,8 @@ GPIO 15
 
 bool json_bound_successfully = false;
 bool csv_bound_successfully = false;
-         
+bool upload_queue_saved = false;
+
 bool wifi_connected = false;
 uint32_t WiFi_Strength = 0;
 char ota_log[150] = "...";
@@ -257,6 +264,7 @@ char last_upload_time[32] = "Never!";
 
 char upload_error_code[100] = "";
 
+char table_log[32] = "...";
 
 
 float aggregate_sensor_humidities();
@@ -268,6 +276,32 @@ TimerKeeper sawa;
 
 bool clock_is_working = false;
 char clock_status_msg[64] = "Not Started!";
+
+
+uint8_t copied_entry = 0;
+
+uint64_t successful_uploads = 0;
+char successful_uploads_c[20] = ""; // 18
+
+// ── Tuneable constants ──────────────────────────────────────────────────────
+static const size_t UPLOAD_BUFFER_SIZE     = 10000; // 20-60 sendable_to_sd_card_csv entries
+static const size_t UPLOAD_BUFFER_DANGER   = 8000; // ~80% full → force clear oldest
+static const uint8_t ENTRIES_PER_UPLOAD    = 20; // 10;
+static const uint8_t MAX_UPLOAD_FAILS = 3; // after 3 misses, drop oldest batch or else buffer chokes
+uint8_t upload_fail_count = 0;
+
+char sendable_to_cloud_db[UPLOAD_BUFFER_SIZE] = ""; 
+
+
+// Global declarations (add to your global variables)
+char upload_accumulator_buffer[UPLOAD_BUFFER_SIZE];  // 10KB buffer
+uint16_t accumulated_entries = 0;
+bool data_ready_for_upload = false;
+char accumulator_log[128];
+
+
+bool otaModeActive = false;
+
 
 bool esp_now_initialized = false;
 char esp_now_status_msg[64] = "Not Started";
@@ -287,6 +321,8 @@ float new_average_temp = 0.0f;
 
 // readings for up to 10 minutes ago
 float historical_outside_temperatures[10] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+float historical_outside_humidities[10] =  {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+float historical_outside_pressures[10] =  {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
 
 float historical_temperature_readings[10] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
 float historical_humidity_readings[10] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
@@ -314,8 +350,26 @@ char storage_size_char[64];
 
 
 
-uint8_t hr = 0, mint = 0, sec = 0, day_ = 0, mth = 0, yr = 0; uint16_t mwaka = 2000; 
+char upload_report[512];
 
+
+char temp_str[10] = "__";  // no reading yet
+char humi_str[10] = "__"; // no reading yet
+
+
+char temps_log[256];
+char humis_log[256];
+
+
+char sendable_to_cloud_csv[1024]; // 45+ fields × ~10 chars avg = ~440 bytes + lot of margin
+char csv_cloud_bind_log[512];
+char csv_cloud_save_log[512];
+
+// time series averages
+uint8_t active_sensors = 0;
+float temperature_readings[12] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+float humidity_readings[12] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+float pressure_readings[12] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
 
 
 
@@ -325,26 +379,6 @@ float humidity = 0.00;
 float atm_pressure = 0.00;
 float elevation = 0.00;
 
-
-
-char temp_str[10] = "__";  // no reading yet
-char humi_str[10] = "__"; // no reading yet
-char temp_str_log[50] = "...";
-char humi_str_log[50] = "...";
-char temp_log[320] = "";
-char humi_log[320] = "";
-
-
-// time series averages
-
-uint8_t active_sensors = 0;
-float temperature_readings[12] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-float humidity_readings[12] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-float pressure_readings[12] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-
-float sensor_1_temp_readings[30];
-float sensor_1_humi_readings[30];
-float sensor_1_press_readings[30];
 
 float highest_temperature = -100.0f; // initialize to a very low value to ensure any valid reading will be higher
 float lowest_temperature = 200.0f; // initialize to a very high value to ensure
@@ -359,17 +393,13 @@ float temperature_deviation = 0.0f; // to track how much the current temperature
 float humidity_deviation = 0.0f; // same for humidity
 
 
-uint64_t last_seen[12] = {0, 0, 0, 0, 0, 0};
-
-
-
 
 
 
 
 
 char voltage_string[10] = ""; 
-double voltage = 0.00;
+float voltage = 0.0f;
 uint8_t no_of_batts = 1; // 1 for 12V, 2 batts for 24V, 4 batts for 48V
 
 char initializer[100] = "Now Booting...";
@@ -419,9 +449,6 @@ char sensor_9_last_seen[12] = "--:--"; char sensor_10_last_seen[12] = "--:--"; c
 uint64_t sensor_1_last_seen_ms = 0; uint64_t sensor_2_last_seen_ms = 0; uint64_t sensor_3_last_seen_ms = 0; uint64_t sensor_4_last_seen_ms = 0;
 uint64_t sensor_5_last_seen_ms = 0; uint64_t sensor_6_last_seen_ms = 0; uint64_t sensor_7_last_seen_ms = 0; uint64_t sensor_8_last_seen_ms = 0;
 uint64_t sensor_9_last_seen_ms = 0; uint64_t sensor_10_last_seen_ms = 0; uint64_t sensor_11_last_seen_ms = 0; uint64_t sensor_12_last_seen_ms = 0;
-
-
-bool otaModeActive = false;
                       
 
 //function prototypes
@@ -457,7 +484,10 @@ char save_log[512] = "No JSON Saved!";
 char json_save_log[512] = "Not Saved!";
 char csv_save_log[512] = "not Saved!";
 
-char dataPack[250] = ""; // receivable
+char json_serialization_log[512] = "JSON Serialization Not Done!";
+char csv_bind_log[512] = "CSV Serialization Not Done!";
+
+
 void extract_readings();
 
 void OnSensorData_received(const uint8_t * mac, const uint8_t *incomingData, int len);
@@ -483,7 +513,8 @@ upload Uploader(wifi_led, server_address);
 
 bool data_sent = false; // how to log missed sends
 char upload_log[150] = "Nothing Yet Uploaded!";
-
+bool last_upload_success = false;
+uint16_t last_http_code = 0;
 char time_of_weather[32] = "--:--";
 
 void monitor_weather();
@@ -552,8 +583,24 @@ const int PACKET_STACK_SIZE = 16384;
 void extract_readings_from_packet(ReceivedPacket *packet);
 */
 
+
+uint64_t    packet_loss_counter = 1;
+uint64_t total_packets_received = 0;
+
+
+size_t json_currentSize = 0; // base file ...  before rotating
+size_t csv_currentSize = 0; // base file ...  before rotating
+
+
 volatile bool display_needs_update = false;
 
+uint8_t hawa = 0;
+
+#include "time.h"
+
+const char* ntpServer = "pool.ntp.org";
+const long gmtOffset_sec = 0;     // Change for your timezone
+const int daylightOffset_sec = 3600; // Change for DST
 
 void setup() { delay(50); // for OTA to fully hand over
        Serial.begin(115200); Serial.print(devicename); Serial.println(" Booting..."); // while (!Serial) delay(100);   // wait for native usb
@@ -582,7 +629,16 @@ void setup() { delay(50); // for OTA to fully hand over
         sd_initialized = initialize_sd_card(); //USES HSPI HARDWARE SERIAL
 
 
-        if (sd_initialized)     check_storage_files();
+        if (sd_initialized)   {
+                setup_sd_files(); delay(1000);
+                check_storage_files();
+        }
+
+                
+          // setup() checks for existence --- if not, it creates them
+         //  config file, JSON file, CSV accumulation file, csv upload file....
+        //
+
         
         delay(1000);
 
@@ -634,9 +690,55 @@ void setup() { delay(50); // for OTA to fully hand over
 
       pinMode(innerFAN, OUTPUT); digitalWrite(innerFAN, LOW); 
     
+        // 1. RTC first — no WiFi needed
+        clock_is_working = sawa.initialize_RTC();
+
+        if(clock_is_working){
+            sawa.query_rtc();
+             snprintf(clock_status_msg, sizeof(clock_status_msg),"RTC Clock is working. Time => %s, Date =>%s", sawa.SystemTime, sawa.SystemDate);
+             LOG(clock_status_msg);
     
-      clock_is_working = sawa.initialize_RTC();
-      snprintf(clock_status_msg, sizeof(clock_status_msg), "RTC Clock: %s", clock_is_working ? "Initialized Successfully" : "Initialization Failed!");
+        // 2. WiFi up — using your existing manager
+        WiFiMgrStatus wifi_status = wifi_obj.initialize_ESP_WiFi(devicename);
+        bool wifi_ready = (wifi_status == WIFI_MGR_SUCCESS);
+
+        // 3. NTP sync while WiFi is still up
+        if (wifi_ready) { LOG("Checking for time over WiFi...");
+            bool ntp_ok = wifi_obj.sync_ntp(10800, 0, 10);  // UTC+3 Kampala, no DST
+
+            if (ntp_ok) { LOG("Using network time to set RTC time");
+                sawa.apply_ntp_time(wifi_obj.ntp_timeinfo);
+            }
+        }
+
+        else {
+            LOG("CANNOT FIND WIFI FOR NETWORK TIME");
+        }
+
+        // 4. Tear down WiFi cleanly before ESP-NOW takes the radio
+        WiFi.disconnect(true);
+        WiFi.mode(WIFI_OFF);
+        delay(500);
+
+        }
+
+         // 5. Status log
+        snprintf(clock_status_msg, sizeof(clock_status_msg),
+            "RTC: %s | NTP: %s | Time: %s | Date: %s",
+            clock_is_working        ? "OK"      : "FAILED",
+            wifi_obj.ntp_synced     ? "Synced"  : "Not synced",
+            sawa.SystemTime,
+            sawa.SystemDate);
+
+            LOG(clock_status_msg);
+
+        // 6. ESP-NOW takes over
+        esp_now_initialized = packetHandler.begin();
+        snprintf(esp_now_status_msg, sizeof(esp_now_status_msg), "%s",
+            esp_now_initialized ? "ESP-NOW Initialization Successful!"
+                                : "Failed to initialize packet handler!");
+
+       
 
     /*
         Serial.print("Starting Realtime Clock...");
@@ -698,17 +800,12 @@ void setup() { delay(50); // for OTA to fully hand over
     
     */
 
-
-        esp_now_initialized = packetHandler.begin(); // pinned to core 0: has espnow, callbacks, and queue creation inside
-    if (!esp_now_initialized) snprintf(esp_now_status_msg, sizeof(esp_now_status_msg), "Failed to initialize packet handler!");
-        
-    else     snprintf(esp_now_status_msg, sizeof(esp_now_status_msg), "ESP-NOW Initialization Successful!");
-    // HANDLES onDataReceived
     
 
         digitalWrite(blinker, HIGH); delay(1000);
         digitalWrite(blinker, LOW);
 
+    init_log_strings();
         
     // Initialize timers AFTER hardware is ready
       last_read_time_ms = esp_timer_get_time() / 1000ULL;
@@ -743,7 +840,7 @@ void setup() { delay(50); // for OTA to fully hand over
         }
         */
 
-        monitor_box_conditions();
+        MonitorCabinet();
 
         monitor_dryer_readings(); 
 
@@ -765,8 +862,188 @@ void setup() { delay(50); // for OTA to fully hand over
          buzzer.beep(2,50,50);  // END OF BOOT
          Serial.println("Done Booting!");
     
+        // Enable watchdog (timeout after 60 seconds)
+    esp_task_wdt_init(60, true);
+    esp_task_wdt_add(NULL);
+    
 
 }
+
+// ============================================================
+// FUNCTION 1: setup_sd_files()
+// Purpose: Create ALL necessary SD card files if missing
+// Call this ONCE after SD card initialization
+// ============================================================
+void setup_sd_files() {
+    if (!storage_initialized) {
+        LOG("[SD] Cannot setup files - storage not initialized");
+        return;
+    }
+
+    LOG("[SD] Checking/creating required files...");
+    
+    // Archive CSV
+    if (!SD.exists(csv_log_file)) {
+        File f = SD.open(csv_log_file, FILE_WRITE);
+        if (f) { 
+            f.close(); 
+            LOG("[SD] Created archive CSV file");
+        } else { 
+            LOG("[SD] ERROR: Could not create archive CSV");
+        }
+    }
+
+    // JSON log
+    if (!SD.exists(json_log_file)) {
+        File f = SD.open(json_log_file, FILE_WRITE);
+        if (f) { 
+            f.close(); 
+            LOG("[SD] Created JSON log file");
+        } else { 
+            LOG("[SD] ERROR: Could not create JSON log");
+        }
+    }
+
+    // Upload queue
+    if (!SD.exists(UPLOAD_QUEUE_FILE)) {
+        File f = SD.open(UPLOAD_QUEUE_FILE, FILE_WRITE);
+        if (f) { 
+            f.close(); 
+            LOG("[SD] Created upload queue file");
+        } else { 
+            LOG("[SD] ERROR: Could not create upload queue");
+        }
+    }
+
+    // System log
+    if (!SD.exists("/system_logs.txt")) {
+        File f = SD.open("/system_logs.txt", FILE_WRITE);
+        if (f) { 
+            f.close(); 
+            LOG("[SD] Created system log file");
+        } else { 
+            LOG("[SD] ERROR: Could not create system log");
+        }
+    }
+    
+    LOG("[SD] File setup complete");
+}
+
+// ============================================================
+// FUNCTION 2: check_storage_files()
+// Purpose: Check storage status, file sizes, and rotate if needed
+// Call this PERIODICALLY (every few minutes/hour)
+// ============================================================
+bool check_storage_files() {
+    // Guard clause
+    if (!storage_initialized) {
+        snprintf(storage_status_log, sizeof(storage_status_log),
+                 "SD: Init Error. Will retry later");
+        LOG(storage_status_log);
+        return false;
+    }
+
+    // ========== 1. Get Storage Statistics ==========
+    totalBytes = SD.totalBytes();
+    usedBytes = SD.usedBytes();
+
+    float usedMB = usedBytes / 1048576.0f;      // Convert to MB
+    float freeMB = (totalBytes - usedBytes) / 1048576.0f;
+    float freeGB = freeMB / 1024.0f;
+
+    // Clear and rebuild status log (don't append to old)
+    snprintf(storage_status_log, sizeof(storage_status_log),
+             "SD: Used: %.2fMB, Free: %.2fGB", usedMB, freeGB);
+
+    // ========== 2. Ensure JSON File Exists ==========
+    if (!SD.exists(json_log_file)) {
+        strncat(storage_status_log, " | Creating JSON file",
+                sizeof(storage_status_log) - strlen(storage_status_log) - 1);
+        
+        File f = SD.open(json_log_file, FILE_WRITE);
+        if (!f) {
+            strncat(storage_status_log, " | FAILED",
+                    sizeof(storage_status_log) - strlen(storage_status_log) - 1);
+            LOG(storage_status_log);
+            return false;
+        }
+        f.close();
+    }
+
+    // ========== 3. Get JSON File Size ==========
+    File f = SD.open(json_log_file, FILE_READ);
+    if (!f) {
+        strncat(storage_status_log, " | Cannot read JSON",
+                sizeof(storage_status_log) - strlen(storage_status_log) - 1);
+        LOG(storage_status_log);
+        return false;
+    }
+    json_currentSize = f.size();
+    f.close();
+
+    // ========== 4. Get CSV File Size ==========
+    File f2 = SD.open(csv_log_file, FILE_READ);
+    if (!f2) {
+        strncat(storage_status_log, " | Cannot read CSV",
+                sizeof(storage_status_log) - strlen(storage_status_log) - 1);
+        LOG(storage_status_log);
+        return false;
+    }
+    size_t csv_currentSize = f2.size();
+    f2.close();
+
+    // ========== 5. Add File Sizes to Status ==========
+    float size_of_json_file = json_currentSize / 1048576.0f;
+    float size_of_csv_file = csv_currentSize / 1048576.0f;
+    
+    snprintf(storage_status_log + strlen(storage_status_log),
+             sizeof(storage_status_log) - strlen(storage_status_log),
+             ", JSON: %.2fMB, CSV: %.2fMB", 
+             size_of_json_file, size_of_csv_file);
+
+    // ========== 6. Check if Rotation Needed ==========
+    if (json_currentSize > MAX_FILE_SIZE) {
+        strncat(storage_status_log, " | Rotating JSON...",
+                sizeof(storage_status_log) - strlen(storage_status_log) - 1);
+        
+        // Check total storage before rotation
+        if (usedBytes > MAX_TOTAL_SIZE) {
+            strncat(storage_status_log, " | STORAGE FULL!",
+                    sizeof(storage_status_log) - strlen(storage_status_log) - 1);
+            LOG(storage_status_log);
+            return false;
+        }
+        
+        // Perform rotation
+        File newFile = create_another_file();
+        if (newFile) {
+            strncat(storage_status_log, " | OK",
+                    sizeof(storage_status_log) - strlen(storage_status_log) - 1);
+            newFile.close();
+            json_currentSize = 0;  // Reset after rotation
+        } else {
+            strncat(storage_status_log, " | ROTATION FAILED",
+                    sizeof(storage_status_log) - strlen(storage_status_log) - 1);
+            LOG(storage_status_log);
+            return false;
+        }
+    }
+    
+    // ========== 7. Also rotate CSV if needed ==========
+    if (csv_currentSize > MAX_CSV_FILE_SIZE) {
+        strncat(storage_status_log, " | Rotating CSV...",
+                sizeof(storage_status_log) - strlen(storage_status_log) - 1);
+        
+        File newCSV = create_another_csv_file();
+        if (newCSV) {
+            newCSV.close();
+        }
+    }
+    
+    LOG(storage_status_log);
+    return true;
+}
+
 
 
 
@@ -779,46 +1056,7 @@ void BuzzingTask(void * pvParams) {
   }
 }
 
-/*
-void esp_now_packet_handler_task(void * pvParams) { 
-  uint8_t checkin_frequency = 1; // check each millisecond to ensure no packet is lost
- TickType_t prev_check_time = xTaskGetTickCount();
 
-  const TickType_t xDelay = pdMS_TO_TICKS(checkin_frequency);
-  while (true) {
-      if(packet_received) {  extract_readings(); packet_received = false; buzzer.beep(1,50,0);  } //this runs async but what happens when all crossfire
-      vTaskDelay(xDelay); // or use vTashdelayUntil
-  }
-} 
-
-*/
-
-/*
-void esp_now_packet_handler_task(void *pvParams) {
-    ReceivedPacket packet;
-
-    while (true) {
-        if (xQueueReceive(packetQueue, &packet, portMAX_DELAY) == pdTRUE) {
-
-            extract_readings_from_packet(&packet);
-
-            buzzer.beep(1, 50, 0);
-
-        }
-    }
-}
-*/
-
-
-uint64_t    packet_loss_counter = 1;
-uint64_t total_packets_received = 0;
-
-
-size_t jsonSize = 0; // base file ...  before rotating
-size_t csvSize  = 0; // base file ...  before rotating
-
-size_t json_currentSize = 0;
-size_t csv_currentSize = 0;
 
 
 void enable_sd_card(){
@@ -905,117 +1143,6 @@ bool initialize_sd_card() { // “Is the SD card hardware usable?”
     return status;
 }
 
-bool check_storage_files() {
-
-    if (!storage_initialized) {
-         strncat(storage_status_log, " SD: Init Error. Will retry later",
-                sizeof(storage_status_log) - strlen(storage_status_log) - 1);
-        return false;
-    }
-
-    bool status = false;
-        /*
-                usedSpace = (SD.usedBytes()) / (1024 * 1024);
-                //usedSpace /= 1000.0;
-                freeSpace = (sd_storage_size*1000) - (float)(usedSpace);
-                freeSpace /= 1000.0;
-        */
-
-         totalBytes = SD.totalBytes();
-         usedBytes  = SD.usedBytes();
-
-        float usedMB = usedBytes / 1048576.0;      // avoids intermediate rounding of  1024*1024
-        float freeMB = (totalBytes - usedBytes) / (1024.0 * 1024.0);
-
-        float freeGB = freeMB / 1024.0; // using binary units ... 1073741824.0 from 1024*1024*1024
-
-   
-
-    snprintf(storage_status_log + strlen(storage_status_log),
-             sizeof(storage_status_log) - strlen(storage_status_log),
-             ", Used: %.2fMB, Free: %.2fGB", usedMB, freeGB);
-
-    // Check/create JSON log file
-    if (!SD.exists(json_log_file)) {
-
-        strncat(storage_status_log, " | Creating new log file",
-                sizeof(storage_status_log) - strlen(storage_status_log) - 1);
-
-        File f = SD.open(json_log_file, FILE_WRITE);
-        if (!f) {
-            strncat(storage_status_log, " | FAILED to create file",
-                    sizeof(storage_status_log) - strlen(storage_status_log) - 1);
-            return false;
-        }
-        f.close();
-    }
-
-    File f = SD.open(json_log_file, FILE_READ);
-    if (!f) {
-        strncat(storage_status_log, " | Cannot open file for size check",
-                sizeof(storage_status_log) - strlen(storage_status_log) - 1);
-        return false;
-    }
-
-     json_currentSize = f.size();
-
-    f.close();
-
-    
-    File f2 = SD.open(csv_log_file, FILE_READ);
-    if (!f2) {
-        strncat(storage_status_log, " | Cannot open file for size check",
-                sizeof(storage_status_log) - strlen(storage_status_log) - 1);
-        return false;
-    }
-
-    size_t csv_currentSize = f2.size();
-
-    f2.close();
-
-    if (json_currentSize <= MAX_FILE_SIZE) { // at most 20MB 
-
-            float size_of_json_file = ((float)(json_currentSize))/1048576.0; // // 1024*1024
-            float size_of_csv_file = ((float)(csv_currentSize))/1048576.0; // 1024*1024
-
-        snprintf(storage_status_log + strlen(storage_status_log),
-                 sizeof(storage_status_log) - strlen(storage_status_log), 
-                 ", JSON: %.2f MB, CSV: %.2fMB", size_of_json_file, size_of_csv_file);
-
-        status = true;
-   
-    } else {
-        
-        strncat(storage_status_log, " | File needs rotation",
-                sizeof(storage_status_log) - strlen(storage_status_log) - 1);
-
-        uint64_t totalUsed =  usedBytes; // SD.usedBytes();
-
-        if (totalUsed > MAX_TOTAL_SIZE) {
-
-            strncat(storage_status_log, " | TOTAL STORAGE LIMIT REACHED",
-                    sizeof(storage_status_log) - strlen(storage_status_log) - 1);
-
-            return false;
-        }
-
-        File newFile = create_another_file();
-
-        if (newFile) {
-            strncat(storage_status_log, " | File rotated",
-                    sizeof(storage_status_log) - strlen(storage_status_log) - 1);
-            newFile.close();
-            status = true;
-        } else {
-            strncat(storage_status_log, " | Rotation FAILED",
-                    sizeof(storage_status_log) - strlen(storage_status_log) - 1);
-        }
-
-            }
-
-    LOG(storage_status_log);
-    return status;
-}
 
 File create_another_file() {
     // Make sure ShortDate and ShortTime are defined and valid
@@ -2492,6 +2619,7 @@ uint64_t    last_wifi_check = 0;
 uint64_t data_update_interval = 60ULL * 1000ULL; // 30 seconds if power is good, 60 seconds when not
 bool json_data_logged = false;
 bool csv_data_logged = false;
+bool csv_uploadable_data_logged = false;
 
 bool fans_are_togglable = false; // when power is low, totawaana
 bool wifi_triggered = false;
@@ -2499,7 +2627,8 @@ bool otaTriggered = false;
 uint32_t loop_count = 0; // tracker for whenever loop or a RTOS task yeesibye
 
 bool currently_uploading = false;
-char activity_log[1024];
+char activity_log[2048];
+char updates_log[128];
 bool is_night_time = false;
 bool is_at_peak_sunshine = false;
 bool screen_is_changing = false;
@@ -2508,105 +2637,153 @@ bool ten_min = false; // alarm for 10 minute event (UPLOADS)
 bool five_min = false;
 bool hour_marked = false;
 
+static uint64_t last_storage_check = 0;
+
+
+void log_all_activities();
+void update_dynamic_data();
+void save_stuff_to_sd_card();
+
+bool time_to_upload = false;
+char _hourly_marked[64] = "Hourly upload at --:--";
+
+
+// Helper macro for NAN sanitization
+#define SAFE_FLOAT(x) ((isnan(x) || isinf(x)) ? 0.0f : (float)x)
+
+
+
 void loop() {
     now_now_ms = esp_timer_get_time() / 1000ULL; // us to ms
-    // either we are in OTA MODE or uploading mode or normal mode
+    esp_task_wdt_reset();  // Reset watchdog timer
 
-  if (otaModeActive) { // KEEP CHECKING OTA HANDLE EVERY LOOP
-        ArduinoOTA.handle(); 
-        handle_ota(now_now_ms);
-        
-        return;
-   }         
- 
-  else  {  // !otaModeActive 
-          //  if(currently_uploading){ handle_upload(); /* return; */ }
-        //  handle_upload(); // has early exits
-        
-            flash(now_now_ms, blinker, 50, 75, 50, 1500); // normal
-
-    //this is handled by a queuing task on core 0;
-            
-   // if(packet_received) { buzzer.beep(1,50,0);  extract_readings(); packet_received = false; } // this is called every loop cycle
     
-    // Sensor readings
-    if ((now_now_ms - last_read_time_ms) >= data_update_interval) { // 60 seconds if power is good for 24 hours:: 1,440 saved packets/day
-        last_read_time_ms = now_now_ms;  // Update FIRST to prevent race conditions
-        
-          //most recent parameters
-          
-          if(!sawa.isClockWorking()) return; 
-          else sawa.update();    
-          ten_min          = sawa.is10MinuteMarker();
-          five_min         = sawa.is5MinuteMarker();
-          hour_marked      = sawa.isHourlyMarker();
+    // either we are in OTA MODE or We are in NORMAL MODE
+     // Priority 1: Critical WiFi tasks
+    
+        if (otaModeActive) { // KEEP CHECKING OTA HANDLE EVERY LOOP
+            ArduinoOTA.handle(); 
+            handle_ota(now_now_ms);
+        return; // ← exits loop() completely
+        }     
 
-          char time_snap[20];
-          strncpy(time_snap, sawa.SystemTime, sizeof(time_snap));
 
-            // dynamically establish refresh rate
-          hr  = sawa.getCurrentHour();
-          is_night_time = (hr >= 20 || hr < 7);  // if 24 hour system: 8pm to 7am... time for idling
-          is_at_peak_sunshine = (hr > 9 && hr < 18); // 9am to 3pm...[and if solar radiation>1000W/m2]...time for peak peformance
-        
-          if(is_night_time) screen_refresh_interval = (60ULL*60ULL*1000ULL); //  refresh once every hour...maybe between light sleeps
-          else {
-                if(is_at_peak_sunshine) screen_refresh_interval = (60ULL*1000ULL); // refresh once every minute
-                else screen_refresh_interval = (10ULL*60ULL*1000ULL); // refresh once every 10 minutes
-          }
-          
+      // Priority 2: Normal mode - batch all operations
+        else { // keep the uploader running until it is done
+                //handle_upload(); // has early exits  // hourly — fast no-op 59 out of 60 minutes
 
-          // screen_refresh_interval = (1ULL*60ULL*1000ULL);
+        // Priority 2: Check if it's time to upload (regardless of WiFi state)
+            bool time_to_upload = false;
+            if (!clock_is_working) { 
+                time_to_upload = (now_now_ms - last_upload_time_ms) >= upload_interval_ms;
+            } else {
+                time_to_upload = sawa.is5MinuteMarker();  // Or () is5MinuteMarker // isHourlyMarker
+            }
 
-          MonitorBattery(); // battery voltage
-          
-          monitor_box_conditions(); // internal temp and fan state only if rtc is working
-          monitor_dryer_readings(); 
-          monitor_weather();
-          
-          //check_meta_data(); // column headers for CSV
-           json_bound_successfully = bind_dynamic_data_into_json();
-           csv_bound_successfully = bind_dynamic_data_into_csv();
 
-          json_data_logged = save_json_to_sd_card(); delay(500);
-          csv_data_logged  = save_csv_to_sd_card(); delay(500);
+            // Priority 3: Handle upload if needed (this will manage WiFi connection)
+            if (time_to_upload) { //  && !currently_uploading
+                LOG("TIME TO UPLOAD!");
+                currently_uploading = true;
+                accumulate_into_upload_buffer();
 
+                handle_upload();  // This function will handle WiFi connection/disconnection
+                currently_uploading = false;
+                // Don't return - continue with normal operations
+            } 
+    
+    // Priority 4: Normal mode operations
+    flash(now_now_ms, blinker, 50, 75, 50, 1500);
+     
+        if ((now_now_ms - last_read_time_ms) >= data_update_interval) { // 60 seconds if power is good for 24 hours:: 1,440 saved packets/day
+            last_read_time_ms = now_now_ms;  // Update FIRST to prevent race conditions
+            update_dynamic_data(); // Sensor readings
+
+            log_all_activities();  // Update activity_log first
+
+            save_stuff_to_sd_card(); // 4 files: 1 JSON, 2 CSV, 1 log
+             LOG(activity_log);
+       
         if(json_data_logged && csv_data_logged)  buzzer.beep(2, 100, 0);
 
-          snprintf(activity_log, sizeof(activity_log), 
-                    "\nLoopCount:%lu\nUptime: %llu, Reading complete! Power mode: %d, Voltage: %.1fV\njson_data_logged: %s",     
-                    loop_count, last_read_time_ms/1000, current_power, voltage, json_data_logged?"YES":"NO"
-              );
+            if(sawa.is10MinuteMarker()){
+            // Monitor heap fragmentation
+                Serial.printf("Heap: %d bytes free, largest block: %d\n", 
+                ESP.getFreeHeap(), ESP.getMaxAllocHeap());
 
-          LOG(activity_log);
-       }
-    
+                printHeapStats(); // for fragmentation %.
+            }
+
+
+        
     }
-     
-            wifi_triggered = read_button(wifi_toggler, now_now_ms);
 
-            otaTriggered = read_button(ota_button, now_now_ms);
+    if ((now_now_ms - last_storage_check) >= 3600000ULL) { // Every hour
+        if (storage_initialized) {
+            check_storage_files();
+        }
+        last_storage_check = now_now_ms;
+    }
+    
+
+
+    // per loop cycle
+              otaTriggered = read_button(ota_button, now_now_ms);
 
             if (otaTriggered && !otaModeActive) toggle_ota();
 
-            if(wifi_triggered && !screen_is_changing) { //shouldRotateScreen(now_now_ms);
+            // wifi_triggered = read_button(wifi_toggler, now_now_ms);
+        /*
+            if(wifi_triggered && !screen_is_changing) { 
                     if(currentScreen > 5) currentScreen = 1;
                   else currentScreen++;
         
              special_call = true;} // go to next screen
+        */
          
-       //  if(wifi_triggered && !currently_uploading) currently_uploading = true;
- 
          
         update_display(); // this returns 99.9% of the time and only updates screen ever 5, or 30mins
 
         loop_count++;
         // delay(10); // make the loop less tight when not polling ota
-         vTaskDelay(10 / portTICK_PERIOD_MS);
+         vTaskDelay(10 / portTICK_PERIOD_MS); // ESP-NOW callbacks still work
 
-         
+         // Better: Let other tasks run without forced wait
+          //  yield();  // Or delay(1) for slight breathing room
+  }
 
-   /*
+}
+/// loop()
+
+
+/*
+    Healthy values
+    Fragmentation	Meaning
+    0–10%	Excellent
+    10–25%	Normal
+    25–40%	Watch
+    40%+	Dangerous
+*/
+
+
+void printHeapStats() {
+
+    size_t freeHeap = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+    size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+    size_t minHeap = heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT);
+
+    float fragmentation = 100 - ((float)largest / freeHeap) * 100;
+
+    Serial.printf(
+        "[HEAP] free:%u  largest:%u  minEver:%u  frag:%.1f%%\n",
+        freeHeap,
+        largest,
+        minHeap,
+        fragmentation
+    );
+}
+
+ /*
     // Enter sleep based on power state
     if (current_power != POWER_EXCELLENT) {
         sleep_dynamically();
@@ -2614,10 +2791,468 @@ void loop() {
         // For excellent power, use delay instead of sleep
         delay(1000);
     }
-   */
+ */
 
+
+
+
+// Helper: Format uptime from microseconds
+char* get_uptime_str(uint64_t microseconds) {
+    static char uptime[32];
+    uint64_t seconds = microseconds / 1000000ULL;
+    uint32_t hours = seconds / 3600;
+    uint32_t minutes = (seconds % 3600) / 60;
+    uint32_t secs = seconds % 60;
+    snprintf(uptime, sizeof(uptime), "%02lu:%02lu:%02lu", hours, minutes, secs);
+    return uptime;
 }
-/// loop()
+
+// Helper: Get power mode string
+const char* get_power_mode_str(int mode) {
+    switch(mode) {
+        case 0: return "EXCELLENT";
+        case 1: return "GOOD";
+        case 2: return "LOW";
+        case 3: return "CRITICAL";
+        default: return "UNKNOWN";
+    }
+}
+
+// Main comprehensive logging function using RTC time from sawa
+void log_all_activities() {
+    Serial.println("activities log");
+    // Get current uptime
+    uint64_t now_us = esp_timer_get_time();
+    uint64_t now_sec = now_us / 1000000ULL;
+    
+    // Get RTC time and date from sawa
+    const char* rtc_time = (sawa.SystemTime[0] != '\0') ? sawa.SystemTime : "Time not set";
+    const char* rtc_date = (sawa.SystemDate[0] != '\0') ? sawa.SystemDate : "Date not set";
+    
+    // Build the complete log
+    snprintf(activity_log, sizeof(activity_log),
+        "\n========== SYSTEM SNAPSHOT [%s %s] ==========\n"
+        "【SYSTEM TIMING】\n"
+        "  RTC Date/Time: %s %s\n"
+        "  Loop Count: %lu\n"
+        "  Uptime: %s (%llu seconds)\n"
+        "  Current μs: %llu\n"
+        "  Last Sensor Read: %s ago\n"
+        "\n【CONNECTIVITY】\n"
+        "  WiFi: %s | OTA: %s\n"
+        "  Last OTA: %s\n"
+        "\n【POWER】\n"
+        "  Mode: %s (%d) | Voltage: %.2fV\n"
+        "\n【ENVIRONMENT】\n"
+        "  Cabin Temp: %.2f°C | Ambient Temp: %.2f°C | Humidity: %.2f%%\n"
+        "  Temp Log: %s\n"
+        "  Humidity Log: %s\n"
+        "\n【DATA STORAGE】\n"
+        "  JSON: %s | CSV: %s\n"
+        "  JSON Save: %s\n"
+        "  CSV Save: %s\n"
+        "  JSON Serialization: %s\n"
+        "  CSV Bind: %s\n"
+        "  Cloud CSV Bind: %s\n"
+        "\n【STORAGE】\n"
+        "  Status: %s\n"
+        "\n【UPLOADS】\n"
+        "  Report: %s\n"
+        "  Log: %s\n"
+        "\n【INTERNALS】\n"
+        "  %s\n"
+        "\n【TABLES】\n"
+        "  %s\n"
+        "\n【CLOCK STATUS】\n"
+        "  %s\n"
+        "  RTC Working: %s | 10Min Marker: %s | Hour Marker: %s\n"
+        "\n【OTA HISTORY】\n"
+        "  %s\n"
+        "============================================\n",
+        
+        // Header with RTC time/date
+        rtc_date, rtc_time,
+        rtc_date, rtc_time,
+        
+        // SYSTEM TIMING
+        loop_count,
+        get_uptime_str(now_us), now_sec,
+        now_us,
+        get_uptime_str((now_us - last_read_time_ms * 1000ULL)),
+        
+        // CONNECTIVITY
+        wifi_connected ? "ON" : "OFF",
+        otaModeActive ? "ACTIVE" : "IDLE",
+        (ota_log[0] != '\0') ? ota_log : "None",
+        
+        // POWER
+        get_power_mode_str(current_power), current_power, voltage,
+        
+        // ENVIRONMENT
+        cabin_temperature, average_temp, average_humi,
+        (temps_log[0] != '\0') ? temps_log : "OK",
+        (humis_log[0] != '\0') ? humis_log : "OK",
+        
+        // DATA STORAGE
+        json_data_logged ? "YES" : "NO",
+        csv_data_logged ? "YES" : "NO",
+        (json_save_log[0] != '\0') ? json_save_log : "Pending",
+        (csv_save_log[0] != '\0') ? csv_save_log : "Pending",
+        (json_serialization_log[0] != '\0') ? json_serialization_log : "Ready",
+        (csv_bind_log[0] != '\0') ? csv_bind_log : "Ready",
+        (csv_cloud_bind_log[0] != '\0') ? csv_cloud_bind_log : "Ready",
+        
+        // STORAGE
+        (storage_status_log[0] != '\0') ? storage_status_log : "OK",
+        
+        // UPLOADS
+        (upload_report[0] != '\0') ? upload_report : "None",
+        (upload_log[0] != '\0') ? upload_log : "Idle",
+        
+        // INTERNALS
+        (internals_log[0] != '\0') ? internals_log : "Normal",
+        
+        // TABLES
+        (table_log[0] != '\0') ? table_log : "Initialized",
+        
+        // CLOCK STATUS
+        (clock_status_msg[0] != '\0') ? clock_status_msg : "Clock nominal",
+        sawa.isClockWorking() ? "YES" : "NO",
+        sawa.is10MinuteMarker() ? "YES" : "NO",
+        sawa.isHourlyMarker() ? "YES" : "NO",
+        
+        // OTA HISTORY
+        (ota_log[0] != '\0') ? ota_log : "No OTA"
+    );
+    
+}
+
+
+
+
+
+// Initialize all log strings (call once in setup)
+void init_log_strings() {
+    static char default_log[] = "OK";
+    
+    if (ota_log[0] == '\0') strcpy(ota_log, "No OTA");
+    if (temps_log[0] == '\0') strcpy(temps_log, default_log);
+    if (humis_log[0] == '\0') strcpy(humis_log, default_log);
+    if (json_save_log[0] == '\0') strcpy(json_save_log, "Ready");
+    if (csv_save_log[0] == '\0') strcpy(csv_save_log, "Ready");
+    if (json_serialization_log[0] == '\0') strcpy(json_serialization_log, "Ready");
+    if (csv_bind_log[0] == '\0') strcpy(csv_bind_log, "Ready");
+    if (csv_cloud_bind_log[0] == '\0') strcpy(csv_cloud_bind_log, "Ready");
+    if (storage_status_log[0] == '\0') strcpy(storage_status_log, "OK");
+    if (upload_report[0] == '\0') strcpy(upload_report, "No uploads");
+    if (upload_log[0] == '\0') strcpy(upload_log, "Idle");
+    if (internals_log[0] == '\0') strcpy(internals_log, "Normal");
+    if (table_log[0] == '\0') strcpy(table_log, "Initialized");
+    if (clock_status_msg[0] == '\0') strcpy(clock_status_msg, "Synced");
+}
+
+
+
+void save_logs_to_sd_card() {
+    // Check if storage is initialized
+    if (!storage_initialized) {
+        snprintf(storage_status_log, sizeof(storage_status_log),
+                 "[SYSTEM LOG] SD card not initialized - log not saved");
+        LOG(storage_status_log);
+        return;
+    }
+    
+    // Open system log file in append mode (creates if doesn't exist)
+    File logFile = SD.open("/system_logs.txt", FILE_APPEND);
+    if (!logFile) {
+        snprintf(storage_status_log, sizeof(storage_status_log),
+                 "[SYSTEM LOG] Failed to open system_logs.txt for writing");
+        LOG(storage_status_log);
+        return;
+    }
+    
+    // Write timestamp and the activity log
+    // Using RTC time if available, otherwise uptime
+    char timestamp[64];
+    
+    if (clock_is_working) {
+    snprintf(timestamp, sizeof(timestamp), "%s %s", sawa.SystemDate, sawa.SystemTime);
+    } else {
+    uint64_t s = now_now_ms / 1000ULL;
+    snprintf(timestamp, sizeof(timestamp), "Uptime %02llu:%02llu:%02llu",
+             s/3600, (s%3600)/60, s%60);
+    }
+
+
+    // logFile.printf("[Uptime %02lu:%02lu:%02lu]\n", hours, minutes, secs);
+    logFile.print(timestamp);
+    
+    // Write the actual log content
+    size_t written = logFile.print(activity_log);
+    logFile.println(); // Add extra newline for separation
+    
+    // Ensure data is written to SD
+    logFile.flush();
+    logFile.close();
+    
+    // Update status based on write success
+    if (written == 0) {
+        snprintf(storage_status_log, sizeof(storage_status_log),
+                 "[SYSTEM LOG] Write returned 0 bytes - possible SD full or error");
+        LOG(storage_status_log);
+    } else {
+        snprintf(storage_status_log, sizeof(storage_status_log),
+                 "[SYSTEM LOG] %d bytes written to system_logs.txt", written);
+        LOG(storage_status_log);
+    }
+}
+
+// Optional: Periodic log saver with rotation
+void save_logs_to_sd_card_with_rotation(uint32_t max_file_size_bytes = 204800) { // 200KB default
+    if (!storage_initialized) return;
+    
+    // Check current file size
+    File logFile = SD.open("/system_logs.txt", FILE_READ);
+    if (logFile) {
+        uint32_t fileSize = logFile.size();
+        logFile.close();
+        
+        // Rotate if file is too large
+        if (fileSize >= max_file_size_bytes) {
+            // Remove old backup if exists
+            if (SD.exists("/system_logs_old.txt")) {
+                SD.remove("/system_logs_old.txt");
+            }
+            
+            // Rename current log to backup
+            SD.rename("/system_logs.txt", "/system_logs_old.txt");
+            
+            snprintf(storage_status_log, sizeof(storage_status_log),
+                     "[SYSTEM LOG] Rotated log file (%u bytes -> backup)", fileSize);
+            LOG(storage_status_log);
+        }
+    }
+    
+    // Save the current log
+    save_logs_to_sd_card();
+}
+
+// Batch save: Append multiple logs at once
+void batch_save_logs_to_sd_card(const char* log_buffer, size_t buffer_size) {
+    if (!storage_initialized) {
+        snprintf(storage_status_log, sizeof(storage_status_log),
+                 "[SYSTEM LOG] Cannot batch save - SD not initialized");
+        LOG(storage_status_log);
+        return;
+    }
+    
+    File logFile = SD.open("/system_logs.txt", FILE_APPEND);
+    if (!logFile) {
+        snprintf(storage_status_log, sizeof(storage_status_log),
+                 "[SYSTEM LOG] Batch save failed - cannot open file");
+        LOG(storage_status_log);
+        return;
+    }
+    
+    // Add batch separator
+    logFile.println("\n========== BATCH LOG START ==========");
+    
+    size_t written = logFile.write((const uint8_t*)log_buffer, buffer_size);
+    
+    logFile.println("\n========== BATCH LOG END ==========");
+    logFile.flush();
+    logFile.close();
+    
+    snprintf(storage_status_log, sizeof(storage_status_log),
+             "[SYSTEM LOG] Batch saved %d bytes", written);
+    LOG(storage_status_log);
+}
+
+// Helper: Get system log file size
+uint32_t get_system_log_size() {
+    if (!storage_initialized) return 0;
+    
+    File logFile = SD.open("/system_logs.txt", FILE_READ);
+    if (logFile) {
+        uint32_t size = logFile.size();
+        logFile.close();
+        return size;
+    }
+    return 0;
+}
+
+// Helper: Clear system log file (with confirmation)
+bool clear_system_log() {
+    if (!storage_initialized) return false;
+    
+    if (SD.exists("/system_logs.txt")) {
+        SD.remove("/system_logs.txt");
+        snprintf(storage_status_log, sizeof(storage_status_log),
+                 "[SYSTEM LOG] Log file cleared");
+        LOG(storage_status_log);
+        return true;
+    }
+    return false;
+}
+
+// Advanced: Log with severity levels
+void save_logs_to_sd_card_with_severity(const char* severity, const char* message) {
+    if (!storage_initialized) return;
+    
+    File logFile = SD.open("/system_logs.txt", FILE_APPEND);
+    if (!logFile) return;
+    
+    char timestamp[32];
+    uint64_t now_us = esp_timer_get_time();
+    uint64_t now_sec = now_us / 1000000ULL;
+    uint32_t hours = now_sec / 3600;
+    uint32_t minutes = (now_sec % 3600) / 60;
+    uint32_t secs = now_sec % 60;
+    
+    logFile.printf("[%s] [%s] [Uptime %02lu:%02lu:%02lu] %s\n", 
+                   severity, 
+                   (sawa.isClockWorking() ? "RTC_OK" : "NO_RTC"),
+                   hours, minutes, secs, 
+                   message);
+    
+    logFile.flush();
+    logFile.close();
+}
+
+// Lightweight version for frequent logging
+void quick_activities_log() {
+    uint64_t now_us = esp_timer_get_time();
+    
+    snprintf(activity_log, sizeof(activity_log),
+        "[%s %s] Loop:%lu | WiFi:%s | Pwr:%d(%.1fV) | Cabin:%.1f°C Amb:%.1f°C H:%.1f%% | JSON:%s CSV:%s | RTC:%s\n",
+        sawa.SystemDate, sawa.SystemTime,
+        loop_count,
+        wifi_connected ? "ON" : "OFF",
+        current_power, voltage,
+        cabin_temperature, average_temp, average_humi,
+        json_data_logged ? "Y" : "N",
+        csv_data_logged ? "Y" : "N",
+        sawa.isClockWorking() ? "OK" : "FAIL"
+    );
+    
+}
+
+// Error-specific log
+void error_activities_log(const char* error_source, const char* error_msg) {
+    uint64_t now_us = esp_timer_get_time();
+    
+    snprintf(activity_log, sizeof(activity_log),
+        "\n!!! ERROR SNAPSHOT [%s %s] !!!\n"
+        "Source: %s\n"
+        "Error: %s\n"
+        "Loop: %lu | Uptime: %s | WiFi: %s | Power: %d(%.1fV)\n"
+        "RTC Working: %s | Last Sensor: %s ago\n"
+        "========================================\n",
+        
+        sawa.SystemDate, sawa.SystemTime,
+        error_source,
+        error_msg,
+        loop_count,
+        get_uptime_str(now_us),
+        wifi_connected ? "ON" : "OFF",
+        current_power, voltage,
+        sawa.isClockWorking() ? "YES" : "NO",
+        get_uptime_str((now_us - last_read_time_ms * 1000ULL))
+    );
+    
+}
+
+// Log for sensor reading events
+void sensor_reading_log(bool success) {
+    if (success) {
+        snprintf(activity_log, sizeof(activity_log),
+            "[%s %s] SENSOR OK | Loop:%lu | Cabin:%.1f°C Amb:%.1f°C Hum:%.1f%% | Voltage:%.1fV\n",
+            sawa.SystemDate, sawa.SystemTime,
+            loop_count,
+            cabin_temperature, average_temp, average_humi,
+            voltage
+        );
+    } else {
+        snprintf(activity_log, sizeof(activity_log),
+            "[%s %s] SENSOR FAIL | Loop:%lu | Voltage:%.1fV | RTC:%s\n",
+            sawa.SystemDate, sawa.SystemTime,
+            loop_count,
+            voltage,
+            sawa.isClockWorking() ? "OK" : "FAIL"
+        );
+    }
+    
+}
+
+// Storage status log
+void storage_status_log_msg(const char* operation, bool success, size_t bytes_written = 0) {
+    if (success) {
+        snprintf(activity_log, sizeof(activity_log),
+            "[%s %s] STORAGE: %s OK | %d bytes | Free: %llu KB\n",
+            sawa.SystemDate, sawa.SystemTime,
+            operation, bytes_written,
+            SD.totalBytes() - SD.usedBytes() / 1024
+        );
+    } else {
+        snprintf(activity_log, sizeof(activity_log),
+            "[%s %s] STORAGE: %s FAILED | RTC:%s | SD:%s\n",
+            sawa.SystemDate, sawa.SystemTime,
+            operation,
+            sawa.isClockWorking() ? "OK" : "FAIL",
+            storage_initialized ? "Mounted" : "Not mounted"
+        );
+    }
+    
+}
+
+
+
+
+void update_dynamic_data(){
+          //most recent parameters
+          clock_is_working = sawa.isClockWorking();
+          if(!clock_is_working) snprintf(updates_log, sizeof(updates_log), "Clock not working, Updating nevertheless..."); /*return;*/  // an early exit here might not be okay, all readings will not be updated!
+          else  {
+                sawa.update();    
+                ten_min          = sawa.is10MinuteMarker();
+                hour_marked      = sawa.isHourlyMarker();
+                hawa  = sawa.getCurrentHour(); // in 24 hours...before formatting to 12HR CLOCK
+
+                // --- Read internal temperature ---
+                cabin_temperature = sawa.temp_reading; //real_time.getTemperature();
+          }
+         
+          MonitorBattery(); // get battery voltage
+          MonitorCabinet(); // internal temp and adjust o=inner state only if rtc is working
+
+          monitor_dryer_readings(); 
+          monitor_weather();
+}
+
+// void save_logs(const char* destination_file1 = , const char* destination_file2, const char* destination_file3){
+
+
+void save_stuff_to_sd_card(){
+         //check_meta_data(); // column headers for CSV
+          
+          csv_bound_successfully = bind_dynamic_data_into_csv();
+          if(storage_initialized) csv_data_logged  = save_csv_to_sd_card(); delay(50);
+
+          
+          json_bound_successfully = bind_dynamic_data_into_json();
+          if(storage_initialized) json_data_logged = save_json_to_sd_card(); delay(50);
+
+         upload_queue_saved = bind_uploadable_data_into_csv();
+         if(storage_initialized) csv_uploadable_data_logged = save_uploadable_csv_to_sd_card();
+
+         if(storage_initialized) save_logs_to_sd_card();
+      //save_logs_to_sd_card_with_rotation(204800); // 200KB max
+
+          accumulate_into_upload_buffer(); //  fall back to ensure uploads no matter what
+
+        
+          
+}
 
 
 void monitor_weather(){
@@ -2629,8 +3264,8 @@ void monitor_weather(){
     average_wind_speed = average_wind_speed * 60.0;
     snprintf(wind_speed_str, sizeof(wind_speed_str), "%.2f", average_wind_speed);
 
-     Serial.print("Wind Speed Direct Read: "); Serial.println(direct_reading);
-     Serial.print("\tWind Speed: "); Serial.println(average_wind_speed);
+   //  Serial.print("Wind Speed Direct Read: "); Serial.println(direct_reading);
+     //Serial.print("\tWind Speed: "); Serial.println(average_wind_speed);
 
     // measure solar radiation
     uint16_t direct_solar_reading = analogRead(solar_rad_pin);
@@ -2639,8 +3274,8 @@ void monitor_weather(){
     average_solar_radiation = average_solar_radiation * 1800.0;
     snprintf(solar_rad_str, sizeof(solar_rad_str), "%.1f", average_solar_radiation);
 
-     Serial.print("Solar Rad, Direct Read: "); Serial.println(direct_solar_reading);
-      Serial.print("\Solar Radition: "); Serial.println(average_solar_radiation);
+   //  Serial.print("Solar Rad, Direct Read: "); Serial.println(direct_solar_reading);
+    //  Serial.print("\Solar Radition: "); Serial.println(average_solar_radiation);
 
     snprintf(time_of_weather, sizeof(time_of_weather), "%s", sawa.ShortTime);
 
@@ -3137,16 +3772,25 @@ void monitor_dryer_readings(){
       for(int i = 9; i > 0; i--){
           historical_temperature_readings[i] = historical_temperature_readings[i-1];
           historical_outside_temperatures[i] = historical_outside_temperatures[i-1];
+
+          historical_outside_humidities[i]   = historical_outside_humidities[i-1];
           historical_humidity_readings[i]    = historical_humidity_readings[i-1];
+
           historical_pressure_readings[i]    = historical_pressure_readings[i-1];
+          historical_outside_pressures[i] = historical_outside_pressures[i-1];
           strcpy(time_stamps[i], time_stamps[i-1]);
       }
 
       // UPDATE HISTORICALS
       historical_temperature_readings[0] = average_temp;
       historical_outside_temperatures[0] = sensor_12_temp;
+
+      historical_outside_humidities[0] = sensor_12_humidity;
       historical_humidity_readings[0]    = average_humi;
-     // historical_pressure_readings[0]    = average_press;
+
+      historical_outside_pressures[0]   = sensor_12_pressure;
+      historical_pressure_readings[0]    = average_press;
+
       strcpy(time_stamps[0], sawa.ShortTime); // HH:MM
 
       if(reading_count < 10) reading_count++;
@@ -3159,15 +3803,12 @@ void monitor_dryer_readings(){
   dtostrf(average_temp, 3, 1, average_temp_str);
   dtostrf(average_humi, 3, 1, average_humi_str);
 
-  Serial.print("Average Temp: "); Serial.println(average_temp);
-  Serial.print("Average Humi: "); Serial.println(average_humi);
-  Serial.print("Active Sensors: "); Serial.println(active_sensors);
+  Serial.print("\tAverage Temp: "); Serial.println(average_temp);
+  Serial.print("\tAverage Humi: "); Serial.println(average_humi);
+  Serial.print("\tActive Sensors: "); Serial.println(active_sensors);
 
 }
 
-
-char temps_log[256];
-char humis_log[256];
 
 float aggregate_sensor_temperatures() {
 
@@ -3347,8 +3988,6 @@ void write_json_metadata(File &file) {
     LOG("[JSON] Metadata written to new file");
 }
 
-char serialization_log[512] = "JSON Serialization Not Done!";
-char csv_bind_log[512] = "CSV Serialization Not Done!";
 
 
 bool bind_dynamic_data_into_json() {
@@ -3386,6 +4025,8 @@ bool bind_dynamic_data_into_json() {
     for (int i = 0; i < active_sensors; i++) {
         All_Sensors["Temperature_Readings"][i] = historical_temperature_readings[i];
         All_Sensors["External Temperatures"][i] = historical_outside_temperatures[i];
+        All_Sensors["External Humidities"][i] = historical_outside_humidities[i];
+        All_Sensors["External Pressures"] = historical_outside_pressures[i];
         All_Sensors["Humidity_Readings"][i] = historical_humidity_readings[i];
         All_Sensors["Pressure_Readings"][i] = historical_pressure_readings[i];
         All_Sensors["Time"][i] = time_stamps[i];
@@ -3393,94 +4034,121 @@ bool bind_dynamic_data_into_json() {
 
     // ================= INDIVIDUAL SENSOR RUNTIME VALUES =================
 
-    JsonObject Sensor_1 = JSON_sendable["Sensor_1"].to<JsonObject>();
-    Sensor_1["Temp"] = sensor_1_temp;
-    Sensor_1["Humi"] = sensor_1_humidity;
-    Sensor_1["Pressure"] = sensor_1_pressure;
-    Sensor_1["Last_Seen"] = sensor_1_last_seen;
-    Sensor_1["Sends"] = sensor_1_transmissions;
+    if(sensor_1_temp > 1.0){
+        JsonObject Sensor_1 = JSON_sendable["Sensor_1"].to<JsonObject>();
+        Sensor_1["Temp"] = sensor_1_temp;
+        Sensor_1["Humi"] = sensor_1_humidity;
+        Sensor_1["Pressure"] = sensor_1_pressure;
+        Sensor_1["Last_Seen"] = sensor_1_last_seen;
+        Sensor_1["Sends"] = sensor_1_transmissions;
+    }
 
-    JsonObject Sensor_2 = JSON_sendable["Sensor_2"].to<JsonObject>();
-    Sensor_2["Temp"] = sensor_2_temp;
-    Sensor_2["Humi"] = sensor_2_humidity;
-    Sensor_2["Pressure"] = sensor_2_pressure;
-    Sensor_2["Last_Seen"] = sensor_2_last_seen;
-    Sensor_2["Sends"] = sensor_2_transmissions;
+    if(sensor_2_temp > 1.0){
+        JsonObject Sensor_2 = JSON_sendable["Sensor_2"].to<JsonObject>();
+        Sensor_2["Temp"] = sensor_2_temp;
+        Sensor_2["Humi"] = sensor_2_humidity;
+        Sensor_2["Pressure"] = sensor_2_pressure;
+        Sensor_2["Last_Seen"] = sensor_2_last_seen;
+        Sensor_2["Sends"] = sensor_2_transmissions;
+    }
 
-    JsonObject Sensor_3 = JSON_sendable["Sensor_3"].to<JsonObject>();
-    Sensor_3["Temp"] = sensor_3_temp;
-    Sensor_3["Humi"] = sensor_3_humidity;
-    Sensor_3["Pressure"] = sensor_3_pressure;
-    Sensor_3["Last_Seen"] = sensor_3_last_seen;
-    Sensor_3["Sends"] = sensor_3_transmissions;
+    if(sensor_3_temp > 1.0){
+        JsonObject Sensor_3 = JSON_sendable["Sensor_3"].to<JsonObject>();
+        Sensor_3["Temp"] = sensor_3_temp;
+        Sensor_3["Humi"] = sensor_3_humidity;
+        Sensor_3["Pressure"] = sensor_3_pressure;
+        Sensor_3["Last_Seen"] = sensor_3_last_seen;
+        Sensor_3["Sends"] = sensor_3_transmissions;
+    }
 
-    JsonObject Sensor_4 = JSON_sendable["Sensor_4"].to<JsonObject>();
-    Sensor_4["Temp"] = sensor_4_temp;
-    Sensor_4["Humi"] = sensor_4_humidity;
-    Sensor_4["Pressure"] = sensor_4_pressure;
-    Sensor_4["Last_Seen"] = sensor_4_last_seen;
-    Sensor_4["Sends"] = sensor_4_transmissions;
+    if(sensor_4_temp > 1.0){
+        JsonObject Sensor_4 = JSON_sendable["Sensor_4"].to<JsonObject>();
+        Sensor_4["Temp"] = sensor_4_temp;
+        Sensor_4["Humi"] = sensor_4_humidity;
+        Sensor_4["Pressure"] = sensor_4_pressure;
+        Sensor_4["Last_Seen"] = sensor_4_last_seen;
+        Sensor_4["Sends"] = sensor_4_transmissions;
+    }
 
-    JsonObject Sensor_5 = JSON_sendable["Sensor_5"].to<JsonObject>();
-    Sensor_5["Temp"] = sensor_5_temp;
-    Sensor_5["Humi"] = sensor_5_humidity;
-    Sensor_5["Pressure"] = sensor_5_pressure;
-    Sensor_5["Last_Seen"] = sensor_5_last_seen;
-    Sensor_5["Sends"] = sensor_5_transmissions;
+    if(sensor_5_temp > 1.0){
+        JsonObject Sensor_5 = JSON_sendable["Sensor_5"].to<JsonObject>();
+        Sensor_5["Temp"] = sensor_5_temp;
+        Sensor_5["Humi"] = sensor_5_humidity;
+        Sensor_5["Pressure"] = sensor_5_pressure;
+        Sensor_5["Last_Seen"] = sensor_5_last_seen;
+        Sensor_5["Sends"] = sensor_5_transmissions;
+    }
 
-    JsonObject Sensor_6 = JSON_sendable["Sensor_6"].to<JsonObject>();
-    Sensor_6["Temp"] = sensor_6_temp;
-    Sensor_6["Humi"] = sensor_6_humidity;
-    Sensor_6["Pressure"] = sensor_6_pressure;
-    Sensor_6["Last_Seen"] = sensor_6_last_seen;
-    Sensor_6["Sends"] = sensor_6_transmissions;
+    if(sensor_6_temp > 1.0){
+        JsonObject Sensor_6 = JSON_sendable["Sensor_6"].to<JsonObject>();
+        Sensor_6["Temp"] = sensor_6_temp;
+        Sensor_6["Humi"] = sensor_6_humidity;
+        Sensor_6["Pressure"] = sensor_6_pressure;
+        Sensor_6["Last_Seen"] = sensor_6_last_seen;
+        Sensor_6["Sends"] = sensor_6_transmissions;
+    }
 
-    JsonObject Sensor_7 = JSON_sendable["Sensor_7"].to<JsonObject>();
-    Sensor_7["Temp"] = sensor_7_temp;
-    Sensor_7["Humi"] = sensor_7_humidity;
-    Sensor_7["Pressure"] = sensor_7_pressure;
-    Sensor_7["Last_Seen"] = sensor_7_last_seen;
-    Sensor_7["Sends"] = sensor_7_transmissions;
+    if(sensor_7_temp > 1.0){
+        JsonObject Sensor_7 = JSON_sendable["Sensor_7"].to<JsonObject>();
+        Sensor_7["Temp"] = sensor_7_temp;
+        Sensor_7["Humi"] = sensor_7_humidity;
+        Sensor_7["Pressure"] = sensor_7_pressure;
+        Sensor_7["Last_Seen"] = sensor_7_last_seen;
+        Sensor_7["Sends"] = sensor_7_transmissions;
+    }
 
-    JsonObject Sensor_8 = JSON_sendable["Sensor_8"].to<JsonObject>();
-    Sensor_8["Temp"] = sensor_8_temp;
-    Sensor_8["Humi"] = sensor_8_humidity;
-    Sensor_8["Pressure"] = sensor_8_pressure;
-    Sensor_8["Last_Seen"] = sensor_8_last_seen;
-    Sensor_8["Sends"] = sensor_8_transmissions;
+    if(sensor_8_temp > 1.0){
+        JsonObject Sensor_8 = JSON_sendable["Sensor_8"].to<JsonObject>();
+        Sensor_8["Temp"] = sensor_8_temp;
+        Sensor_8["Humi"] = sensor_8_humidity;
+        Sensor_8["Pressure"] = sensor_8_pressure;
+        Sensor_8["Last_Seen"] = sensor_8_last_seen;
+        Sensor_8["Sends"] = sensor_8_transmissions;
+    }
 
-    JsonObject Sensor_9 = JSON_sendable["Sensor_9"].to<JsonObject>();
-    Sensor_9["Temp"] = sensor_9_temp;
-    Sensor_9["Humi"] = sensor_9_humidity;
-    Sensor_9["Pressure"] = sensor_9_pressure;
-    Sensor_9["Last_Seen"] = sensor_9_last_seen;
-    Sensor_9["Sends"] = sensor_9_transmissions;
+    if(sensor_9_temp > 1.0){
+        JsonObject Sensor_9 = JSON_sendable["Sensor_9"].to<JsonObject>();
+        Sensor_9["Temp"] = sensor_9_temp;
+        Sensor_9["Humi"] = sensor_9_humidity;
+        Sensor_9["Pressure"] = sensor_9_pressure;
+        Sensor_9["Last_Seen"] = sensor_9_last_seen;
+        Sensor_9["Sends"] = sensor_9_transmissions;
+    }
 
-    JsonObject Sensor_10 = JSON_sendable["Sensor_10"].to<JsonObject>();
-    Sensor_10["Temp"] = sensor_10_temp;
-    Sensor_10["Humi"] = sensor_10_humidity;
-    Sensor_10["Pressure"] = sensor_10_pressure;
-    Sensor_10["Last_Seen"] = sensor_10_last_seen;
-    Sensor_10["Sends"] = sensor_10_transmissions;
+    if(sensor_10_temp > 1.0){
+        JsonObject Sensor_10 = JSON_sendable["Sensor_10"].to<JsonObject>();
+        Sensor_10["Temp"] = sensor_10_temp;
+        Sensor_10["Humi"] = sensor_10_humidity;
+        Sensor_10["Pressure"] = sensor_10_pressure;
+        Sensor_10["Last_Seen"] = sensor_10_last_seen;
+        Sensor_10["Sends"] = sensor_10_transmissions;
+    }
 
-    JsonObject Sensor_11 = JSON_sendable["Sensor_11"].to<JsonObject>();
-    Sensor_11["Temp"] = sensor_11_temp;
-    Sensor_11["Humi"] = sensor_11_humidity;
-    Sensor_11["Pressure"] = sensor_11_pressure;
-    Sensor_11["Last_Seen"] = sensor_11_last_seen;
-    Sensor_11["Sends"] = sensor_11_transmissions;
+    if(sensor_11_temp >= 1.0){
+        JsonObject Sensor_11 = JSON_sendable["Sensor_11"].to<JsonObject>();
+        Sensor_11["Temp"] = sensor_11_temp;
+        Sensor_11["Humi"] = sensor_11_humidity;
+        Sensor_11["Pressure"] = sensor_11_pressure;
+        Sensor_11["Last_Seen"] = sensor_11_last_seen;
+        Sensor_11["Sends"] = sensor_11_transmissions;
+    }
+    if(sensor_12_temp > 1.0) {
+        JsonObject Sensor_12 = JSON_sendable["Sensor_12"].to<JsonObject>();
+        Sensor_12["Temp"] = sensor_12_temp;
+        Sensor_12["Humi"] = sensor_12_humidity;
+        Sensor_12["Pressure"] = sensor_12_pressure;
+        Sensor_12["Last_Seen"] = sensor_12_last_seen;
+        Sensor_12["Sends"] = sensor_12_transmissions;
+    }
 
-    JsonObject Sensor_12 = JSON_sendable["Sensor_12"].to<JsonObject>();
-    Sensor_12["Temp"] = sensor_12_temp;
-    Sensor_12["Humi"] = sensor_12_humidity;
-    Sensor_12["Pressure"] = sensor_12_pressure;
-    Sensor_12["Last_Seen"] = sensor_12_last_seen;
-    Sensor_12["Sends"] = sensor_12_transmissions;
+    if(average_solar_radiation > 0.0 || average_wind_speed > 0.0){ // unless it is night and not windy
 
-    // ================= ENVIRONMENT =================
-    JsonObject Environment = JSON_sendable["Environment"].to<JsonObject>();
-    Environment["Solar_Radiation"] = average_solar_radiation;
-    Environment["Wind_Speed"] = average_wind_speed;
+        // ================= ENVIRONMENT =================
+        JsonObject Environment = JSON_sendable["Environment"].to<JsonObject>();
+        Environment["Solar_Radiation"] = average_solar_radiation;
+        Environment["Wind_Speed"] = average_wind_speed;
+
+    }
 
     // ================= SERIALIZATION =================
 
@@ -3490,10 +4158,10 @@ bool bind_dynamic_data_into_json() {
           //  size_t len_cloud = serializeJson(JSON_sendable, sendable_to_cloud_db);
 
             if (len_sd == 0) {
-                snprintf(serialization_log,
-                        sizeof(serialization_log),
+                snprintf(json_serialization_log,
+                        sizeof(json_serialization_log),
                         "[JSON] Serialization failed!");
-                LOG(serialization_log);
+                LOG(json_serialization_log);
                 return false;
             }
 
@@ -3502,23 +4170,23 @@ bool bind_dynamic_data_into_json() {
             // Optional: detect truncation (ArduinoJson does NOT null-terminate if truncated)
             if (len_sd >= sizeof(sendable_to_sd_card) ||    len_cloud >= sizeof(sendable_to_cloud_db))
             {
-                snprintf(serialization_log,
-                        sizeof(serialization_log),
+                snprintf(json_serialization_log,
+                        sizeof(json_serialization_log),
                         "[JSON] WARNING: Buffer may be too small (truncation detected)");
-                LOG(serialization_log);
+                LOG(json_serialization_log);
             }
 
             */
 
             bound_successfully = true;
 
-            snprintf(serialization_log,
-                    sizeof(serialization_log),
+            snprintf(json_serialization_log,
+                    sizeof(json_serialization_log),
                     "[JSON] Serialized OK | SD: %u bytes",// | Cloud: %u bytes",
                     (unsigned int)len_sd);
                    // (unsigned int)len_cloud);
 
-            LOG(serialization_log);
+            LOG(json_serialization_log);
 
 
     return bound_successfully;
@@ -3528,19 +4196,965 @@ bool bind_dynamic_data_into_json() {
 //  only bind existing values, 
 //  leave out the zeros
 
-uint8_t copied_entry = 0;
-bool data_ready_for_upload = false;
-
-// ── Tuneable constants ──────────────────────────────────────────────────────
-static const size_t UPLOAD_BUFFER_SIZE     = 20000; // 10-20 sendable_to_sd_card_csv entries
-static const size_t UPLOAD_BUFFER_DANGER   = 18000; // ~90% full → force clear oldest
-static const uint8_t ENTRIES_PER_UPLOAD    = 5; // 10;
-static const uint8_t MAX_UPLOAD_FAILS = 3; // after 3 misses, drop oldest batch or else buffer chokes
-uint8_t upload_fail_count = 0;
-
-char sendable_to_cloud_db[UPLOAD_BUFFER_SIZE] = ""; 
+int copied_contents = 0;
 
 
+// Updated bind_dynamic_data_into_csv() with NAN sanitization
+bool bind_dynamic_data_into_csv() {
+    bool bound_successfully = false;
+    
+    // Clear buffer
+    memset(sendable_to_sd_card_csv, 0, sizeof(sendable_to_sd_card_csv));
+    
+    // Sanitize all sensor values
+    float s1_temp = SAFE_FLOAT(sensor_1_temp);
+    float s1_h = SAFE_FLOAT(sensor_1_humidity);
+    float s1_p = SAFE_FLOAT(sensor_1_pressure);
+    
+    float s2_temp = SAFE_FLOAT(sensor_2_temp);
+    float s2_h = SAFE_FLOAT(sensor_2_humidity);
+    float s2_p = SAFE_FLOAT(sensor_2_pressure);
+    
+    float s3_temp = SAFE_FLOAT(sensor_3_temp);
+    float s3_h = SAFE_FLOAT(sensor_3_humidity);
+    float s3_p = SAFE_FLOAT(sensor_3_pressure);
+    
+    float s4_temp = SAFE_FLOAT(sensor_4_temp);
+    float s4_h = SAFE_FLOAT(sensor_4_humidity);
+    float s4_p = SAFE_FLOAT(sensor_4_pressure);
+    
+    float s5_temp = SAFE_FLOAT(sensor_5_temp);
+    float s5_h = SAFE_FLOAT(sensor_5_humidity);
+    float s5_p = SAFE_FLOAT(sensor_5_pressure);
+    
+    float s6_temp = SAFE_FLOAT(sensor_6_temp);
+    float s6_h = SAFE_FLOAT(sensor_6_humidity);
+    float s6_p = SAFE_FLOAT(sensor_6_pressure);
+    
+    float s7_temp = SAFE_FLOAT(sensor_7_temp);
+    float s7_h = SAFE_FLOAT(sensor_7_humidity);
+    float s7_p = SAFE_FLOAT(sensor_7_pressure);
+    
+    float s8_temp = SAFE_FLOAT(sensor_8_temp);
+    float s8_h = SAFE_FLOAT(sensor_8_humidity);
+    float s8_p = SAFE_FLOAT(sensor_8_pressure);
+    
+    float s9_temp = SAFE_FLOAT(sensor_9_temp);
+    float s9_h = SAFE_FLOAT(sensor_9_humidity);
+    float s9_p = SAFE_FLOAT(sensor_9_pressure);
+    
+    float s10_temp = SAFE_FLOAT(sensor_10_temp);
+    float s10_h = SAFE_FLOAT(sensor_10_humidity);
+    float s10_p = SAFE_FLOAT(sensor_10_pressure);
+    
+    float s11_temp = SAFE_FLOAT(sensor_11_temp);
+    float s11_h = SAFE_FLOAT(sensor_11_humidity);
+    float s11_p = SAFE_FLOAT(sensor_11_pressure);
+    
+    float s12_temp = SAFE_FLOAT(sensor_12_temp);
+    float s12_h = SAFE_FLOAT(sensor_12_humidity);
+    float s12_p = SAFE_FLOAT(sensor_12_pressure);
+    
+    float safe_solar = SAFE_FLOAT(average_solar_radiation);
+    float safe_wind = SAFE_FLOAT(average_wind_speed);
+    float safe_voltage = SAFE_FLOAT(voltage);
+    
+    // Build single CSV row
+    int len = snprintf(
+        sendable_to_sd_card_csv,
+        sizeof(sendable_to_sd_card_csv),
+        "%s,%s,"                    // Date, Time
+        "%.2f,%.2f,%.2f,"           // Sensor 1
+        "%.2f,%.2f,%.2f,"           // Sensor 2
+        "%.2f,%.2f,%.2f,"           // Sensor 3
+        "%.2f,%.2f,%.2f,"           // Sensor 4
+        "%.2f,%.2f,%.2f,"           // Sensor 5
+        "%.2f,%.2f,%.2f,"           // Sensor 6
+        "%.2f,%.2f,%.2f,"           // Sensor 7
+        "%.2f,%.2f,%.2f,"           // Sensor 8
+        "%.2f,%.2f,%.2f,"           // Sensor 9
+        "%.2f,%.2f,%.2f,"           // Sensor 10
+        "%.2f,%.2f,%.2f,"           // Sensor 11
+        "%.2f,%.2f,%.2f,"           // Sensor 12
+        "%.2f,%.2f,%llu,%.2f\n",    // Solar, Wind, Uptime, Voltage
+        
+        sawa.SystemDate,
+        sawa.ShortTime,
+        s1_temp, s1_h, s1_p,
+        s2_temp, s2_h, s2_p,
+        s3_temp, s3_h, s3_p,
+        s4_temp, s4_h, s4_p,
+        s5_temp, s5_h, s5_p,
+        s6_temp, s6_h, s6_p,
+        s7_temp, s7_h, s7_p,
+        s8_temp, s8_h, s8_p,
+        s9_temp, s9_h, s9_p,
+        s10_temp, s10_h, s10_p,
+        s11_temp, s11_h, s11_p,
+        s12_temp, s12_h, s12_p,
+        safe_solar,
+        safe_wind,
+        (unsigned long long)(now_now_ms / 1000),
+        safe_voltage
+    );
+    
+    // Validation
+    if (len <= 0) {
+        snprintf(csv_bind_log, sizeof(csv_bind_log), "[CSV] Serialization failed!");
+        LOG(csv_bind_log);
+        return false;
+    }
+    
+    if (len >= (int)sizeof(sendable_to_sd_card_csv)) {
+        snprintf(csv_bind_log, sizeof(csv_bind_log),
+                 "[CSV] WARNING: Buffer too small (truncated)");
+        LOG(csv_bind_log);
+    }
+    
+    bound_successfully = true;
+    
+    snprintf(csv_bind_log, sizeof(csv_bind_log),
+             "[CSV] Serialized OK | %u bytes", (unsigned int)len);
+    LOG(csv_bind_log);
+    
+    return bound_successfully;
+}
+
+
+bool bind_uploadable_data_into_csv() {
+
+    memset(sendable_to_cloud_csv, 0, sizeof(sendable_to_cloud_csv));
+
+    //prevent NANz especially on sensor 12
+    
+        // Sanitize all sensor values
+    float s1_temp = SAFE_FLOAT(sensor_1_temp);
+    float s1_h = SAFE_FLOAT(sensor_1_humidity);
+    float s1_p = SAFE_FLOAT(sensor_1_pressure);
+    
+    float s2_temp = SAFE_FLOAT(sensor_2_temp);
+    float s2_h = SAFE_FLOAT(sensor_2_humidity);
+    float s2_p = SAFE_FLOAT(sensor_2_pressure);
+    
+    float s3_temp = SAFE_FLOAT(sensor_3_temp);
+    float s3_h = SAFE_FLOAT(sensor_3_humidity);
+    float s3_p = SAFE_FLOAT(sensor_3_pressure);
+    
+    float s4_temp = SAFE_FLOAT(sensor_4_temp);
+    float s4_h = SAFE_FLOAT(sensor_4_humidity);
+    float s4_p = SAFE_FLOAT(sensor_4_pressure);
+    
+    float s5_temp = SAFE_FLOAT(sensor_5_temp);
+    float s5_h = SAFE_FLOAT(sensor_5_humidity);
+    float s5_p = SAFE_FLOAT(sensor_5_pressure);
+    
+    float s6_temp = SAFE_FLOAT(sensor_6_temp);
+    float s6_h = SAFE_FLOAT(sensor_6_humidity);
+    float s6_p = SAFE_FLOAT(sensor_6_pressure);
+    
+    float s7_temp = SAFE_FLOAT(sensor_7_temp);
+    float s7_h = SAFE_FLOAT(sensor_7_humidity);
+    float s7_p = SAFE_FLOAT(sensor_7_pressure);
+    
+    float s8_temp = SAFE_FLOAT(sensor_8_temp);
+    float s8_h = SAFE_FLOAT(sensor_8_humidity);
+    float s8_p = SAFE_FLOAT(sensor_8_pressure);
+    
+    float s9_temp = SAFE_FLOAT(sensor_9_temp);
+    float s9_h = SAFE_FLOAT(sensor_9_humidity);
+    float s9_p = SAFE_FLOAT(sensor_9_pressure);
+    
+    float s10_temp = SAFE_FLOAT(sensor_10_temp);
+    float s10_h = SAFE_FLOAT(sensor_10_humidity);
+    float s10_p = SAFE_FLOAT(sensor_10_pressure);
+    
+    float s11_temp = SAFE_FLOAT(sensor_11_temp);
+    float s11_h = SAFE_FLOAT(sensor_11_humidity);
+    float s11_p = SAFE_FLOAT(sensor_11_pressure);
+    
+    float s12_temp = SAFE_FLOAT(sensor_12_temp);
+    float s12_h = SAFE_FLOAT(sensor_12_humidity);
+    float s12_p = SAFE_FLOAT(sensor_12_pressure);
+    
+    float safe_solar = SAFE_FLOAT(average_solar_radiation);
+    float safe_wind = SAFE_FLOAT(average_wind_speed);
+    float safe_voltage = SAFE_FLOAT(voltage);
+
+
+    // Must match PHP EXPECTED_FIELDS = 42 exactly:
+    // Date, Time,
+    // s1_t,s1_h,s1_p × 12 sensors,
+    // solar, wind, uptime, voltage
+    int len = snprintf(
+        sendable_to_cloud_csv, sizeof(sendable_to_cloud_csv),
+        "%s,%s,"            // Date, Time
+        "%.2f,%.2f,%.2f,"   // s1
+        "%.2f,%.2f,%.2f,"   // s2
+        "%.2f,%.2f,%.2f,"   // s3
+        "%.2f,%.2f,%.2f,"   // s4
+        "%.2f,%.2f,%.2f,"   // s5
+        "%.2f,%.2f,%.2f,"   // s6
+        "%.2f,%.2f,%.2f,"   // s7
+        "%.2f,%.2f,%.2f,"   // s8
+        "%.2f,%.2f,%.2f,"   // s9
+        "%.2f,%.2f,%.2f,"   // s10
+        "%.2f,%.2f,%.2f,"   // s11
+        "%.2f,%.2f,%.2f,"   // s12
+        "%.2f,%.2f,%llu,%.2f\n",  // solar, wind, uptime, voltage
+        sawa.SystemDate, sawa.ShortTime,
+        s1_temp,  s1_h,  s1_p,
+        s2_temp,  s2_h,  s2_p,
+        s3_temp,  s3_h,  s3_p,
+        s4_temp,  s4_h,  s4_p,
+        s5_temp,  s5_h,  s5_p,
+        s6_temp,  s6_h,  s6_p,
+        s7_temp,  s7_h,  s7_p,
+        s8_temp,  s8_h,  s8_p,
+        s9_temp,  s9_h,  s9_p,
+        s10_temp, s10_h, s10_p,
+        s11_temp, s11_h, s11_p,
+        s12_temp, s12_h, s12_p,
+        safe_solar, safe_wind,
+        (unsigned long long)(now_now_ms / 1000ULL),
+        (float)safe_voltage
+    );
+
+    if (len <= 0) {
+        snprintf(csv_cloud_bind_log, sizeof(csv_cloud_bind_log),
+                 "[CLOUD CSV] snprintf failed");
+        LOG(csv_cloud_bind_log);
+        return false;
+    }
+
+    if (len >= (int)sizeof(sendable_to_cloud_csv)) {
+        snprintf(csv_cloud_bind_log, sizeof(csv_cloud_bind_log),
+                 "[CLOUD CSV] WARNING: row truncated at %d B", len);
+        LOG(csv_cloud_bind_log);
+    } else {
+        snprintf(csv_cloud_bind_log, sizeof(csv_cloud_bind_log),
+                 "[CLOUD CSV] Bound successfully. Row size OK: %dB saved in %uB",
+                 len, (unsigned int)sizeof(sendable_to_cloud_csv));
+        LOG(csv_cloud_bind_log);
+    }
+
+    return true;
+}
+
+
+/*
+bool bind_uploadable_data_into_csv() {
+    bool csv_bound = false;
+    memset(sendable_to_cloud_csv, 0, sizeof(sendable_to_cloud_csv));
+    
+    
+    // Sanitize ALL float values
+    float safe_voltage = SAFE_FLOAT(voltage);
+    float safe_avg_temp = SAFE_FLOAT(average_temp);
+    float safe_avg_humi = SAFE_FLOAT(average_humi);
+    
+    // Outdoor sensor (sensor 12)
+    float safe_out_temp = SAFE_FLOAT(sensor_12_temp);
+    float safe_out_humi = SAFE_FLOAT(sensor_12_humidity);
+    float safe_out_press = SAFE_FLOAT(sensor_12_pressure);
+    
+    // Indoor sensors 1-11
+    float s1_t = SAFE_FLOAT(sensor_1_temp);
+    float s1_h = SAFE_FLOAT(sensor_1_humidity);
+    float s1_p = SAFE_FLOAT(sensor_1_pressure);
+    
+    float s2_t = SAFE_FLOAT(sensor_2_temp);
+    float s2_h = SAFE_FLOAT(sensor_2_humidity);
+    float s2_p = SAFE_FLOAT(sensor_2_pressure);
+    
+    float s3_t = SAFE_FLOAT(sensor_3_temp);
+    float s3_h = SAFE_FLOAT(sensor_3_humidity);
+    float s3_p = SAFE_FLOAT(sensor_3_pressure);
+    
+    float s4_t = SAFE_FLOAT(sensor_4_temp);
+    float s4_h = SAFE_FLOAT(sensor_4_humidity);
+    float s4_p = SAFE_FLOAT(sensor_4_pressure);
+    
+    float s5_t = SAFE_FLOAT(sensor_5_temp);
+    float s5_h = SAFE_FLOAT(sensor_5_humidity);
+    float s5_p = SAFE_FLOAT(sensor_5_pressure);
+    
+    float s6_t = SAFE_FLOAT(sensor_6_temp);
+    float s6_h = SAFE_FLOAT(sensor_6_humidity);
+    float s6_p = SAFE_FLOAT(sensor_6_pressure);
+    
+    float s7_t = SAFE_FLOAT(sensor_7_temp);
+    float s7_h = SAFE_FLOAT(sensor_7_humidity);
+    float s7_p = SAFE_FLOAT(sensor_7_pressure);
+    
+    float s8_t = SAFE_FLOAT(sensor_8_temp);
+    float s8_h = SAFE_FLOAT(sensor_8_humidity);
+    float s8_p = SAFE_FLOAT(sensor_8_pressure);
+    
+    float s9_t = SAFE_FLOAT(sensor_9_temp);
+    float s9_h = SAFE_FLOAT(sensor_9_humidity);
+    float s9_p = SAFE_FLOAT(sensor_9_pressure);
+    
+    float s10_t = SAFE_FLOAT(sensor_10_temp);
+    float s10_h = SAFE_FLOAT(sensor_10_humidity);
+    float s10_p = SAFE_FLOAT(sensor_10_pressure);
+    
+    float s11_t = SAFE_FLOAT(sensor_11_temp);
+    float s11_h = SAFE_FLOAT(sensor_11_humidity);
+    float s11_p = SAFE_FLOAT(sensor_11_pressure);
+    
+    float safe_solar = SAFE_FLOAT(average_solar_radiation);
+    float safe_wind = SAFE_FLOAT(average_wind_speed);
+    
+    int data_size = snprintf(
+        sendable_to_cloud_csv, sizeof(sendable_to_cloud_csv),
+
+        "%s,%s,"            // EntryDate, EntryTime
+        "%.2f,"             // Voltage
+        "%.2f,%.2f,"        // average_temp, average_humi
+        "%.2f,%.2f,%.2f,"   // outdoor_temp, outdoor_humi, outdoor_pre
+        // sensors 1-11
+        "%.2f,%.2f,%.2f,"   // s1
+        "%.2f,%.2f,%.2f,"   // s2
+        "%.2f,%.2f,%.2f,"   // s3
+        "%.2f,%.2f,%.2f,"   // s4
+        "%.2f,%.2f,%.2f,"   // s5
+        "%.2f,%.2f,%.2f,"   // s6
+        "%.2f,%.2f,%.2f,"   // s7
+        "%.2f,%.2f,%.2f,"   // s8
+        "%.2f,%.2f,%.2f,"   // s9
+        "%.2f,%.2f,%.2f,"   // s10
+        "%.2f,%.2f,%.2f,"   // s11
+        "%.2f,%.2f,%.2f,"   // s12 (duplicate)
+        "%.2f,%.2f,"        // solar, wind
+        "%u\n",             // active_sensors
+
+        // ── Sanitized Values ──
+        sawa.SystemDate, sawa.ShortTime,
+        safe_voltage,
+        safe_avg_temp, safe_avg_humi,
+        safe_out_temp, safe_out_humi, safe_out_press,
+        s1_t, s1_h, s1_p,
+        s2_t, s2_h, s2_p,
+        s3_t, s3_h, s3_p,
+        s4_t, s4_h, s4_p,
+        s5_t, s5_h, s5_p,
+        s6_t, s6_h, s6_p,
+        s7_t, s7_h, s7_p,
+        s8_t, s8_h, s8_p,
+        s9_t, s9_h, s9_p,
+        s10_t, s10_h, s10_p,
+        s11_t, s11_h, s11_p,
+        safe_out_temp, safe_out_humi, safe_out_press,  // s12 duplicate
+        safe_solar, safe_wind,
+        (unsigned int)active_sensors
+    );
+    
+    int buffer_size = sizeof(sendable_to_cloud_csv);
+    
+    if (data_size <= 0) {
+        snprintf(csv_cloud_bind_log, sizeof(csv_cloud_bind_log),
+                 "[CLOUD CSV] snprintf failed: %d", data_size);
+        
+        csv_bound =  false;
+    }
+    
+    if (data_size >= buffer_size) {
+        snprintf(csv_cloud_bind_log, sizeof(csv_cloud_bind_log),
+                 "[CLOUD CSV] WARNING: Would need %d bytes, buffer %d bytes", 
+                 data_size, buffer_size);
+       
+        
+        // Print preview instead of full string
+        char preview[80];
+        strncpy(preview, sendable_to_cloud_csv, 70);
+        preview[70] = '\0';
+        LOG(preview);
+
+        csv_bound = true; // though only partially done!
+
+    } else {
+        snprintf(csv_cloud_bind_log, sizeof(csv_cloud_bind_log),
+                 "[CLOUD CSV] Bound successfully. Row size OK: %dB saved in %dB", data_size, buffer_size);
+        csv_bound = true;
+    }
+    
+    LOG(csv_cloud_bind_log);
+
+    // ✅ Remove this line - it's causing the crash!
+    // LOG("function exited successfully");
+    
+    return csv_bound;
+}
+*/
+
+
+bool save_uploadable_csv_to_sd_card() {
+
+    size_t len = strlen(sendable_to_cloud_csv);  // actual string length, not buffer size
+
+    if (!storage_initialized) {
+        snprintf(csv_cloud_save_log, sizeof(csv_cloud_save_log),
+                 "[CLOUD CSV] No SD — row discarded (%u B)", (unsigned int)len);
+        LOG(csv_cloud_save_log);
+        return false;
+    }
+
+    // FILE_APPEND creates the file if it does not exist — no separate creation step needed
+    File qf = SD.open(UPLOAD_QUEUE_FILE, FILE_APPEND);
+    if (!qf) {
+        snprintf(csv_cloud_save_log, sizeof(csv_cloud_save_log),
+                 "[CLOUD CSV] Queue open failed — row discarded");
+        LOG(csv_cloud_save_log);
+        return false;
+    }
+
+    size_t written = qf.print(sendable_to_cloud_csv);
+    qf.flush();
+    qf.close();
+
+    if (written == 0) {
+        snprintf(csv_cloud_save_log, sizeof(csv_cloud_save_log),
+                 "[CLOUD CSV] Write returned 0 bytes");
+        LOG(csv_cloud_save_log);
+        return false;
+    }
+
+    snprintf(csv_cloud_save_log, sizeof(csv_cloud_save_log),
+             "[CLOUD CSV] %u B queued (queue ~%u B)",
+             (unsigned int)written, (unsigned int)upload_queue_size());
+    LOG(csv_cloud_save_log);
+    return true;
+}
+
+
+// ── Upload queue helpers ──────────────────────────────────────────────────────
+
+// Returns the size of the upload queue file in bytes, or 0 if absent/empty.
+static size_t upload_queue_size() {
+    if (!storage_initialized) return 0;
+    File f = SD.open(UPLOAD_QUEUE_FILE, FILE_READ);
+    if (!f) return 0;
+    size_t sz = f.size();
+    f.close();
+    return sz;
+}
+
+// Deletes the upload queue file (called after confirmed success).
+static void clear_upload_queue() {
+    if (SD.exists(UPLOAD_QUEUE_FILE)) {
+        SD.remove(UPLOAD_QUEUE_FILE);
+        LOG("[Upload] Queue file cleared");
+    }
+}
+
+// Reads the entire upload queue file into a heap-allocated buffer.
+// Caller must free() the buffer.  Returns nullptr on failure.
+// Max safe read: ~50 kB (60 rows × ~400 B = 24 kB, well within limit).
+static char* read_upload_queue(size_t* out_len) {
+    *out_len = 0;
+    if (!storage_initialized) return nullptr;
+
+    File f = SD.open(UPLOAD_QUEUE_FILE, FILE_READ);
+    if (!f) return nullptr;
+
+    size_t sz = f.size();
+    if (sz == 0) { f.close(); return nullptr; }
+
+    // Cap at 50 kB — 1 hour at 1 row/min = 60 rows × ~400 B = ~24 kB,
+    // so this cap only triggers if the upload has been failing for >2 hours.
+    if (sz > 51200) sz = 51200;
+
+    char* buf = (char*)malloc(sz + 1);
+    if (!buf) {
+        f.close();
+        LOG("[Upload] malloc failed for queue read");
+        return nullptr;
+    }
+
+    size_t got = f.readBytes(buf, sz);
+    buf[got] = '\0';
+    f.close();
+
+    *out_len = got;
+    return buf;
+}
+
+// ── Main upload handler ───────────────────────────────────────────────────────
+// Call this from loop() — it has early exits and does nothing
+// until the hourly boundary is reached AND there is data queued.
+
+// Function to accumulate CSV rows into buffer (when no SD card)
+bool accumulate_into_upload_buffer() {
+    // Validate we have data to accumulate
+    if (strlen(sendable_to_sd_card_csv) == 0) {
+        return false;
+    }
+    
+    size_t row_size = strlen(sendable_to_sd_card_csv);
+    size_t current_fill = strlen(upload_accumulator_buffer);
+    size_t remaining = UPLOAD_BUFFER_SIZE - current_fill - 1;
+    
+    // Check if buffer is near full (80% threshold)
+    if (current_fill >= UPLOAD_BUFFER_DANGER) {
+        // Drop oldest half of entries
+        size_t half = UPLOAD_BUFFER_SIZE / 2;
+        
+        // Find a newline boundary to avoid cutting a row in half
+        size_t cut_point = half;
+        while (cut_point < current_fill && upload_accumulator_buffer[cut_point] != '\n') {
+            cut_point++;
+        }
+        
+        if (cut_point < current_fill) {
+            cut_point++; // Move past the newline
+            
+            // Shift remaining data to front
+            memmove(upload_accumulator_buffer, 
+                    upload_accumulator_buffer + cut_point, 
+                    current_fill - cut_point);
+            
+            // Clear the end
+            memset(upload_accumulator_buffer + (current_fill - cut_point), 
+                   0, 
+                   cut_point);
+            
+            current_fill = strlen(upload_accumulator_buffer);
+            remaining = UPLOAD_BUFFER_SIZE - current_fill - 1;
+            
+            // Adjust entry count (approximate)
+            accumulated_entries = accumulated_entries / 2;
+            
+            snprintf(accumulator_log, sizeof(accumulator_log),
+                     "[ACC] Buffer near-full: dropped oldest half, now %u/%u bytes",
+                     (unsigned int)current_fill, UPLOAD_BUFFER_SIZE);
+            LOG(accumulator_log);
+        }
+    }
+    
+    // Check if we have room for this row
+    if (remaining < row_size + 1) {
+        snprintf(accumulator_log, sizeof(accumulator_log),
+                 "[ACC] Buffer full! %u bytes, need %u - row dropped",
+                 (unsigned int)current_fill, (unsigned int)row_size);
+        LOG(accumulator_log);
+        return false;
+    }
+    
+    // Append the row to buffer
+    strncat(upload_accumulator_buffer, sendable_to_sd_card_csv, remaining);
+    accumulated_entries++;
+    
+    snprintf(accumulator_log, sizeof(accumulator_log),
+             "[ACC] Row %u bytes | Entry %u | Buffer %u/%u B",
+             (unsigned int)row_size, 
+             accumulated_entries,
+             (unsigned int)strlen(upload_accumulator_buffer),
+             UPLOAD_BUFFER_SIZE);
+    LOG(accumulator_log);
+    
+    // Signal ready when we have a full batch OR buffer is getting full
+    if (accumulated_entries >= ENTRIES_PER_UPLOAD || 
+        strlen(upload_accumulator_buffer) >= UPLOAD_BUFFER_DANGER) {
+        data_ready_for_upload = true;
+        snprintf(accumulator_log, sizeof(accumulator_log),
+                 "[ACC] Ready for upload: %u entries, %u bytes",
+                 accumulated_entries, (unsigned int)strlen(upload_accumulator_buffer));
+        LOG(accumulator_log);
+    }
+    
+    return true;
+}
+
+void handle_upload() { LOG ("UPLOADER FUNCTION CALLED...");
+    // ── 1. Time gate is already checked before calling ──
+    // But double-check to prevent race conditions
+    /*
+    bool time_to_upload = false;
+    if (!clock_is_working) {
+        time_to_upload = (now_now_ms - last_upload_time_ms) >= upload_interval_ms;
+    } else {
+        time_to_upload = sawa.isHourlyMarker(); // isHourlyMarker // is5MinuteMarker
+    }
+    
+    if (!time_to_upload) {
+        return;
+    }
+    */
+    
+    // Update timer immediately to prevent re-entrance
+    last_upload_time_ms = now_now_ms;
+    
+    LOG("Determining source of upload...");
+    // ── 2. Determine upload source ───────────────────────────────────
+    char* payload = NULL;
+    size_t payload_len = 0;
+    bool using_sd_card = false;
+    
+    // First try SD card queue
+    if (storage_initialized) { LOG("Copying from SD card...");
+        size_t queue_bytes = upload_queue_size();
+        if (queue_bytes > 0) {
+            payload = read_upload_queue(&payload_len);
+            using_sd_card = true;
+            Serial.printf("[Upload] Using SD queue: %u bytes\n", 
+                          (unsigned int)payload_len);
+        }
+    }
+    
+    else { LOG("GETTING FROM THE UPLOAD BUFFER");
+    // If no SD queue, try memory buffer
+    if (!payload || payload_len == 0) {
+        if(strlen(upload_accumulator_buffer) > 0)  data_ready_for_upload = true;
+
+        if (data_ready_for_upload) {
+            // data_ready_for_upload
+            payload_len = strlen(upload_accumulator_buffer);
+            payload = (char*)malloc(payload_len + 1);
+            if (payload) {
+                strcpy(payload, upload_accumulator_buffer);
+                Serial.printf("[Upload] Using memory buffer: %u bytes, %u entries\n",
+                              (unsigned int)payload_len, accumulated_entries);
+             }
+          }
+       }
+    
+    }
+
+    // Nothing to upload
+    if (!payload || payload_len == 0) {
+        LOG("[Upload] Nothing queued — skipping upload");
+        if (payload) free(payload);
+        return;
+    }
+
+    LOG("BUFFER FOUND, NOW SWITCHING RADIOS");
+    
+    // ── 3. Switch from ESP-NOW to WiFi ─────────────────────────────────
+    flash(now_now_ms, blinker, 500, 500, 0, 0);
+    
+    // Deinit ESP-NOW first
+    if (esp_now_deinit() != ESP_OK) {
+        LOG("[Upload] ESP-NOW deinit failed — aborting, data preserved");
+        if (payload) free(payload);
+        return;
+    }
+    
+    // Switch radio to WiFi
+    if (!switch_radio_to_wifi()) {
+        LOG("[Upload] WiFi switch failed — data preserved for next hour");
+        switch_radio_to_espnow();  // Switch back to ESP-NOW
+        upload_fail_count++;
+        if (payload) free(payload);
+        return;
+    }
+    
+    // Connect to WiFi
+    wifi_connected = wifi_obj.ensure_wifi();
+    if (!wifi_connected) {
+        LOG("[Upload] WiFi connect failed — data preserved for next hour");
+        switch_radio_to_espnow();
+        upload_fail_count++;
+        if (payload) free(payload);
+        return;
+    }
+
+    LOG("SUCCESSFULLY CONNECTED TO A WIFI NETWORK");
+    
+    delay(500);
+    
+    // ── 4. Attempt upload ─────────────────────────────────────────────────
+    Uploader.begin();
+    
+    snprintf(upload_log, sizeof(upload_log),
+             "Uploading %u bytes (%s)...",
+             (unsigned int)payload_len,
+             using_sd_card ? "SD queue" : "memory buffer");
+    LOG(upload_log);
+    
+    UploadStatus st = Uploader.upload_to_web_of_iot(payload);
+    
+    
+    
+    snprintf(upload_report, sizeof(upload_report), 
+             "[Upload] status=%d report=%s", (int)st, Uploader.get_upload_report());
+    LOG(upload_report);
+
+    // Show upload screen on e-paper
+    currentScreen = 20; 
+    special_call = true;
+    update_display();
+    
+    // ── 5. Handle result ──────────────────────────────────────────────────────
+    if (st == UPLOAD_HTTP_OK) {
+        last_upload_success = true;
+        last_http_code = 200;
+        
+        snprintf(last_upload_time, sizeof(last_upload_time), "%s", sawa.SystemTime);
+        snprintf(upload_log, sizeof(upload_log),
+                 "Uploaded at %s on %s (%u B)",
+                 sawa.ShortTime, sawa.SystemDate,
+                 (unsigned int)payload_len);
+        LOG(upload_log);
+        
+        // Clear the source that was used
+        if (using_sd_card) {
+            clear_upload_queue();
+        } else {
+            // Clear memory buffer
+            memset(upload_accumulator_buffer, 0, sizeof(upload_accumulator_buffer));
+            accumulated_entries = 0;
+            data_ready_for_upload = false;
+        }
+        
+        upload_fail_count = 0;
+        data_sent = true;
+        
+    } else {
+        upload_fail_count++;
+        snprintf(upload_error_code, sizeof(upload_error_code),
+                 "FAILED attempt %u at %s — data preserved",
+                 upload_fail_count, sawa.ShortTime);
+        LOG(upload_error_code);
+        
+        // After MAX_UPLOAD_FAILS, trim the data source
+        if (upload_fail_count >= MAX_UPLOAD_FAILS) {
+            if (using_sd_card) {
+                trim_sd_queue();
+            } else {
+                // Trim memory buffer - drop oldest half
+               // trim_memory_buffer();
+            }
+            upload_fail_count = 0;
+        }
+        
+        data_sent = false;
+    }
+    
+    free(payload);
+    
+    // ── 6. Switch back to ESP-NOW ─────────────────────────────────────────────
+    delay(500);
+    switch_radio_to_espnow();
+    wifi_connected = false;  // Reset WiFi flag
+}
+
+/*
+// Updated handle_upload() to check both SD queue and memory buffer
+void handle_upload() {
+    bool time_to_upload = false;
+    
+    // ── 1. Time gate ─────────────────────────────────────────────────────────
+    if (!sawa.isClockWorking()) {
+        // RTC absent — fall back to esp_timer
+        time_to_upload = (now_now_ms - last_upload_time_ms) >= upload_interval_ms;
+    } else {
+        // Use the hourly RTC marker — fires once per hour at :00 minutes
+       // time_to_upload = sawa.isHourlyMarker();
+        time_to_upload = sawa.is5MinuteMarker(); // delete after testing
+
+        if (time_to_upload) {
+            char hourly_msg[64];
+            snprintf(hourly_msg, sizeof(hourly_msg),
+                     "Hourly upload at %s", sawa.SystemTime);
+            Serial.println(hourly_msg);
+        }
+    }
+    
+    if (!time_to_upload) return;
+    
+    // Always update the timer so the fallback drift doesn't accumulate
+    last_upload_time_ms = now_now_ms;
+    
+    // ── 2. Determine source: SD card queue OR memory buffer ───────────────────
+    char* payload = NULL;
+    size_t payload_len = 0;
+    bool using_sd_card = false;
+    
+    // First try SD card queue
+    if (storage_initialized) {
+        size_t queue_bytes = upload_queue_size();
+        if (queue_bytes > 0) {
+            payload = read_upload_queue(&payload_len);
+            using_sd_card = true;
+            Serial.printf("[Upload] Using SD queue: %u bytes\n", 
+                          (unsigned int)payload_len);
+        }
+    }
+    
+    // If no SD queue or SD failed, try memory buffer
+    if (!payload || payload_len == 0) {
+        if (data_ready_for_upload && strlen(upload_accumulator_buffer) > 0) {
+            payload_len = strlen(upload_accumulator_buffer);
+            payload = (char*)malloc(payload_len + 1);
+            if (payload) {
+                strcpy(payload, upload_accumulator_buffer);
+                Serial.printf("[Upload] Using memory buffer: %u bytes, %u entries\n",
+                              (unsigned int)payload_len, accumulated_entries);
+            }
+        }
+    }
+    
+    // Nothing to upload
+    if (!payload || payload_len == 0) {
+        LOG("[Upload] Nothing queued — skipping");
+        if (payload) free(payload);
+        return;
+    }
+    
+    // ── 3. Radio switch to WiFi ───────────────────────────────────────────────
+    flash(now_now_ms, blinker, 500, 500, 0, 0);
+    
+    if (esp_now_deinit() != ESP_OK) {
+        LOG("[Upload] ESP-NOW deinit failed — aborting, data preserved");
+        switch_radio_to_espnow();
+        if (payload) free(payload);
+        return;
+    }
+    
+    if (!switch_radio_to_wifi()) {
+        LOG("[Upload] WiFi switch failed — data preserved for next hour");
+        switch_radio_to_espnow();
+        upload_fail_count++;
+        if (payload) free(payload);
+        return;
+    }
+    
+    wifi_connected = wifi_obj.ensure_wifi();
+    if (!wifi_connected) {
+        LOG("[Upload] WiFi connect failed — data preserved for next hour");
+        switch_radio_to_espnow();
+        upload_fail_count++;
+        if (payload) free(payload);
+        return;
+    }
+    
+    delay(500);
+    
+    // ── 4. Attempt upload ─────────────────────────────────────────────────────
+    Uploader.begin();
+    
+    snprintf(upload_log, sizeof(upload_log),
+             "Uploading %u bytes (%s)...",
+             (unsigned int)payload_len,
+             using_sd_card ? "SD queue" : "memory buffer");
+    Serial.println(upload_log);
+    
+    UploadStatus st = Uploader.upload_to_web_of_iot(payload);
+    
+    // Show upload screen on e-paper
+    currentScreen = 19; 
+    special_call = true;
+    update_display();
+    
+    snprintf(upload_report, sizeof(upload_report), 
+             "[Upload] status=%d report=%s", (int)st, Uploader.get_upload_report());
+    Serial.println(upload_report);
+    
+    // ── 5. Handle result ──────────────────────────────────────────────────────
+    if (st == UPLOAD_HTTP_OK) {
+        last_upload_success = true;
+        last_http_code = 200;
+        
+        snprintf(last_upload_time, sizeof(last_upload_time), "%s", sawa.SystemTime);
+        snprintf(upload_log, sizeof(upload_log),
+                 "Uploaded at %s on %s (%u B)",
+                 sawa.ShortTime, sawa.SystemDate,
+                 (unsigned int)payload_len);
+        LOG(upload_log);
+        
+        // Clear the source that was used
+        if (using_sd_card) {
+            clear_upload_queue();
+        } else {
+            // Clear memory buffer
+            memset(upload_accumulator_buffer, 0, sizeof(upload_accumulator_buffer));
+            accumulated_entries = 0;
+            data_ready_for_upload = false;
+        }
+        
+        upload_fail_count = 0;
+        data_sent = true;
+        
+    } else {
+        upload_fail_count++;
+        snprintf(upload_error_code, sizeof(upload_error_code),
+                 "FAILED attempt %u at %s — data preserved",
+                 upload_fail_count, sawa.ShortTime);
+        LOG(upload_error_code);
+        
+        // After MAX_UPLOAD_FAILS, trim the data source
+        if (upload_fail_count >= MAX_UPLOAD_FAILS) {
+            if (using_sd_card) {
+                // Trim SD queue (existing logic)
+                trim_sd_queue();
+            } else {
+                // Trim memory buffer - drop oldest half
+                size_t current_len = strlen(upload_accumulator_buffer);
+                size_t half = current_len / 2;
+                
+                // Find newline boundary
+                while (half < current_len && upload_accumulator_buffer[half] != '\n') {
+                    half++;
+                }
+                if (half < current_len) {
+                    half++; // Move past newline
+                    memmove(upload_accumulator_buffer, 
+                            upload_accumulator_buffer + half,
+                            current_len - half);
+                    memset(upload_accumulator_buffer + (current_len - half), 
+                           0, half);
+                    
+                    accumulated_entries = accumulated_entries / 2;
+                    
+                    snprintf(accumulator_log, sizeof(accumulator_log),
+                             "[Upload] Memory buffer trimmed: kept %u of %u bytes",
+                             (unsigned int)(current_len - half),
+                             (unsigned int)current_len);
+                    LOG(accumulator_log);
+                }
+            }
+            upload_fail_count = 0;
+        }
+        
+        data_sent = false;
+    }
+    
+    free(payload);
+    
+    // ── 6. Switch back to ESP-NOW ─────────────────────────────────────────────
+    delay(1000);
+    switch_radio_to_espnow();
+    currently_uploading = false;
+}
+*/
+
+// Helper function to trim SD queue (extract from your existing code)
+void trim_sd_queue() {
+    size_t trim_len = 0;
+    char* all = read_upload_queue(&trim_len);
+    
+    if (all && trim_len > 0) {
+        size_t mid = trim_len / 2;
+        while (mid < trim_len && all[mid] != '\n') mid++;
+        if (mid < trim_len) mid++;
+        
+        SD.remove(UPLOAD_QUEUE_FILE);
+        File qf = SD.open(UPLOAD_QUEUE_FILE, FILE_WRITE);
+        if (qf) {
+            qf.write((uint8_t*)(all + mid), trim_len - mid);
+            qf.flush();
+            qf.close();
+            Serial.printf("[Upload] Queue trimmed: kept %u of %u bytes\n",
+                          (unsigned int)(trim_len - mid),
+                          (unsigned int)trim_len);
+        }
+    }
+    if (all) free(all);
+}
+
+
+
+/*
 bool bind_dynamic_data_into_csv(){
 
 
@@ -3614,6 +5228,8 @@ bool bind_dynamic_data_into_csv(){
         LOG(csv_bind_log);
     }
 
+    copied_contents = len;
+
     bound_successfully = true;
 
     snprintf(csv_bind_log,
@@ -3621,59 +5237,171 @@ bool bind_dynamic_data_into_csv(){
              "[CSV] Serialized OK | %u bytes",
              (unsigned int)len);
 
-
     LOG(csv_bind_log);
 
-    // ── Accumulate into upload buffer ────────────────────────────────────────
-    size_t current_fill = strlen(sendable_to_cloud_db);
-    size_t row_size     = (size_t)len;
-    size_t remaining    = UPLOAD_BUFFER_SIZE - current_fill - 1;
 
-    // Near-choke: buffer over danger threshold — drop the oldest half
-    // This only happens if repeated upload failures have let it fill up
-    if (current_fill >= UPLOAD_BUFFER_DANGER) {
-        size_t half = UPLOAD_BUFFER_SIZE / 2;
-        // Shift second half to front, preserving the more recent entries
-        memmove(sendable_to_cloud_db, sendable_to_cloud_db + half,
-                UPLOAD_BUFFER_SIZE - half);
-        memset(sendable_to_cloud_db + (UPLOAD_BUFFER_SIZE - half), 0, half);
-        current_fill = strlen(sendable_to_cloud_db);
-        remaining    = UPLOAD_BUFFER_SIZE - current_fill - 1;
-        // Adjust entry count estimate (we dropped roughly half)
-        copied_entry = (copied_entry > ENTRIES_PER_UPLOAD / 2)
-                       ? (copied_entry - ENTRIES_PER_UPLOAD / 2)
-                       : 0;
-        LOG("[CSV] Upload buffer near-full: dropped oldest half");
-    }
-
-    if (remaining < row_size) {
-        // Still no room after choke-clear — this should never happen
-        // with 30kB, but log and skip rather than corrupt
-        LOG("[CSV] Upload buffer full — row dropped");
-        return false;
-    }
-
-    strncat(sendable_to_cloud_db, sendable_to_sd_card_csv, remaining);
-    copied_entry++;
-
-    snprintf(csv_bind_log, sizeof(csv_bind_log),
-             "[CSV] OK %u bytes | entry %u/%u | buf %u/%u B",
-             (unsigned int)row_size, copied_entry, ENTRIES_PER_UPLOAD,
-             (unsigned int)strlen(sendable_to_cloud_db),
-             (unsigned int)UPLOAD_BUFFER_SIZE);
-    LOG(csv_bind_log);
-
-    // Flag ready when we have a full batch
-    if (copied_entry >= ENTRIES_PER_UPLOAD) {
-        data_ready_for_upload = true;
-    }
+    //accumulate_into_upload_buffer(); // handled by a separate function
+    
 
     return bound_successfully;
 }
+*/
 
-//this is declared way up among the gulobals
-//const uint64_t upload_frequency_ms   = (10ULL * 60ULL * 1000ULL); // 10 minutes
+/*
+void handle_upload() {
 
+    // ── 1. Time gate ─────────────────────────────────────────────────────────
+    if (!sawa.isClockWorking()) {
+        // RTC absent — fall back to esp_timer
+        time_to_upload = (now_now_ms - last_upload_time_ms) >= upload_interval_ms;
+    } else {
+        // Use the hourly RTC marker — fires once per hour at :00 minutes
+        time_to_upload = sawa.isHourlyMarker();
+        if (time_to_upload) {
+            snprintf(_hourly_marked, sizeof(_hourly_marked),
+                     "Hourly upload at %s", sawa.SystemTime);
+            Serial.println(_hourly_marked);
+        }
+    }
+
+    if (!time_to_upload) return;
+
+    // Always update the timer so the fallback drift doesn't accumulate
+    last_upload_time_ms = now_now_ms;
+
+    // ── 2. Check if there is anything to upload ───────────────────────────────
+    size_t queue_bytes = upload_queue_size();
+    if (queue_bytes == 0) {
+        LOG("[Upload] Nothing queued — skipping");
+        return;
+    }
+
+    Serial.printf("[Upload] Queue: %u bytes — starting upload\n",
+                  (unsigned int)queue_bytes);
+
+    // ── 3. Read queue file into heap buffer ───────────────────────────────────
+    size_t payload_len = 0;
+    char* payload = read_upload_queue(&payload_len);
+    if (!payload || payload_len == 0) {
+        LOG("[Upload] Failed to read queue file");
+        if (payload) free(payload);
+        return;
+    }
+
+    // ── 4. Radio switch to WiFi ───────────────────────────────────────────────
+    flash(now_now_ms, blinker, 500, 500, 0, 0);
+
+    if (esp_now_deinit() != ESP_OK) {
+        LOG("[Upload] ESP-NOW deinit failed — aborting, data preserved");
+        switch_radio_to_espnow();
+        free(payload);
+        return;
+    }
+
+    if (!switch_radio_to_wifi()) {
+        LOG("[Upload] WiFi switch failed — data preserved for next hour");
+        switch_radio_to_espnow();
+        upload_fail_count++;
+        free(payload);
+        return;
+    }
+
+    wifi_connected = wifi_obj.ensure_wifi();
+    if (!wifi_connected) {
+        LOG("[Upload] WiFi connect failed — data preserved for next hour");
+        switch_radio_to_espnow();
+        upload_fail_count++;
+        free(payload);
+        return;
+    }
+
+    delay(500);
+
+    // ── 5. Attempt upload ─────────────────────────────────────────────────────
+    Uploader.begin();
+
+    snprintf(upload_log, sizeof(upload_log),
+             "Uploading %u bytes (%u rows approx)...",
+             (unsigned int)payload_len,
+             (unsigned int)(payload_len / 400 + 1));
+    Serial.println(upload_log);
+
+    UploadStatus st = Uploader.upload_to_web_of_iot(payload);
+    free(payload);   // always free regardless of outcome
+
+    // Show upload screen on e-paper
+    currentScreen = 19; special_call = true;
+    update_display();
+    snprintf(upload_report, sizeof(upload_report), "[Upload] status=%d  report=%s\n",   (int)st, Uploader.get_upload_report());
+    Serial.println(upload_report);
+
+    // ── 6. Handle result ──────────────────────────────────────────────────────
+   // if (st == UPLOAD_SUCCESS) { 
+    if (st == UPLOAD_HTTP_OK) {
+        last_upload_success = true;
+        last_http_code = 200;
+
+        snprintf(last_upload_time, sizeof(last_upload_time), "%s", sawa.SystemTime);
+        snprintf(upload_log, sizeof(upload_log),
+                 "Uploaded at %s on %s (%u B)",
+                 sawa.ShortTime, sawa.SystemDate,
+                 (unsigned int)queue_bytes);
+        LOG(upload_log);
+
+        clear_upload_queue();   // wipe the queue file — data is now in DB
+        upload_fail_count = 0;
+        data_sent = true;
+
+    } else {
+
+        upload_fail_count++;
+        snprintf(upload_error_code, sizeof(upload_error_code),
+                 "FAILED attempt %u at %s — queue preserved",
+                 upload_fail_count, sawa.ShortTime);
+        LOG(upload_error_code);
+
+        // After MAX_UPLOAD_FAILS the queue file is getting stale — drop oldest half.
+        // This prevents unbounded growth if WiFi is down for days.
+        if (upload_fail_count >= MAX_UPLOAD_FAILS) {
+
+            LOG("[Upload] Max retries — trimming oldest half of queue");
+
+            size_t trim_len = 0;
+            char* all = read_upload_queue(&trim_len);
+
+            if (all && trim_len > 0) {
+                // Find the midpoint at a clean newline boundary
+                size_t mid = trim_len / 2;
+                while (mid < trim_len && all[mid] != '\n') mid++;
+                if (mid < trim_len) mid++;   // step past the newline
+
+                // Rewrite the queue file with only the second half
+                SD.remove(UPLOAD_QUEUE_FILE);
+                File qf = SD.open(UPLOAD_QUEUE_FILE, FILE_WRITE);
+                if (qf) {
+                    qf.write((uint8_t*)(all + mid), trim_len - mid);
+                    qf.flush();
+                    qf.close();
+                    Serial.printf("[Upload] Queue trimmed: kept %u of %u bytes\n",
+                                  (unsigned int)(trim_len - mid),
+                                  (unsigned int)trim_len);
+                }
+            }
+            if (all) free(all);
+            upload_fail_count = 0;
+        }
+
+        data_sent = false;
+    }
+
+    // ── 7. Switch back to ESP-NOW ─────────────────────────────────────────────
+    delay(1000);
+    switch_radio_to_espnow();
+    currently_uploading = false;
+}
+*/
+
+/*
 char _10minute_marked[128] = "10-min marker at "; //   HH:MM:SS
 bool time_to_upload = false;
 void handle_upload(){
@@ -3796,7 +5524,7 @@ void handle_upload(){
     currently_uploading = false;
 
 }
-
+*/
 
 
 power_state_t get_power_state(float voltage) {
@@ -3857,14 +5585,12 @@ void update_power_settings() {
 //  Serial.print("Inside Temp: "); Serial.print(cabin_temperature);  Serial.print("\tFAN: ");
 
 
-void monitor_box_conditions() {
+void MonitorCabinet() {
 
-    // --- Read internal temperature ---
-    cabin_temperature = sawa.temp_reading; //real_time.getTemperature();
-
+    
     // ---------- FAN CONTROL (with hysteresis) ----------
     
-    if (cabin_temperature >= 30.5f && !innerFan_ON) { // turn fan ON
+    if (cabin_temperature >= 31.5f && !innerFan_ON) { // turn fan ON
         digitalWrite(innerFAN, HIGH);
         innerFan_ON = true;
         buzzer.beep(1, 50, 0);
@@ -3933,7 +5659,7 @@ bool switch_radio_to_wifi() {
   // Set WiFi mode before initialization
   WiFi.mode(WIFI_STA);
 
-//  snprintf(wifi_log, sizeof(wifi_log), " WiFi channel: %d\n", WiFi.channel());
+ //  snprintf(wifi_log, sizeof(wifi_log), " WiFi channel: %d\n", WiFi.channel());
 
   //Serial.println(wifi_log);
   
@@ -3991,56 +5717,10 @@ bool switch_radio_to_wifi() {
   return false;
 }
 
-// ====== Wi-Fi Connect Cycle ======
-bool connectKnownWiFi() {
-  bool connected_state = false;
-  
-  WiFi.mode(WIFI_STA);
-  WiFi.disconnect(true);
-  delay(100);
-
-  int n = WiFi.scanNetworks();
-  if (n <= 0) return false;
-
-  int bestIndex = -1, bestRSSI = -999;
-  for (int i = 0; i < n; i++) {
-    String foundSSID = WiFi.SSID(i);
-    int32_t rssi = WiFi.RSSI(i);
-    for (int j = 0; j < knownCount; j++) {
-      if (foundSSID == knownNetworks[j].SECRET_SSID) {
-        if (rssi > bestRSSI) { bestRSSI = rssi; bestIndex = j; }
-      }
-    }
-  }
-
-  if (bestIndex == -1) return false;
-
-  WiFi.begin(knownNetworks[bestIndex].SECRET_SSID, knownNetworks[bestIndex].SECRET_PASS);
-  unsigned long startAttempt = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 10000) {
-    delay(100);
-    yield();
-  }
-
-  if (WiFi.status() == WL_CONNECTED) {
-    //err = 14;
-    //error_log(err);
-    connected_state = true;
-   // return true;
-  } else { // WiFi connection failed
-    //err = 15;
-    //error_log(err);
-    connected_state = false;
-   // return false;
-  }
-
-  return connected_state;
-}
-
 // Add dynamic sleep based on conditions
 void optimize_power_consumption() {
     // Reduce update frequency during night/low activity
-    bool is_night = (hr > 20 || hr < 6);
+    bool is_night = (hawa > 20 || hawa < 6);
     bool low_activity = (average_temp < 18.0 && average_humi > 60.0); // go to idle at night
     
     if (is_night && low_activity) {
@@ -4133,118 +5813,8 @@ void enforce_bus_quiet() {
 
 
 
-uint64_t successful_uploads = 0;
-char successful_uploads_c[20] = ""; // 18
 
 
-
-
-/*
-void upload_to_web_of_iot(){ // (no leak, better status handling)
-  if (!wifi_connected) { Serial.println("Skip POST: WiFi down"); return; }
-  if (!hasFreshJson) { Serial.println("Skip POST: no fresh JSON"); return; }
-
-  Serial.printf("\tPOST JSON => %s\n\tTo: %s\n", httpsData, server_address);
-
-  WiFiClientSecure client;   // no heap leak
-  client.setInsecure();      // accept all certs (consider proper CA in production)
-
-  HTTPClient https;
-  if (https.begin(client, server_address)) {
-    https.setTimeout(15000); // 15s network timeout
-    https.addHeader("Content-Type", "application/json");
-
-    int httpResponse = https.POST((uint8_t*)httpsData, strlen(httpsData));
-    Serial.printf("HTTP Response: %d (%s)\n",
-                  httpResponse, https.errorToString(httpResponse).c_str());
-
-    if (httpResponse > 0 && (httpResponse/100) == 2) {
-      Serial.println("Uploaded Successfully");
-      // Optionally: String body = https.getString(); Serial.println(body);
-    } else {
-      Serial.println("Upload Failed");
-    }
-    https.end();
-  } else {
-    Serial.println("HTTP initialization failed!");
-  }
-  hasFreshJson = false; // mark consumed
-}
-*/
-
-/*
-void upload_to_web_of_iot(){
-   //  Serial.print("\tData to send via HTTP POST => ");    Serial.println(dataPack);    Serial.print("\tTo: "); Serial.println(server_address); 
-   
-    
-    // WiFiClientSecure client;
-    //client.setInsecure();
-    //HTTPClient https;
-   //std::unique_ptr<BearSSL::WiFiClientSecure>client(new BearSSL::WiFiClientSecure);
-    // Ignore SSL certificate validation
-    //client->setInsecure();
-    //setInsecure(); 
-    
-     //if(WiFi.status()== WL_CONNECTED){
-      WiFiClientSecure *client = new WiFiClientSecure; // must delete it once you’re done with the HTTP transaction to avoid a memory leak.
-      client->setInsecure(); //don't use SSL certificate
-    
-      HTTPClient https;
- 
-      Serial.println("Initializing HTTP...");
-      
-    //  bool initialized = https.begin(server_address); 
-        bool initialized = https.begin(*client, server_address); // Your Domain name with URL path or IP address with path
-
-        if(initialized){ 
-           
-              Serial.println("HTTP initialized Successfully!"); //Serial.println("Adding HTTP Header: \'Application/x-www-form-urlencoded'");
-      // Specify content-type header
-              https.addHeader("Content-Type", "application/json");  
-              delay(50);
-      
-      // Send HTTP POST request
-             int httpResponse = https.POST(httpsData);
-             delay(150);
-            
-            Serial.printf("HTTP Response: %d (%s)\n", httpResponse, https.errorToString(httpResponse).c_str());  Serial.println();
-            if(httpResponse == 200){
-              Serial.println("Uploaded Successfully, YeeeeY!"); Serial.println();
-            }
-            else if(httpResponse >= 600){
-              Serial.println("Failed to upload to server!"); Serial.println();
-            }
-
-            else if(httpResponse <= 0){
-              Serial.println("Insane Response!"); Serial.println("Failed to upload to server!");
-
-            }
-            else {
-              Serial.println("rESPONSE FUNNy!"); Serial.println("Failed to upload to server!");
-            }
-
-        }
-        else Serial.println("HTTPS initialization failed!");
-             
-    
-        Serial.println("Ending HTTP");
-      // Free resources
-      https.end();
-          
-    // now free the heap allocation
-    delete client;
-    client = nullptr;  // optional safety a good habit to avoid dangling pointers.
-    //}
-    //NOTE: If you repeatedly create/destroy clients in loop(), 
-    //this will fragment the ESP32 heap over time. 
-    //Stack allocation (WiFiClientSecure client;) is usually safer and lighter on small devices.
-    
-    //lastTime = millis();
-  //}
-
-}
-
-*/
 
 
 
@@ -4261,7 +5831,7 @@ char SleepPrompt[200];
 
 void sleep_dynamically() {
     // Add activity-based optimization
-    bool is_night = (hr > 20 || hr < 6);
+    bool is_night = (hawa > 20 || hawa < 6);
     bool low_activity = (average_temp < 18.0 && average_humi > 60.0); // night time: low temp, high humidity
     
     // Extend sleep during low activity periods
@@ -4544,7 +6114,6 @@ void drawTableFrame() {
     
 }
 
-char table_log[32] = "...";
 
 // Helper function to populate a row with data
 void drawTableRow(uint8_t rowIndex, const char* id, float temp, float humi, float pressure, const char* time) {
@@ -4696,9 +6265,27 @@ uint8_t which_data_table = 1; // show all as default
     otaPage() → OTA mode
 */
 
+
 bool shouldRotateScreen(uint64_t screen_time_ms = 0) {
-        // Display update (often in daytime, less frequent at night) 5mins vs 30mins
-   
+        // Display update (more often in daytime, less frequent at night) 5mins vs 30mins
+
+        
+         // dynamically establish refresh rate
+           //  screen_refresh_interval = set_refresh_rate();
+          is_night_time = (hawa >= 20 || hawa < 7)?true:false;  // if 24 hour system: 8pm to 7am... time for idling
+          is_at_peak_sunshine = (hawa > 9 && hawa < 15)?true:false; // 9am to 3pm...[and if solar radiation>1000W/m2]...time for peak peformance
+                
+          if(is_night_time) screen_refresh_interval = (60ULL*60ULL*1000ULL); //  refresh once every hour...maybe between light sleeps
+          else {
+                if(is_at_peak_sunshine) screen_refresh_interval = (1ULL*60ULL*1000ULL); // refresh once every minute
+                else screen_refresh_interval = (10ULL*60ULL*1000ULL); // refresh once every 10 minutes
+                // between 7am - 9am and between 1500 - 1959hrs, [2hrs+4hrs] ... 10min cycle
+          }
+          
+          
+          // screen_refresh_interval = (1ULL*60ULL*1000ULL);
+       
+          
     if ((screen_time_ms - last_refresh_time_ms) >= screen_refresh_interval) {
         last_refresh_time_ms = screen_time_ms;
           if(currentScreen > 5) currentScreen = 1;
@@ -4710,6 +6297,7 @@ bool shouldRotateScreen(uint64_t screen_time_ms = 0) {
 }
 
 void update_display(){
+        
     screen_is_changing = true;
     if((!shouldRotateScreen(now_now_ms)) && (!special_call)) // Most of the time: subtraction, compasison, branch, return...Calling a function every loop that usually returns immediately...microseconds
         return;
@@ -4725,22 +6313,28 @@ void update_display(){
         case 2: tablePage(); // having the table of results
             break;
 
-        case 3: graphPage(); // having graphs of inside vs outside temp
+        case 3: graphPage_temperatures(); // having graphs of inside vs outside temp
+            break;
+
+        case 4: graphPage_humidities();
             break;
         
-        case 4: filesPage(); // showing the folders in main directory
+        case 5: graphPage_pressures();
+            break;
+        
+        case 6: filesPage(); // showing the folders in main directory
         break;
 
-        case 5: logsPage(); // files, saves, cloud sends, offline sensors, etc
+        case 7: logsPage(); // files, saves, cloud sends, offline sensors, etc
             break;
 
-        case 6: cloudPage();
+        case 8: cloudPage();
             break;
 
         case 10: otaPage(); // showing OTA mode, WiFi, and IP
             break;
 
-        case 19: uploadScreen();
+        case 20: uploadPage();
             break;
 
         default: sleepPage();
@@ -4754,18 +6348,235 @@ void update_display(){
 
 }
 
-void uploadScreen(){
-        LCD.firstPage();
+void uploadPage() {
+    uint16_t accentColor = (LCD.epd2.hasColor ? GxEPD_RED : GxEPD_BLACK);
+    
+    uint64_t now = now_now_ms;
+    uint64_t elapsed = now - last_upload_time_ms;
+    
+    uint64_t remaining = 0;
+    if (elapsed < upload_frequency_ms)
+        remaining = upload_frequency_ms - elapsed;
+    
+    uint32_t rem_sec = remaining / 1000;
+    uint16_t rem_min = rem_sec / 60;
+    uint16_t rem_s = rem_sec % 60;
+    
+    // Get queue size
+    unsigned long queue_size = upload_queue_size();
+    
+    LCD.firstPage();
     do {
-            LCD.fillScreen(GxEPD_WHITE);
-
-            LCD.setFont(&FreeSans12pt7b);
-            LCD.setTextColor(GxEPD_WHITE);
-            LCD.setCursor(20, 28);
-            LCD.print("Cloud Connectivity");
-
+        LCD.fillScreen(GxEPD_WHITE);
+        
+        // ================= HEADER =================
+        LCD.fillRect(1, 1, SCREEN_W - 2, 40, accentColor);
+        
+        LCD.setFont(&FreeSans12pt7b);
+        LCD.setTextColor(GxEPD_WHITE);
+        LCD.setCursor(20, 28);
+        LCD.print("Cloud Upload");
+        
+        LCD.setTextColor(accentColor);
+        LCD.setCursor(SCREEN_W - 80, 28);
+        LCD.print("Queue");
+        
+        // ================= WIFI STATUS =================
+        int y = 60;
+        
+        LCD.setFont(&FreeSans9pt7b);
+        LCD.setTextColor(accentColor);
+        
+        // WiFi icon (simple)
+        if (wifi_connected) {
+            LCD.drawCircle(25, y + 8, 5, accentColor);
+            LCD.drawCircle(25, y + 8, 10, accentColor);
+            LCD.fillCircle(25, y + 8, 2, accentColor);
+        } else {
+            LCD.drawCircle(25, y + 8, 5, accentColor);
+            LCD.drawLine(20, y + 3, 30, y + 13, accentColor);
+        }
+        
+        LCD.setCursor(45, y + 12);
+        LCD.print("WiFi:");
+        
+        if (wifi_connected) {
+            LCD.setCursor(100, y + 12);
+            LCD.print(WiFi.SSID().substring(0, 12));
+            LCD.setCursor(100, y + 28);
+            LCD.print(WiFi.localIP());
+            y += 15;
+        } else {
+            LCD.setCursor(100, y + 12);
+            LCD.print("DISCONNECTED");
+        }
+        
+        y += 35;
+        
+        // ================= UPLOAD TIMING =================
+        LCD.drawLine(10, y, SCREEN_W - 10, y, accentColor);
+        y += 15;
+        
+        LCD.setCursor(20, y + 12);
+        LCD.print("Last Upload:");
+        LCD.setCursor(150, y + 12);
+        LCD.print(last_upload_time);
+        
+        y += 22;
+        
+        LCD.setCursor(20, y + 12);
+        LCD.print("Next Upload:");
+        LCD.setCursor(150, y + 12);
+        if (remaining > 0) {
+            LCD.printf("%02u:%02u", rem_min, rem_s);
+        } else {
+            LCD.print("READY");
+        }
+        
+        y += 22;
+        
+        LCD.setCursor(20, y + 12);
+        LCD.print("Interval:");
+        LCD.setCursor(150, y + 12);
+        LCD.printf("%llu min", (unsigned long long)(upload_frequency_ms / 60000ULL));
+        
+        y += 30;
+        
+        // ================= QUEUE STATUS =================
+        LCD.drawLine(10, y, SCREEN_W - 10, y, accentColor);
+        y += 15;
+        
+        LCD.setCursor(20, y + 12);
+        LCD.print("Queue Size:");
+        LCD.setCursor(150, y + 12);
+        
+        if (queue_size == 0) {
+            LCD.print("Empty");
+        } else {
+            LCD.printf("%lu bytes", queue_size);
+        }
+        
+        y += 22;
+        
+        LCD.setCursor(20, y + 12);
+        LCD.print("Pending Rows:");
+        LCD.setCursor(150, y + 12);
+        
+        if (queue_size == 0) {
+            LCD.print("0");
+        } else {
+            int rows = queue_size / 150; // Approx 150 bytes per row
+            LCD.printf("%d", rows);
+        }
+        
+        y += 30;
+        
+        // ================= LAST UPLOAD RESULT =================
+        LCD.drawLine(10, y, SCREEN_W - 10, y, accentColor);
+        y += 15;
+        
+        LCD.setCursor(20, y + 12);
+        LCD.print("Last Result:");
+        
+        if (last_upload_success) {
+            LCD.setCursor(130, y + 12);
+            LCD.setTextColor(GxEPD_RED);
+            LCD.print("SUCCESS");
+            LCD.setTextColor(accentColor);
+            LCD.setCursor(210, y + 12);
+           // LCD.printf("%d B", last_upload_size);
+        } else {
+            LCD.setCursor(130, y + 12);
+            LCD.setTextColor(accentColor);
+            LCD.print("FAILED");
+        }
+        
+        y += 22;
+        
+        LCD.setCursor(20, y + 12);
+        LCD.print("HTTP Code:");
+        LCD.setCursor(130, y + 12);
+        
+        if (last_http_code > 0) {
+            if (last_http_code == 200) {
+                LCD.setTextColor(GxEPD_RED);
+            }
+            LCD.printf("%d", last_http_code);
+            LCD.setTextColor(accentColor);
+        } else {
+            LCD.print("---");
+        }
+        
+        y += 30;
+        
+        // ================= DATA PREVIEW =================
+        LCD.drawLine(10, y, SCREEN_W - 10, y, accentColor);
+        y += 15;
+        
+        LCD.setCursor(20, y + 12);
+        LCD.print("Payload:");
+        LCD.setCursor(100, y + 12);
+        LCD.printf("%d bytes", strlen(sendable_to_cloud_db));
+        
+        y += 20;
+        
+        // Preview first line of data (truncated)
+        LCD.setFont(&FreeMono9pt7b);
+        LCD.setCursor(15, y + 10);
+        char preview[45];
+        strncpy(preview, sendable_to_cloud_db, 40);
+        preview[40] = '\0';
+        if (strlen(sendable_to_cloud_db) > 40) {
+            strcat(preview, "...");
+        }
+        LCD.print(preview);
+        
+        LCD.setFont(&FreeSans9pt7b);
+        
+        // ================= FOOTER =================
+        int footerY = SCREEN_H - 22;
+        LCD.drawLine(10, footerY, SCREEN_W - 10, footerY, accentColor);
+        
+        LCD.setCursor(10, footerY + 14);
+        LCD.printf("%s", sawa.ShortTime);
+        
+        LCD.setCursor(SCREEN_W - 70, footerY + 14);
+        LCD.print("v1.0");
+        
     } while (LCD.nextPage());
+}
 
+// Simplified cloud icon (no overlapping fills that cause EPD artifacts)
+void cloud_icon(int x, int y) {
+    uint16_t color = (LCD.epd2.hasColor ? GxEPD_RED : GxEPD_BLACK);
+    
+    // Draw cloud outline only (better for slow EPD)
+    LCD.drawCircle(x + 15, y + 15, 8, color);
+    LCD.drawCircle(x + 30, y + 15, 8, color);
+    LCD.drawCircle(x + 22, y + 8, 10, color);
+    LCD.drawRect(x + 8, y + 12, 30, 12, color);
+}
+
+// Simple WiFi arc drawing (no complex arcs for EPD)
+void draw_wifi_icon(int x, int y, bool connected) {
+    uint16_t color = (LCD.epd2.hasColor ? GxEPD_RED : GxEPD_BLACK);
+    
+    if (connected) {
+        // Draw 3 concentric quarter-circles for signal strength
+        for (int r = 3; r <= 9; r += 3) {
+            for (int angle = 200; angle <= 340; angle += 10) {
+                float rad = angle * 3.14159 / 180;
+                int x1 = x + r * cos(rad);
+                int y1 = y + r * sin(rad);
+                LCD.drawPixel(x1, y1, color);
+            }
+        }
+        LCD.fillCircle(x, y + 5, 2, color);
+    } else {
+        // Draw crossed-out circle
+        LCD.drawCircle(x, y + 5, 8, color);
+        LCD.drawLine(x - 6, y - 1, x + 6, y + 11, color);
+    }
 }
 
 
@@ -4861,35 +6672,1032 @@ void cloudPage(){
 
         LCD.setFont(&FreeMono9pt7b);
         LCD.setCursor(10, y);
-        //LCD.print(Uploader.get_upload_report());
+        LCD.print(upload_report);
 
         y += 20;
 
         LCD.setCursor(10, y);
-        LCD.print("Error Code:");
+        LCD.print("Upload Logs:");
         y += 15;
 
         LCD.setCursor(10, y);
-        //LCD.print(Uploader.get_error_code());
+        LCD.print(upload_log);
 
         footer();
 
     } while (LCD.nextPage());
 }
 
-/*
-void update_display(){
 
-  if(currentScreen == 1) homepage();
-  if(currentScreen == 2) dataPage();
-  if(currentScreen == 3) otaPage();
-  if(currentScreen == 4) logsPage();
-
-  LCD.hibernate();
+void graphPage_temperatures() {  // GRAPHS, CHARTS etc ----
+    LCD.firstPage();
+    do {
+        if (graph_mode == LINEGRAPH) { // line graph for inside vs outside temps, temporally varied 
+            uint16_t accentColor = (LCD.epd2.hasColor ? GxEPD_RED : GxEPD_BLACK);
+            
+            // ---- Header ----
+            LCD.fillRect(1, 1, SCREEN_W - 3, HEADER_H, accentColor);
+            LCD.fillRoundRect(260, 2, 120, 30, 5, GxEPD_WHITE);
+            
+            LCD.setFont(&FreeSans12pt7b);
+            LCD.setTextColor(GxEPD_BLACK);
+            LCD.setCursor(270, 22);
+            LCD.print("Graphs");
+            
+            LCD.setFont(&FreeSans9pt7b);
+            LCD.setTextColor(GxEPD_WHITE);
+            LCD.setCursor(20, 19);
+            LCD.print("Tiles");
+            
+            LCD.setCursor(140, 19);
+            LCD.print("Data Table");
+            
+            LCD.setFont();
+            LCD.setTextColor(GxEPD_RED);
+            LCD.setCursor(0, 285);
+            LCD.print(storage_status_log);
+            
+            // ===============================
+            // GRAPH AREA
+            // ===============================
+            
+            int graph_left   = 40;
+            int graph_right  = 360;
+            int graph_top    = 60;
+            int graph_bottom = 250;
+            
+            int graph_width  = graph_right - graph_left;
+            int graph_height = graph_bottom - graph_top;
+            
+            // ---- Draw Axes ----
+            LCD.drawLine(graph_left, graph_bottom, graph_right, graph_bottom, GxEPD_BLACK);
+            LCD.drawLine(graph_left, graph_bottom+1, graph_right, graph_bottom+1, GxEPD_BLACK);
+            LCD.drawLine(graph_left, graph_top, graph_left, graph_bottom, GxEPD_BLACK);
+            LCD.drawLine(graph_left-1, graph_top, graph_left-1, graph_bottom, GxEPD_BLACK);
+            
+            // ---- Axis Arrows ----
+            // X-axis arrow (pointing right)
+            LCD.fillTriangle(
+                graph_right, graph_bottom,
+                graph_right - 8, graph_bottom - 5,
+                graph_right - 8, graph_bottom + 5,
+                GxEPD_BLACK
+            );
+            
+            // Y-axis arrow (pointing up)
+            LCD.fillTriangle(
+                graph_left, graph_top,
+                graph_left - 5, graph_top + 8,
+                graph_left + 5, graph_top + 8,
+                GxEPD_BLACK
+            );
+            
+            // ---- Only draw if we have data ----
+            if (reading_count > 1) {
+                // FIXED SCALING
+                float minTemp = 15.0f;
+                float maxTemp = 55.0f;
+                float range   = maxTemp - minTemp;
+                
+                int prev_x1 = 0, prev_y1 = 0;  // inside
+                int prev_x2 = 0, prev_y2 = 0;  // outside
+                
+                // Store previous positions for value labels
+                int last_label_x = -100;
+                
+                for (int i = 0; i < reading_count; i++) {
+                    int x = graph_left + (graph_width * i) / (reading_count - 1);
+                    float inside  = historical_temperature_readings[i];
+                    float outside = historical_outside_temperatures[i];
+                    
+                    // Clamp both
+                    if (inside < minTemp) inside = minTemp;
+                    if (inside > maxTemp) inside = maxTemp;
+                    if (outside < minTemp) outside = minTemp;
+                    if (outside > maxTemp) outside = maxTemp;
+                    
+                    int y_inside  = graph_bottom - ((inside - minTemp) / range) * graph_height;
+                    int y_outside = graph_bottom - ((outside - minTemp) / range) * graph_height;
+                    
+                    // ---- DRAW OUTSIDE FIRST (background line) ----
+                    LCD.fillCircle(x, y_outside, 2, GxEPD_BLACK);
+                    if (i > 0) {
+                        LCD.drawLine(prev_x2, prev_y2, x, y_outside, GxEPD_BLACK);
+                    }
+                    
+                    // ---- DRAW INSIDE (accent color on top) ----
+                    LCD.fillCircle(x, y_inside, 3, accentColor);
+                    if (i > 0) {
+                        LCD.drawLine(prev_x1, prev_y1, x, y_inside, accentColor);
+                    }
+                    
+                    // ---- ADD TINY FONT READINGS ON DATA POINTS ----
+                    // Use smallest font for value labels
+                    LCD.setFont();  // Tiny <6pt font
+                    LCD.setTextColor(accentColor);
+                    
+                    // Show inside temperature value near the point
+                    char value_str[8];
+                    snprintf(value_str, sizeof(value_str), "%f", inside);
+                    int text_width = strlen(value_str) * 4;  // Approximate width
+                    
+                    // Position text above the point (offset to avoid overlapping)
+                    int label_x = x - 8;
+                    int label_y = y_inside - 8;
+                    
+                    // Avoid label collisions
+                    if (abs(x - last_label_x) > 25) {
+                        // Make sure label stays within graph bounds
+                        if (label_y > graph_top && label_y < graph_bottom - 10) {
+                            // Draw white background box for readability
+                            LCD.fillRect(label_x - 2, label_y - 8, text_width + 6, 12, GxEPD_WHITE);
+                            LCD.setCursor(label_x, label_y);
+                            LCD.print(value_str);
+                            
+                            // Add small degree symbol
+                            LCD.setCursor(label_x + text_width, label_y - 2);
+                            LCD.print("°");
+                            
+                            last_label_x = x;
+                        }
+                    }
+                    
+                    // Show outside temperature value (smaller, black)
+                    snprintf(value_str, sizeof(value_str), "%f", outside);
+                    LCD.setTextColor(GxEPD_BLACK);
+                    label_x = x + 5;
+                    label_y = y_outside - 8;
+                    
+                    if (abs(x - last_label_x) > 25) {
+                        if (label_y > graph_top && label_y < graph_bottom - 10) {
+                            LCD.fillRect(label_x - 2, label_y - 8, text_width + 6, 12, GxEPD_WHITE);
+                            LCD.setCursor(label_x, label_y);
+                            LCD.print(value_str);
+                        }
+                    }
+                    
+                    // Store previous positions
+                    prev_x1 = x;
+                    prev_y1 = y_inside;
+                    prev_x2 = x;
+                    prev_y2 = y_outside;
+                }
+                
+                // ---- Y-axis Labels ----
+                LCD.setFont(&FreeSans9pt7b);
+                LCD.setTextColor(GxEPD_BLACK);
+                LCD.setCursor(5, graph_top + 10);
+                LCD.print("55C");
+                LCD.setCursor(5, graph_bottom);
+                LCD.print("15C");
+                
+                // Add intermediate Y-axis labels with tiny font
+                LCD.setFont();
+                for (int temp = 20; temp <= 50; temp += 5) {
+                    int y = graph_bottom - ((temp - minTemp) / range) * graph_height;
+                    if (y > graph_top && y < graph_bottom) {
+                        char temp_str[8];
+                        snprintf(temp_str, sizeof(temp_str), "%d", temp);
+                        LCD.setCursor(3, y);
+                        LCD.print(temp_str);
+                    }
+                }
+                
+                // ---- Time Labels (X-axis) ----
+                LCD.setFont();  // Tiny font for time labels
+                LCD.setTextColor(GxEPD_BLACK);
+                
+                for (int i = 0; i < reading_count; i++) {
+                    int x = graph_left + (graph_width * i) / (reading_count - 1);
+                    
+                    if (strlen(time_stamps[i]) > 0) {
+                        int label_x = x - 15;
+                        int label_y = graph_bottom + 12;
+                        
+                        // Prevent overflow
+                        if (label_x < 2) label_x = 2;
+                        if (label_x > SCREEN_W - 40) label_x = SCREEN_W - 40;
+                        
+                        // Adaptive label density
+                        int step = (reading_count > 8) ? 2 : ((reading_count > 5) ? 2 : 1);
+                        if (i % step == 0) {
+                            LCD.setCursor(label_x, label_y);
+                            LCD.print(time_stamps[i]);
+                        }
+                    }
+                }
+                
+                // ---- Add legend with current values ----
+                LCD.setFont();
+                
+                // Inside temp legend (red)
+                LCD.fillRect(graph_right - 55, graph_top - 5, 50, 18, GxEPD_WHITE);
+                LCD.fillCircle(graph_right - 50, graph_top + 3, 3, accentColor);
+                LCD.setTextColor(accentColor);
+                LCD.setCursor(graph_right - 43, graph_top + 6);
+                LCD.print("In:");
+                
+                char current_inside[8];
+                snprintf(current_inside, sizeof(current_inside), "%.1f°C", historical_temperature_readings[reading_count - 1]);
+                LCD.setCursor(graph_right - 30, graph_top + 6);
+                LCD.print(current_inside);
+                
+                // Outside temp legend (black)
+                LCD.fillCircle(graph_right - 50, graph_top + 13, 3, GxEPD_BLACK);
+                LCD.setTextColor(GxEPD_BLACK);
+                LCD.setCursor(graph_right - 43, graph_top + 16);
+                LCD.print("Out:");
+                
+                char current_outside[8];
+                snprintf(current_outside, sizeof(current_outside), "%f°C", historical_outside_temperatures[reading_count - 1]);
+                LCD.setCursor(graph_right - 30, graph_top + 16);
+                LCD.print(current_outside);
+            }
+        }
+        
+        // Active sensors count
+        LCD.setFont(&FreeMono9pt7b);
+        LCD.setTextColor(GxEPD_RED);
+        LCD.setCursor(70, 70);
+        LCD.print(active_sensors);LCD.print(" internal sensors active");
+        
+    } while (LCD.nextPage());
 }
-*/
 
-void graphPage(){  //GRAPHS, CHARTS etc ----
+
+void graphPage_humidities() {
+    LCD.firstPage();
+    do {
+        uint16_t accentColor = (LCD.epd2.hasColor ? GxEPD_RED : GxEPD_BLACK);
+        
+        // ---- Header ----
+        LCD.fillRect(1, 1, SCREEN_W - 3, HEADER_H, accentColor);
+        LCD.fillRoundRect(260, 2, 120, 30, 5, GxEPD_WHITE);
+        
+        LCD.setFont(&FreeSans12pt7b);
+        LCD.setTextColor(GxEPD_BLACK);
+        LCD.setCursor(270, 22);
+        LCD.print("Graphs");
+        
+        LCD.setFont(&FreeSans9pt7b);
+        LCD.setTextColor(GxEPD_WHITE);
+        LCD.setCursor(20, 19);
+        LCD.print("Humidity");
+        
+        LCD.setCursor(140, 19);
+        LCD.print("Data Table");
+        
+        LCD.setFont();
+        LCD.setTextColor(GxEPD_RED);
+        LCD.setCursor(0, 285);
+        LCD.print(storage_status_log);
+        
+        // ===============================
+        // GRAPH AREA
+        // ===============================
+        
+        int graph_left   = 40;
+        int graph_right  = 360;
+        int graph_top    = 60;
+        int graph_bottom = 250;
+        
+        int graph_width  = graph_right - graph_left;
+        int graph_height = graph_bottom - graph_top;
+        
+        // ---- Draw Axes ----
+        LCD.drawLine(graph_left, graph_bottom, graph_right, graph_bottom, GxEPD_BLACK);
+        LCD.drawLine(graph_left, graph_bottom+1, graph_right, graph_bottom+1, GxEPD_BLACK);
+        LCD.drawLine(graph_left, graph_top, graph_left, graph_bottom, GxEPD_BLACK);
+        LCD.drawLine(graph_left-1, graph_top, graph_left-1, graph_bottom, GxEPD_BLACK);
+        
+        // ---- Axis Arrows ----
+        LCD.fillTriangle(graph_right, graph_bottom,
+                        graph_right - 8, graph_bottom - 5,
+                        graph_right - 8, graph_bottom + 5,
+                        GxEPD_BLACK);
+        
+        LCD.fillTriangle(graph_left, graph_top,
+                        graph_left - 5, graph_top + 8,
+                        graph_left + 5, graph_top + 8,
+                        GxEPD_BLACK);
+        
+        // ---- Draw humidity data ----
+        if (reading_count > 1) {
+            float minHumi = 0.0f;
+            float maxHumi = 100.0f;
+            float range = maxHumi - minHumi;
+            
+            int prev_x1 = 0, prev_y1 = 0;
+            int prev_x2 = 0, prev_y2 = 0;
+            int last_label_x = -100;
+            
+            for (int i = 0; i < reading_count; i++) {
+                int x = graph_left + (graph_width * i) / (reading_count - 1);
+                float inside = historical_humidity_readings[i];
+                float outside = historical_outside_humidities[i];
+                
+                if (inside < minHumi) inside = minHumi;
+                if (inside > maxHumi) inside = maxHumi;
+                if (outside < minHumi) outside = minHumi;
+                if (outside > maxHumi) outside = maxHumi;
+                
+                int y_inside = graph_bottom - ((inside - minHumi) / range) * graph_height;
+                int y_outside = graph_bottom - ((outside - minHumi) / range) * graph_height;
+                
+                // Draw outside (black)
+                LCD.fillCircle(x, y_outside, 2, GxEPD_BLACK);
+                if (i > 0) {
+                    LCD.drawLine(prev_x2, prev_y2, x, y_outside, GxEPD_BLACK);
+                }
+                
+                // Draw inside (red)
+                LCD.fillCircle(x, y_inside, 3, accentColor);
+                if (i > 0) {
+                    LCD.drawLine(prev_x1, prev_y1, x, y_inside, accentColor);
+                }
+                
+                // Add value labels
+                LCD.setFont();
+                
+                char value_str[8];
+                snprintf(value_str, sizeof(value_str), "%.0f", inside);
+                int text_width = strlen(value_str) * 4;
+                
+                if (abs(x - last_label_x) > 25) {
+                    int label_x = x - 8;
+                    int label_y = y_inside - 8;
+                    if (label_y > graph_top && label_y < graph_bottom - 10) {
+                        LCD.fillRect(label_x - 2, label_y - 8, text_width + 8, 12, GxEPD_WHITE);
+                        LCD.setTextColor(accentColor);
+                        LCD.setCursor(label_x, label_y);
+                        LCD.print(value_str);
+                        LCD.setCursor(label_x + text_width, label_y - 2);
+                        LCD.print("%");
+                        last_label_x = x;
+                    }
+                }
+                
+                snprintf(value_str, sizeof(value_str), "%.0f", outside);
+                int label_x = x + 5;
+                int label_y = y_outside - 8;
+                if (abs(x - last_label_x) > 25) {
+                    if (label_y > graph_top && label_y < graph_bottom - 10) {
+                        LCD.fillRect(label_x - 2, label_y - 8, text_width + 8, 12, GxEPD_WHITE);
+                        LCD.setTextColor(GxEPD_BLACK);
+                        LCD.setCursor(label_x, label_y);
+                        LCD.print(value_str);
+                    }
+                }
+                
+                prev_x1 = x;
+                prev_y1 = y_inside;
+                prev_x2 = x;
+                prev_y2 = y_outside;
+            }
+            
+            // Y-axis Labels
+            LCD.setFont(&FreeSans9pt7b);
+            LCD.setTextColor(GxEPD_BLACK);
+            LCD.setCursor(5, graph_top + 10);
+            LCD.print("100%");
+            LCD.setCursor(5, graph_bottom);
+            LCD.print("0%");
+            
+            LCD.setFont();
+            for (int humi = 20; humi <= 80; humi += 20) {
+                int y = graph_bottom - ((humi - minHumi) / range) * graph_height;
+                if (y > graph_top && y < graph_bottom) {
+                    char humi_str[8];
+                    snprintf(humi_str, sizeof(humi_str), "%d", humi);
+                    LCD.setCursor(2, y + 2);
+                    LCD.print(humi_str);
+                }
+            }
+            
+            // Comfort zone indicator (40-60%)
+            int comfort_top = graph_bottom - ((60 - minHumi) / range) * graph_height;
+            int comfort_bottom = graph_bottom - ((40 - minHumi) / range) * graph_height;
+            for (int y = comfort_bottom; y <= comfort_top; y++) {
+                LCD.drawPixel(graph_left - 3, y, GxEPD_RED);
+                LCD.drawPixel(graph_left - 4, y, GxEPD_RED);
+            }
+            
+            // Time Labels
+            LCD.setFont();
+            for (int i = 0; i < reading_count; i++) {
+                int x = graph_left + (graph_width * i) / (reading_count - 1);
+                if (strlen(time_stamps[i]) > 0) {
+                    int label_x = x - 15;
+                    int label_y = graph_bottom + 12;
+                    if (label_x < 2) label_x = 2;
+                    if (label_x > SCREEN_W - 40) label_x = SCREEN_W - 40;
+                    int step = (reading_count > 8) ? 2 : ((reading_count > 5) ? 2 : 1);
+                    if (i % step == 0) {
+                        LCD.setCursor(label_x, label_y);
+                        LCD.print(time_stamps[i]);
+                    }
+                }
+            }
+            
+            // Legend
+            LCD.setFont();
+            LCD.fillRect(graph_right - 55, graph_top - 5, 55, 18, GxEPD_WHITE);
+            LCD.fillCircle(graph_right - 50, graph_top + 3, 3, accentColor);
+            LCD.setTextColor(accentColor);
+            LCD.setCursor(graph_right - 43, graph_top + 6);
+            LCD.print("In:");
+            
+            char current_inside[8];
+            snprintf(current_inside, sizeof(current_inside), "%.0f%%", historical_humidity_readings[reading_count - 1]);
+            LCD.setCursor(graph_right - 30, graph_top + 6);
+            LCD.print(current_inside);
+            
+            LCD.fillCircle(graph_right - 50, graph_top + 13, 3, GxEPD_BLACK);
+            LCD.setTextColor(GxEPD_BLACK);
+            LCD.setCursor(graph_right - 43, graph_top + 16);
+            LCD.print("Out:");
+            
+            char current_outside[8];
+            snprintf(current_outside, sizeof(current_outside), "%.0f%%", historical_outside_humidities[reading_count - 1]);
+            LCD.setCursor(graph_right - 30, graph_top + 16);
+            LCD.print(current_outside);
+            
+            // Ideal zone label
+            LCD.setFont();
+            LCD.setTextColor(GxEPD_RED);
+            LCD.setCursor(graph_left - 35, (comfort_top + comfort_bottom) / 2);
+            LCD.print("IDEAL");
+        }
+        
+        // Active sensors count
+        LCD.setFont(&FreeMono9pt7b);
+        LCD.setTextColor(GxEPD_RED);
+        LCD.setCursor(70, 70);
+        LCD.print(active_sensors);
+        LCD.print(" internal sensors active");
+        
+    } while (LCD.nextPage());
+}
+
+
+void graphPage_pressures() {
+    LCD.firstPage();
+    do {
+        uint16_t accentColor = (LCD.epd2.hasColor ? GxEPD_RED : GxEPD_BLACK);
+        
+        // ---- Header ----
+        LCD.fillRect(1, 1, SCREEN_W - 3, HEADER_H, accentColor);
+        LCD.fillRoundRect(260, 2, 120, 30, 5, GxEPD_WHITE);
+        
+        LCD.setFont(&FreeSans12pt7b);
+        LCD.setTextColor(GxEPD_BLACK);
+        LCD.setCursor(270, 22);
+        LCD.print("Graphs");
+        
+        LCD.setFont(&FreeSans9pt7b);
+        LCD.setTextColor(GxEPD_WHITE);
+        LCD.setCursor(20, 19);
+        LCD.print("Pressure");
+        
+        LCD.setCursor(140, 19);
+        LCD.print("Data Table");
+        
+        LCD.setFont();
+        LCD.setTextColor(GxEPD_RED);
+        LCD.setCursor(0, 285);
+        LCD.print(storage_status_log);
+        
+        // ===============================
+        // GRAPH AREA
+        // ===============================
+        
+        int graph_left   = 40;
+        int graph_right  = 360;
+        int graph_top    = 60;
+        int graph_bottom = 250;
+        
+        int graph_width  = graph_right - graph_left;
+        int graph_height = graph_bottom - graph_top;
+        
+        // ---- Draw Axes ----
+        LCD.drawLine(graph_left, graph_bottom, graph_right, graph_bottom, GxEPD_BLACK);
+        LCD.drawLine(graph_left, graph_bottom+1, graph_right, graph_bottom+1, GxEPD_BLACK);
+        LCD.drawLine(graph_left, graph_top, graph_left, graph_bottom, GxEPD_BLACK);
+        LCD.drawLine(graph_left-1, graph_top, graph_left-1, graph_bottom, GxEPD_BLACK);
+        
+        // ---- Axis Arrows ----
+        LCD.fillTriangle(graph_right, graph_bottom,
+                        graph_right - 8, graph_bottom - 5,
+                        graph_right - 8, graph_bottom + 5,
+                        GxEPD_BLACK);
+        
+        LCD.fillTriangle(graph_left, graph_top,
+                        graph_left - 5, graph_top + 8,
+                        graph_left + 5, graph_top + 8,
+                        GxEPD_BLACK);
+        
+        // ---- Draw pressure data ----
+        if (reading_count > 1) {
+            // Pressure scale: 70kPa to 100kPa (typical range)
+            float minPress = 70.0f;
+            float maxPress = 100.0f;
+            float range = maxPress - minPress;
+            
+            int prev_x1 = 0, prev_y1 = 0;
+            int prev_x2 = 0, prev_y2 = 0;
+            int last_label_x = -100;
+            
+            for (int i = 0; i < reading_count; i++) {
+                int x = graph_left + (graph_width * i) / (reading_count - 1);
+                float inside = historical_pressure_readings[i];
+                float outside = historical_outside_pressures[i];
+                
+                // Clamp to scale
+                if (inside < minPress) inside = minPress;
+                if (inside > maxPress) inside = maxPress;
+                if (outside < minPress) outside = minPress;
+                if (outside > maxPress) outside = maxPress;
+                
+                int y_inside = graph_bottom - ((inside - minPress) / range) * graph_height;
+                int y_outside = graph_bottom - ((outside - minPress) / range) * graph_height;
+                
+                // Draw outside (black)
+                LCD.fillCircle(x, y_outside, 2, GxEPD_BLACK);
+                if (i > 0) {
+                    LCD.drawLine(prev_x2, prev_y2, x, y_outside, GxEPD_BLACK);
+                }
+                
+                // Draw inside (red)
+                LCD.fillCircle(x, y_inside, 3, accentColor);
+                if (i > 0) {
+                    LCD.drawLine(prev_x1, prev_y1, x, y_inside, accentColor);
+                }
+                
+                // Add value labels
+                LCD.setFont();
+                
+                char value_str[8];
+                snprintf(value_str, sizeof(value_str), "%.1f", inside);
+                int text_width = strlen(value_str) * 4;
+                
+                if (abs(x - last_label_x) > 25) {
+                    int label_x = x - 8;
+                    int label_y = y_inside - 8;
+                    if (label_y > graph_top && label_y < graph_bottom - 10) {
+                        LCD.fillRect(label_x - 2, label_y - 8, text_width + 8, 12, GxEPD_WHITE);
+                        LCD.setTextColor(accentColor);
+                        LCD.setCursor(label_x, label_y);
+                        LCD.print(value_str);
+                        LCD.setCursor(label_x + text_width, label_y - 2);
+                        LCD.print("k");
+                        last_label_x = x;
+                    }
+                }
+                
+                snprintf(value_str, sizeof(value_str), "%.1f", outside);
+                int label_x = x + 5;
+                int label_y = y_outside - 8;
+                if (abs(x - last_label_x) > 25) {
+                    if (label_y > graph_top && label_y < graph_bottom - 10) {
+                        LCD.fillRect(label_x - 2, label_y - 8, text_width + 8, 12, GxEPD_WHITE);
+                        LCD.setTextColor(GxEPD_BLACK);
+                        LCD.setCursor(label_x, label_y);
+                        LCD.print(value_str);
+                    }
+                }
+                
+                prev_x1 = x;
+                prev_y1 = y_inside;
+                prev_x2 = x;
+                prev_y2 = y_outside;
+            }
+            
+            // ---- Y-axis Labels ----
+            LCD.setFont(&FreeSans9pt7b);
+            LCD.setTextColor(GxEPD_BLACK);
+            LCD.setCursor(2, graph_top + 10);
+            LCD.print("100");
+            LCD.setCursor(2, graph_bottom);
+            LCD.print("70");
+            
+            // Add intermediate Y-axis labels (every 5 kPa)
+            LCD.setFont();
+            for (int press = 75; press <= 95; press += 5) {
+                int y = graph_bottom - ((press - minPress) / range) * graph_height;
+                if (y > graph_top && y < graph_bottom) {
+                    char press_str[8];
+                    snprintf(press_str, sizeof(press_str), "%d", press);
+                    LCD.setCursor(2, y + 2);
+                    LCD.print(press_str);
+                }
+            }
+            
+            // Add kPa unit label on Y-axis
+            LCD.setFont();
+            LCD.setTextColor(GxEPD_BLACK);
+            LCD.setCursor(2, graph_top - 5);
+            LCD.print("kPa");
+            
+            // Standard pressure indicator (101.325 kPa is sea level, but 101.3 is typical)
+            // Since our scale is 70-100, we're below sea level standard, so maybe show 85kPa as "AVG"
+            int avg_pressure = 85;
+            int avg_y = graph_bottom - ((avg_pressure - minPress) / range) * graph_height;
+            if (avg_y > graph_top && avg_y < graph_bottom) {
+                LCD.drawLine(graph_left - 5, avg_y, graph_left, avg_y, GxEPD_RED);
+                LCD.setFont();
+                LCD.setTextColor(GxEPD_RED);
+                LCD.setCursor(graph_left - 28, avg_y - 2);
+                LCD.print("AVG");
+            }
+            
+            // ---- Time Labels (X-axis) ----
+            LCD.setFont();
+            for (int i = 0; i < reading_count; i++) {
+                int x = graph_left + (graph_width * i) / (reading_count - 1);
+                if (strlen(time_stamps[i]) > 0) {
+                    int label_x = x - 15;
+                    int label_y = graph_bottom + 12;
+                    if (label_x < 2) label_x = 2;
+                    if (label_x > SCREEN_W - 40) label_x = SCREEN_W - 40;
+                    int step = (reading_count > 8) ? 2 : ((reading_count > 5) ? 2 : 1);
+                    if (i % step == 0) {
+                        LCD.setCursor(label_x, label_y);
+                        LCD.print(time_stamps[i]);
+                    }
+                }
+            }
+            
+            // ---- Legend with current values ----
+            LCD.setFont();
+            LCD.fillRect(graph_right - 55, graph_top - 5, 55, 18, GxEPD_WHITE);
+            LCD.fillCircle(graph_right - 50, graph_top + 3, 3, accentColor);
+            LCD.setTextColor(accentColor);
+            LCD.setCursor(graph_right - 43, graph_top + 6);
+            LCD.print("In:");
+            
+            char current_inside[8];
+            snprintf(current_inside, sizeof(current_inside), "%.1fk", historical_pressure_readings[reading_count - 1]);
+            LCD.setCursor(graph_right - 30, graph_top + 6);
+            LCD.print(current_inside);
+            
+            LCD.fillCircle(graph_right - 50, graph_top + 13, 3, GxEPD_BLACK);
+            LCD.setTextColor(GxEPD_BLACK);
+            LCD.setCursor(graph_right - 43, graph_top + 16);
+            LCD.print("Out:");
+            
+            char current_outside[8];
+            snprintf(current_outside, sizeof(current_outside), "%.1fk", historical_outside_pressures[reading_count - 1]);
+            LCD.setCursor(graph_right - 30, graph_top + 16);
+            LCD.print(current_outside);
+        }
+        
+        // Active sensors count
+        LCD.setFont(&FreeMono9pt7b);
+        LCD.setTextColor(GxEPD_RED);
+        LCD.setCursor(70, 70);
+        LCD.print(active_sensors);
+        LCD.print(" internal sensors active");
+        
+    } while (LCD.nextPage());
+}
+
+// Function to draw temperature graph
+void draw_temperature_graph(int graph_left, int graph_right, int graph_top, int graph_bottom,
+                            int graph_width, int graph_height, uint16_t accentColor) {
+    // FIXED SCALING for temperature
+    float minTemp = 15.0f;
+    float maxTemp = 55.0f;
+    float range = maxTemp - minTemp;
+    
+    if (reading_count > 1) {
+        int prev_x1 = 0, prev_y1 = 0;  // inside
+        int prev_x2 = 0, prev_y2 = 0;  // outside
+        int last_label_x = -100;
+        
+        for (int i = 0; i < reading_count; i++) {
+            int x = graph_left + (graph_width * i) / (reading_count - 1);
+            float inside = historical_temperature_readings[i];
+            float outside = historical_outside_temperatures[i];
+            
+            // Clamp both
+            if (inside < minTemp) inside = minTemp;
+            if (inside > maxTemp) inside = maxTemp;
+            if (outside < minTemp) outside = minTemp;
+            if (outside > maxTemp) outside = maxTemp;
+            
+            int y_inside = graph_bottom - ((inside - minTemp) / range) * graph_height;
+            int y_outside = graph_bottom - ((outside - minTemp) / range) * graph_height;
+            
+            // ---- DRAW OUTSIDE FIRST (background line) ----
+            LCD.fillCircle(x, y_outside, 2, GxEPD_BLACK);
+            if (i > 0) {
+                LCD.drawLine(prev_x2, prev_y2, x, y_outside, GxEPD_BLACK);
+            }
+            
+            // ---- DRAW INSIDE (accent color on top) ----
+            LCD.fillCircle(x, y_inside, 3, accentColor);
+            if (i > 0) {
+                LCD.drawLine(prev_x1, prev_y1, x, y_inside, accentColor);
+            }
+            
+            // ---- ADD TINY FONT READINGS ON DATA POINTS ----
+            LCD.setFont();
+            
+            // Show inside temperature value
+            char value_str[8];
+            snprintf(value_str, sizeof(value_str), "%.1f", inside);
+            int text_width = strlen(value_str) * 4;
+            
+            if (abs(x - last_label_x) > 25) {
+                int label_x = x - 8;
+                int label_y = y_inside - 8;
+                
+                if (label_y > graph_top && label_y < graph_bottom - 10) {
+                    LCD.fillRect(label_x - 2, label_y - 8, text_width + 6, 12, GxEPD_WHITE);
+                    LCD.setTextColor(accentColor);
+                    LCD.setCursor(label_x, label_y);
+                    LCD.print(value_str);
+                    LCD.setCursor(label_x + text_width, label_y - 2);
+                    LCD.print("°");
+                    last_label_x = x;
+                }
+            }
+            
+            // Show outside temperature value
+            snprintf(value_str, sizeof(value_str), "%.1f", outside);
+            int label_x = x + 5;
+            int label_y = y_outside - 8;
+            
+            if (abs(x - last_label_x) > 25) {
+                if (label_y > graph_top && label_y < graph_bottom - 10) {
+                    LCD.fillRect(label_x - 2, label_y - 8, text_width + 6, 12, GxEPD_WHITE);
+                    LCD.setTextColor(GxEPD_BLACK);
+                    LCD.setCursor(label_x, label_y);
+                    LCD.print(value_str);
+                }
+            }
+            
+            prev_x1 = x;
+            prev_y1 = y_inside;
+            prev_x2 = x;
+            prev_y2 = y_outside;
+        }
+        
+        // ---- Y-axis Labels ----
+        LCD.setFont(&FreeSans9pt7b);
+        LCD.setTextColor(GxEPD_BLACK);
+        LCD.setCursor(5, graph_top + 10);
+        LCD.print("55C");
+        LCD.setCursor(5, graph_bottom);
+        LCD.print("15C");
+        
+        // Add intermediate Y-axis labels
+        LCD.setFont();
+        for (int temp = 20; temp <= 50; temp += 5) {
+            int y = graph_bottom - ((temp - minTemp) / range) * graph_height;
+            if (y > graph_top && y < graph_bottom) {
+                char temp_str[8];
+                snprintf(temp_str, sizeof(temp_str), "%d", temp);
+                LCD.setCursor(2, y + 2);
+                LCD.print(temp_str);
+            }
+        }
+        
+        // ---- Time Labels ----
+        LCD.setFont();
+        for (int i = 0; i < reading_count; i++) {
+            int x = graph_left + (graph_width * i) / (reading_count - 1);
+            if (strlen(time_stamps[i]) > 0) {
+                int label_x = x - 15;
+                int label_y = graph_bottom + 12;
+                if (label_x < 2) label_x = 2;
+                if (label_x > SCREEN_W - 40) label_x = SCREEN_W - 40;
+                int step = (reading_count > 8) ? 2 : ((reading_count > 5) ? 2 : 1);
+                if (i % step == 0) {
+                    LCD.setCursor(label_x, label_y);
+                    LCD.print(time_stamps[i]);
+                }
+            }
+        }
+        
+        // ---- Legend ----
+        LCD.setFont();
+        LCD.fillRect(graph_right - 55, graph_top - 5, 50, 18, GxEPD_WHITE);
+        LCD.fillCircle(graph_right - 50, graph_top + 3, 3, accentColor);
+        LCD.setTextColor(accentColor);
+        LCD.setCursor(graph_right - 43, graph_top + 6);
+        LCD.print("In:");
+        
+        char current_inside[8];
+        snprintf(current_inside, sizeof(current_inside), "%.1f°C", historical_temperature_readings[reading_count - 1]);
+        LCD.setCursor(graph_right - 30, graph_top + 6);
+        LCD.print(current_inside);
+        
+        LCD.fillCircle(graph_right - 50, graph_top + 13, 3, GxEPD_BLACK);
+        LCD.setTextColor(GxEPD_BLACK);
+        LCD.setCursor(graph_right - 43, graph_top + 16);
+        LCD.print("Out:");
+        
+        char current_outside[8];
+        snprintf(current_outside, sizeof(current_outside), "%.1f°C", historical_outside_temperatures[reading_count - 1]);
+        LCD.setCursor(graph_right - 30, graph_top + 16);
+        LCD.print(current_outside);
+    }
+}
+
+// Function to draw humidity graph
+void draw_humidity_graph(int graph_left, int graph_right, int graph_top, int graph_bottom,
+                         int graph_width, int graph_height, uint16_t accentColor) {
+    // FIXED SCALING for humidity (0% to 100%)
+    float minHumi = 0.0f;
+    float maxHumi = 100.0f;
+    float range = maxHumi - minHumi;
+    
+    if (reading_count > 1) {
+        int prev_x1 = 0, prev_y1 = 0;  // inside
+        int prev_x2 = 0, prev_y2 = 0;  // outside
+        int last_label_x = -100;
+        
+        for (int i = 0; i < reading_count; i++) {
+            int x = graph_left + (graph_width * i) / (reading_count - 1);
+            float inside = historical_humidity_readings[i];
+            float outside = historical_outside_humidities[i];
+            
+            // Clamp both (0-100%)
+            if (inside < minHumi) inside = minHumi;
+            if (inside > maxHumi) inside = maxHumi;
+            if (outside < minHumi) outside = minHumi;
+            if (outside > maxHumi) outside = maxHumi;
+            
+            int y_inside = graph_bottom - ((inside - minHumi) / range) * graph_height;
+            int y_outside = graph_bottom - ((outside - minHumi) / range) * graph_height;
+            
+            // ---- DRAW OUTSIDE FIRST (background line) ----
+            LCD.fillCircle(x, y_outside, 2, GxEPD_BLACK);
+            if (i > 0) {
+                LCD.drawLine(prev_x2, prev_y2, x, y_outside, GxEPD_BLACK);
+            }
+            
+            // ---- DRAW INSIDE (accent color on top) ----
+            LCD.fillCircle(x, y_inside, 3, accentColor);
+            if (i > 0) {
+                LCD.drawLine(prev_x1, prev_y1, x, y_inside, accentColor);
+            }
+            
+            // ---- ADD TINY FONT READINGS ON DATA POINTS ----
+            LCD.setFont();
+            
+            // Show inside humidity value
+            char value_str[8];
+            snprintf(value_str, sizeof(value_str), "%.0f", inside);  // No decimal for humidity
+            int text_width = strlen(value_str) * 4;
+            
+            if (abs(x - last_label_x) > 25) {
+                int label_x = x - 8;
+                int label_y = y_inside - 8;
+                
+                if (label_y > graph_top && label_y < graph_bottom - 10) {
+                    LCD.fillRect(label_x - 2, label_y - 8, text_width + 8, 12, GxEPD_WHITE);
+                    LCD.setTextColor(accentColor);
+                    LCD.setCursor(label_x, label_y);
+                    LCD.print(value_str);
+                    LCD.setCursor(label_x + text_width, label_y - 2);
+                    LCD.print("%");
+                    last_label_x = x;
+                }
+            }
+            
+            // Show outside humidity value
+            snprintf(value_str, sizeof(value_str), "%.0f", outside);
+            int label_x = x + 5;
+            int label_y = y_outside - 8;
+            
+            if (abs(x - last_label_x) > 25) {
+                if (label_y > graph_top && label_y < graph_bottom - 10) {
+                    LCD.fillRect(label_x - 2, label_y - 8, text_width + 8, 12, GxEPD_WHITE);
+                    LCD.setTextColor(GxEPD_BLACK);
+                    LCD.setCursor(label_x, label_y);
+                    LCD.print(value_str);
+                }
+            }
+            
+            prev_x1 = x;
+            prev_y1 = y_inside;
+            prev_x2 = x;
+            prev_y2 = y_outside;
+        }
+        
+        // ---- Y-axis Labels for Humidity ----
+        LCD.setFont(&FreeSans9pt7b);
+        LCD.setTextColor(GxEPD_BLACK);
+        LCD.setCursor(5, graph_top + 10);
+        LCD.print("100%");
+        LCD.setCursor(5, graph_bottom);
+        LCD.print("0%");
+        
+        // Add intermediate Y-axis labels (every 20%)
+        LCD.setFont();
+        for (int humi = 20; humi <= 80; humi += 20) {
+            int y = graph_bottom - ((humi - minHumi) / range) * graph_height;
+            if (y > graph_top && y < graph_bottom) {
+                char humi_str[8];
+                snprintf(humi_str, sizeof(humi_str), "%d", humi);
+                LCD.setCursor(2, y + 2);
+                LCD.print(humi_str);
+            }
+        }
+        
+        // Add comfort zone indicators (40-60% is ideal)
+        int comfort_top = graph_bottom - ((60 - minHumi) / range) * graph_height;
+        int comfort_bottom = graph_bottom - ((40 - minHumi) / range) * graph_height;
+        for (int y = comfort_bottom; y <= comfort_top; y++) {
+            LCD.drawPixel(graph_left - 3, y, GxEPD_RED);
+            LCD.drawPixel(graph_left - 4, y, GxEPD_RED);
+        }
+        
+        // ---- Time Labels ----
+        LCD.setFont();
+        for (int i = 0; i < reading_count; i++) {
+            int x = graph_left + (graph_width * i) / (reading_count - 1);
+            if (strlen(time_stamps[i]) > 0) {
+                int label_x = x - 15;
+                int label_y = graph_bottom + 12;
+                if (label_x < 2) label_x = 2;
+                if (label_x > SCREEN_W - 40) label_x = SCREEN_W - 40;
+                int step = (reading_count > 8) ? 2 : ((reading_count > 5) ? 2 : 1);
+                if (i % step == 0) {
+                    LCD.setCursor(label_x, label_y);
+                    LCD.print(time_stamps[i]);
+                }
+            }
+        }
+        
+        // ---- Legend for Humidity ----
+        LCD.setFont();
+        LCD.fillRect(graph_right - 55, graph_top - 5, 55, 18, GxEPD_WHITE);
+        LCD.fillCircle(graph_right - 50, graph_top + 3, 3, accentColor);
+        LCD.setTextColor(accentColor);
+        LCD.setCursor(graph_right - 43, graph_top + 6);
+        LCD.print("In:");
+        
+        char current_inside[8];
+        snprintf(current_inside, sizeof(current_inside), "%.0f%%", historical_humidity_readings[reading_count - 1]);
+        LCD.setCursor(graph_right - 30, graph_top + 6);
+        LCD.print(current_inside);
+        
+        LCD.fillCircle(graph_right - 50, graph_top + 13, 3, GxEPD_BLACK);
+        LCD.setTextColor(GxEPD_BLACK);
+        LCD.setCursor(graph_right - 43, graph_top + 16);
+        LCD.print("Out:");
+        
+        char current_outside[8];
+        snprintf(current_outside, sizeof(current_outside), "%.0f%%", historical_outside_humidities[reading_count - 1]);
+        LCD.setCursor(graph_right - 30, graph_top + 16);
+        LCD.print(current_outside);
+        
+        // Add comfort zone label
+        LCD.setFont();
+        LCD.setTextColor(GxEPD_RED);
+        LCD.setCursor(graph_left - 35, (comfort_top + comfort_bottom) / 2);
+        LCD.print("IDEAL");
+    }
+}
+
+// Variables to track graph type
+enum GraphDataType {
+    TEMP_GRAPH,
+    HUMI_GRAPH
+};
+GraphDataType graph_data_type = TEMP_GRAPH;
+
+// Function to toggle between graph types
+void toggle_graph_type() {
+    if (graph_data_type == TEMP_GRAPH) {
+        graph_data_type = HUMI_GRAPH;
+    } else {
+        graph_data_type = TEMP_GRAPH;
+    }
+}
+
+// Button handler to switch graphs
+void handle_graph_toggle() {
+    static uint32_t last_toggle = 0;
+    if ((now_now_ms - last_toggle) > 500) {  // Debounce
+        toggle_graph_type();
+        last_toggle = now_now_ms;
+        
+        // Update header to show current graph type
+        snprintf(updates_log, sizeof(updates_log), 
+                 "Switched to %s graph", 
+                 graph_data_type == TEMP_GRAPH ? "Temperature" : "Humidity");
+        LOG(updates_log);
+    }
+}
+
+
+
+/*
+void graphPage(){  //GRAPHS, CHARTS etc FOR TEMPERATURE INSIDE AND OUTSIDE
       LCD.firstPage();
   do {
 
@@ -4961,28 +7769,8 @@ void graphPage(){  //GRAPHS, CHARTS etc ----
             float minTemp = 15.0f;
             float maxTemp = 55.0f;
             float range   = maxTemp - minTemp;
-            /*
-            //DYNAMIC SCALING
-
-            // Find min & max for scaling
-            float minTemp = historical_temperature_readings[0];
-            float maxTemp = historical_temperature_readings[0];
-
-            for(int i = 0; i < reading_count; i++){
-                if(historical_temperature_readings[i] < minTemp)
-                    minTemp = historical_temperature_readings[i];
-                if(historical_temperature_readings[i] > maxTemp)
-                    maxTemp = historical_temperature_readings[i];
-            }
-
-            // Prevent flat-line divide-by-zero
-            if(maxTemp - minTemp < 0.5f){
-                maxTemp += 0.5f;
-                minTemp -= 0.5f;
-            }
-
-            float range = maxTemp - minTemp;
-            */
+        
+        // PUT DYNAMIC SCALING HERE
 
             int prev_x1 = 0, prev_y1 = 0;  // inside
             int prev_x2 = 0, prev_y2 = 0;  // outside
@@ -5037,12 +7825,7 @@ void graphPage(){  //GRAPHS, CHARTS etc ----
                 LCD.print("15C");
 
              //Add faint horizontal lines every 5°C:
-             /*
-            for(int t = 20; t <= 50; t += 5){
-                int y = graph_bottom - ((t - minTemp) / range) * graph_height;
-                LCD.drawLine(graph_left, y, graph_right, y, GxEPD_RED);
-            }
-            */
+             
 
            // ---- Time Labels (X-axis) ----
                 LCD.setFont(&FreeSans9pt7b);
@@ -5087,6 +7870,43 @@ void graphPage(){  //GRAPHS, CHARTS etc ----
   } while (LCD.nextPage());
     
 }
+
+/*
+            //DYNAMIC SCALING
+
+            // Find min & max for scaling
+            float minTemp = historical_temperature_readings[0];
+            float maxTemp = historical_temperature_readings[0];
+
+            for(int i = 0; i < reading_count; i++){
+                if(historical_temperature_readings[i] < minTemp)
+                    minTemp = historical_temperature_readings[i];
+                if(historical_temperature_readings[i] > maxTemp)
+                    maxTemp = historical_temperature_readings[i];
+            }
+
+            // Prevent flat-line divide-by-zero
+            if(maxTemp - minTemp < 0.5f){
+                maxTemp += 0.5f;
+                minTemp -= 0.5f;
+            }
+
+            float range = maxTemp - minTemp;
+*/
+
+
+
+/*
+void update_display(){
+
+  if(currentScreen == 1) homepage();
+  if(currentScreen == 2) dataPage();
+  if(currentScreen == 3) otaPage();
+  if(currentScreen == 4) logsPage();
+
+  LCD.hibernate();
+}
+*/
 
 
 void filesPage(){
@@ -5179,14 +7999,14 @@ void filesPage(){
     // JSON (left)
     drawFileIcon(40, startY,
                  "JSON LOG",
-                 jsonSize,
+                 json_currentSize,
                  last_json_save_time,
                  accentColor);
 
     // CSV (right)
     drawFileIcon(40 + boxW + gapX, startY,
                  "CSV LOG",
-                 csvSize,
+                 csv_currentSize,
                  last_csv_save_time,
                  GxEPD_BLACK);
 
@@ -5573,7 +8393,7 @@ void otaPage() {
         LCD.fillRoundRect(290, connectionY - 5, 40, 30, 4, GxEPD_WHITE);
 
         // Screen content - tiny "OTA" text to show it's updating
-        LCD.setFont(&FreeSans6pt7b);
+        LCD.setFont();
         LCD.setTextColor(accentBlack);
         LCD.setCursor(298, connectionY + 12);
         LCD.print("OTA");
@@ -6068,6 +8888,34 @@ void homepage() {
 
 
 
+
+        // OUTDOOR CONDITIONS REPLACE THE WEATHER PARAMETERS
+        
+      // ---- outer temp ----
+      uint16_t fanColor = (LCD.epd2.hasColor ? GxEPD_RED : GxEPD_BLACK);
+      drawInfoBox(LEFT_X, BOTTOM_ROW_Y, "Outdoor Temperature", fanColor, fanColor);
+
+     //   LCD.setTextColor((LCD.epd2.hasColor ? GxEPD_RED : GxEPD_BLACK));
+         LCD.setFont(&FreeSansBold24pt7b);       LCD.setTextColor(fanColor);
+         LCD.setCursor(60, (215)); LCD.printf("%.1f", sensor_12_temp); 
+         LCD.setFont();  // FreeMono9pt7b
+         LCD.setCursor(50, (232)); LCD.print("Celcius Degrees");
+
+      // ---- outer humi ----
+      drawInfoBox(RIGHT_X, BOTTOM_ROW_Y, "Outdoor R. Humidity", fanColor, fanColor);
+
+      LCD.setTextColor(fanColor);
+      LCD.setCursor(RIGHT_X + 60, BOTTOM_ROW_Y + 45);
+      
+
+      LCD.setFont(&FreeSansBold24pt7b); 
+         LCD.setCursor(20+(60+box_width), (215));    LCD.printf("%.1f", sensor_12_humidity);
+
+         LCD.setFont(); LCD.setTextColor((LCD.epd2.hasColor ? GxEPD_RED : GxEPD_BLACK)); //FreeMono9pt7b
+         LCD.setCursor(90+(box_width), (232));  LCD.print("Percent");
+        
+        /*
+
       // ---- Solar Radiation ----
       uint16_t fanColor = (LCD.epd2.hasColor ? GxEPD_RED : GxEPD_BLACK);
       drawInfoBox(LEFT_X, BOTTOM_ROW_Y, "Solar Radiation", fanColor, fanColor);
@@ -6094,11 +8942,10 @@ void homepage() {
 
          LCD.setFont(); LCD.setTextColor((LCD.epd2.hasColor ? GxEPD_RED : GxEPD_BLACK)); //FreeMono9pt7b
          LCD.setCursor(90+(box_width), (232));  LCD.print("metres / second");
+
+         */
         
                footer(); // semi universal footing
-
-    //} // side_scroll == 1
-      
       
 
   } while (LCD.nextPage());
@@ -6160,12 +9007,11 @@ void footer(){
             LCD.setTextColor(GxEPD_WHITE);
     
             //DATE
-            LCD.setCursor(2, 290);  LCD.print(clock_is_working?sawa.SystemDate:"Clock not working"); 
+            LCD.setCursor(2, 290);  LCD.print(clock_is_working?sawa.SystemDate:"Sawa Teliiko!"); 
 
             //NETWORK BARS  // WIFI & UPLOADS
             LCD.fillRect(230, 293, 6, 5, GxEPD_WHITE); LCD.fillRect(240, 283, 6, 15, GxEPD_WHITE); LCD.fillRect(250, 274, 6, 25, GxEPD_WHITE);
-            LCD.setFont();
-            //LCD.setCursor(200, 290); LCD.print("WiFi: "); 
+            LCD.setFont();   //LCD.setCursor(200, 290); LCD.print("WiFi: "); 
             LCD.setCursor(224, 280); LCD.print(wifi_connected?"ON":"OFF");
            // if(successful_uploads) {LCD.setCursor(265, 275); LCD.print("(");LCD.print(successful_uploads_c);LCD.print(")"); }
             
@@ -6179,13 +9025,13 @@ void footer(){
             //TIME
             LCD.setTextColor(GxEPD_WHITE);
             LCD.setFont(&FreeSans9pt7b); //FreeMono12pt7b
-            LCD.setCursor(320, 290); LCD.print(sawa.ShortTime);
+            LCD.setCursor(320, 290); LCD.print(clock_is_working?sawa.ShortTime:"Sawa Teliiko!"); 
           //  LCD.setFont(&FreeMono9pt7b);
           //  LCD.setCursor(385, 292); LCD.print(DISP_MODE);
 }
 
 
-
+// bundle of JOY
 
 /*
 bool bind_dynamic_data_into_json(){
@@ -6383,37 +9229,36 @@ bool bind_dynamic_data_into_json(){
 ]
 */
 
+
 /*
+void esp_now_packet_handler_task(void * pvParams) { 
+  uint8_t checkin_frequency = 1; // check each millisecond to ensure no packet is lost
+ TickType_t prev_check_time = xTaskGetTickCount();
 
-void prepare_JSON_file(){ // bundle of JOY
-strcpy(httpsData, "");
-
-     JSON_data["PassKey"] = "Dryer_Kima";
-     JSON_data["Air_Temperature"] = temp1;  // float, env't temp, rs485
-     JSON_data["Air_Humidity"] = humidity;  // float, env't humi, rs485
-     JSON_data["Air_Speed"] =  wind_speed; // float, env't speed, rs485
-
-     JSON_data["Atmospheric_Pressure"] = atm_pressure;
-     JSON_data["Internal_Temp"] = cabin_temperature; 
-     JSON_data["Internal_Fan"] = innerFan_ON; 
-     JSON_data["Night_Light"] = night_Light_ON;
-
-     JSON_data["Voltage"] =  voltage;
-
-     JSON_data["ON_TIME"] = now_now_ms;
-     JSON_data["Hour"] = hr; 
-     JSON_data["Minute"] = mint;  
-     JSON_data["Second"] =  sec;
-     JSON_data["Date"] =  SystemDate;
-
-
-    serializeJson(JSON_data, httpsData);  //Serial.println(output);
-
-      
-}  
+  const TickType_t xDelay = pdMS_TO_TICKS(checkin_frequency);
+  while (true) {
+      if(packet_received) {  extract_readings(); packet_received = false; buzzer.beep(1,50,0);  } //this runs async but what happens when all crossfire
+      vTaskDelay(xDelay); // or use vTashdelayUntil
+  }
+} 
 
 */
 
+/*
+void esp_now_packet_handler_task(void *pvParams) {
+    ReceivedPacket packet;
+
+    while (true) {
+        if (xQueueReceive(packetQueue, &packet, portMAX_DELAY) == pdTRUE) {
+
+            extract_readings_from_packet(&packet);
+
+            buzzer.beep(1, 50, 0);
+
+        }
+    }
+}
+*/
 
 
 
@@ -6424,6 +9269,8 @@ strcpy(httpsData, "");
 This is exactly what ESP-NOW callbacks should do.
 */
 /*
+char dataPack[250] = ""; // receivable
+
 void OnSensorData_received(const uint8_t * mac, const uint8_t *incomingData, int len){
      //   memcpy(&fetch, incomingData, min(len, sizeof(dryerData))); // no matching function for call to 'min(int&, unsigned int)'
         // The compiler will complain because len is an int, while sizeof(dryerData) is an unsigned int (size_t).
