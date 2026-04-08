@@ -6,9 +6,9 @@ const char *OTA_PASS = "12!34";
 const char *devicename = "Dryer_Datalogger";
 const char *server_address = "https://webofiot.com/dryers/muarik/susan_databank/api/server.php/";
 
-const char Manufacturer[15] = "IntelliSys UG";
-const char DeviceID[32] = "Dryer Monitoring System";
-const char DeviceClient[36] = "Susan Mbacho PhD, MUARIK";
+const char* Manufacturer = "IntelliSys UG";
+const char* DeviceID = "Dryer Monitoring System";
+const char* DeviceClient = "Susan Mbacho PhD, MUARIK";
 const int SystemAddress[] = {0x68, 0xFE, 0x71, 0x88, 0x1A, 0x6C}; 
 
 //const char *file_heading = "Report,for,Hybrid,Solar,Dryer,at,Makerere,University,Agricultural,Research,Institute, Kabanyolo,(MUARIK)\n";
@@ -16,9 +16,9 @@ const int SystemAddress[] = {0x68, 0xFE, 0x71, 0x88, 0x1A, 0x6C};
 const char *file_heading = "Data Report for the 13mx7m Hybrid Solar Dryer at Makerere University Agricultural Research Institute Kabanyolo [MUARIK]\n";
 char file_creation_date[64] = "File created:,,,";
 char logging_interval[52] = "Logging Interval (HH:MM:SS):,,,00:01:00,minute(s)\n"; // once every minute
-const char data_points_log[200] = "Data Points:Temperature Relative Humidity Barometric Pressure inside the Dryer (Sensor 1-11) and ambient / Temperature Relative Humidity Barometric Pressure outside the dryer (Sensor 12)";
-const char units_of_data[180] = "Temperature is taken in Celcius Degrees (°C) | Relative Humidity in percent (%) | Barometric Pressure in kilopascals (kPa)";
-const char additional_entries[156] = "Microclimatic conditions measured: (2) wind speed in metres per second (m/s) and solar radiation in Watts per square metres (W/m²)";
+const char* data_points_log = "Data Points:Temperature Relative Humidity Barometric Pressure inside the Dryer (Sensor 1-11) and ambient / Temperature Relative Humidity Barometric Pressure outside the dryer (Sensor 12)";
+const char* units_of_data = "Temperature is taken in Celcius Degrees (°C) | Relative Humidity in percent (%) | Barometric Pressure in kilopascals (kPa)";
+const char* additional_entries = "Microclimatic conditions measured: (2) wind speed in metres per second (m/s) and solar radiation in Watts per square metres (W/m²)";
 
 bool writeSuccess = false;
   
@@ -73,6 +73,9 @@ char FW_VERSION[50] = "v3.3.5-Dryer_Datalogger";
 #include "WiFi_Manager.h"
 #include "upload.h"
 
+#include "memory_monitor.h"
+MemoryMonitor memMonitor;
+
 #include "esp_task_wdt.h"
 // WATCH DOG SHOULD THERE BE A HANG ESP IN CONNECTIVITY
 
@@ -93,6 +96,7 @@ StaticJsonDocument<8000> JSON_sendable;
 #include <Fonts/FreeMonoBold12pt7b.h>
 #include <Fonts/FreeSansBold9pt7b.h>
 
+
 #include <Preferences.h>
 Preferences prefs;
 // File system instance 
@@ -108,7 +112,7 @@ const int PACKET_TASK_PRIORITY = 3; // Higher than normal tasks
 const int PACKET_STACK_SIZE = 12288; // 12kB
 TaskHandle_t packetTaskHandle = NULL;
 
-uint64_t upload_interval_ms = 60ULL * 60ULL * 1000ULL; // 1 hour
+uint64_t upload_interval_ms = 30ULL * 60ULL * 1000ULL; // 2X every hour
 
 
 // For debug logging
@@ -140,12 +144,74 @@ uint64_t ota_timeout_time = 0;
 uint64_t ota_start_time = 0;
 
 
+// ── Tuneable constants ──────────────────────────────────────────────────────
+static const size_t UPLOAD_BUFFER_SIZE     = 12240; // 20-40 sendable_to_sd_card_csv entries
+static const size_t UPLOAD_BUFFER_DANGER   = 11000; // ~90% full → force clear oldest
+static const uint8_t ENTRIES_PER_UPLOAD    = 20; // 10;
+static const uint8_t MAX_UPLOAD_FAILS = 3; // after 3 misses, drop oldest batch or else buffer chokes
+uint8_t upload_fail_count = 0;
+
+char sendable_to_cloud_db[UPLOAD_BUFFER_SIZE] = ""; 
+
+
+// Global declarations (add to your global variables)
+char upload_accumulator_buffer[UPLOAD_BUFFER_SIZE];  // 10KB buffer
+uint16_t accumulated_entries = 0;
+bool data_ready_for_upload = false;
+char accumulator_log[128];
+
+
 static const size_t MAX_FILE_SIZE = 10 * 1024 * 1024; // 10 MB per file
 static const size_t MAX_CSV_FILE_SIZE = 10 * 1024 * 1024; 
 static const size_t MAX_TOTAL_SIZE = 100 * 1024 * 1024; // 100 MB total limit
 
 volatile size_t bytesWritten = 0;
 
+
+char sendable_to_sd_card[3072] = ""; // JSON ~3kiB
+char sendable_to_sd_card_csv[1024] = "";
+char sendable_to_cloud_csv[512]; // 45+ fields × ~10 chars avg = ~440 bytes + lot of margin
+
+char storage_status_log[512] = "NO SD";
+char storage_size_char[64];
+
+char last_upload_time[32] = "Never!";
+
+char upload_error_code[100] = "";
+
+char table_log[32] = "...";
+char ota_log[150] = "...";
+char clock_status_msg[100] = "Not Started!";
+char successful_uploads_c[20] = ""; // 18
+char last_json_save_time[32] = "JSON Never Saved!";
+char last_csv_save_time[32] = "CSV Never Saved!";
+
+
+
+char upload_report[256];
+
+
+char temp_str[10] = "__";  // no reading yet
+char humi_str[10] = "__"; // no reading yet
+
+
+char temps_log[128];
+char humis_log[128];
+
+
+char csv_cloud_bind_log[512];
+char csv_cloud_save_log[512];
+
+char activity_log[2048];
+char updates_log[128];
+
+
+char save_log[256] = "No JSON Saved!";
+char json_save_log[256] = "Not Saved!";
+char csv_save_log[256] = "not Saved!";
+
+char json_serialization_log[512] = "JSON Serialization Not Done!";
+char csv_bind_log[512] = "CSV Serialization Not Done!";
 
 
 const int64_t wifi_checK_interval = (2ULL * 1000ULL);
@@ -248,7 +314,6 @@ bool upload_queue_saved = false;
 
 bool wifi_connected = false;
 uint32_t WiFi_Strength = 0;
-char ota_log[150] = "...";
 volatile bool otaFinished = false;
 volatile bool otaStarted = false;
 volatile bool otaError = false;
@@ -260,12 +325,6 @@ uint16_t upload_fails = 0;
 const uint64_t upload_frequency_ms   = (10ULL * 60ULL * 1000ULL); // 10 minutes
 uint64_t last_upload_time_ms = 0;
 
-char last_upload_time[32] = "Never!";
-
-char upload_error_code[100] = "";
-
-char table_log[32] = "...";
-
 
 float aggregate_sensor_humidities();
 float aggregate_sensor_temperatures();
@@ -275,29 +334,11 @@ float aggregate_sensor_temperatures();
 TimerKeeper sawa;
 
 bool clock_is_working = false;
-char clock_status_msg[64] = "Not Started!";
 
 
 uint8_t copied_entry = 0;
 
 uint64_t successful_uploads = 0;
-char successful_uploads_c[20] = ""; // 18
-
-// ── Tuneable constants ──────────────────────────────────────────────────────
-static const size_t UPLOAD_BUFFER_SIZE     = 10000; // 20-60 sendable_to_sd_card_csv entries
-static const size_t UPLOAD_BUFFER_DANGER   = 8000; // ~80% full → force clear oldest
-static const uint8_t ENTRIES_PER_UPLOAD    = 20; // 10;
-static const uint8_t MAX_UPLOAD_FAILS = 3; // after 3 misses, drop oldest batch or else buffer chokes
-uint8_t upload_fail_count = 0;
-
-char sendable_to_cloud_db[UPLOAD_BUFFER_SIZE] = ""; 
-
-
-// Global declarations (add to your global variables)
-char upload_accumulator_buffer[UPLOAD_BUFFER_SIZE];  // 10KB buffer
-uint16_t accumulated_entries = 0;
-bool data_ready_for_upload = false;
-char accumulator_log[128];
 
 
 bool otaModeActive = false;
@@ -313,8 +354,8 @@ bool night_Light_ON = false;
 static char internals_log[255] = "NULL"; // nker relocation issue that the ESP32 toolchain sometimes throws when you put large-ish global/static arrays into flash/DRAM in a certain way.
 
 
-float average_temp = 0.0f; char average_temp_str[10] = "x.x"; // 35.855
-float average_humi = 0.0f; char average_humi_str[10] = "x.x"; // 75.695
+float average_temp = 0.0f; char average_temp_str[7] = "x.x"; // 35.855
+float average_humi = 0.0f; char average_humi_str[7] = "x.x"; // 75.695
 float average_press = 0.0f; 
 float average_elev = 0.0f;
 float new_average_temp = 0.0f;
@@ -329,12 +370,10 @@ float historical_humidity_readings[10] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
 float historical_pressure_readings[10] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
 char  time_stamps[10][12] = {"--:--", "--:--"}; 
 
-char last_json_save_time[32] = "JSON Never Saved!";
-char last_csv_save_time[32] = "CSV Never Saved!";
 
 
-float average_wind_speed = 0.0f; char wind_speed_str[10] = ".";
-float average_solar_radiation = 0.0f; char solar_rad_str[10] = ".";
+float average_wind_speed = 0.0f; char wind_speed_str[7] = ".";
+float average_solar_radiation = 0.0f; char solar_rad_str[7] = ".";
 
 
 
@@ -345,25 +384,6 @@ bool storage_initialized = false;
 float sd_storage_size = 0.0f;
 float freeSpace = 0.0f;
 uint64_t usedSpace = 0;
-
-char storage_size_char[64];
-
-
-
-char upload_report[512];
-
-
-char temp_str[10] = "__";  // no reading yet
-char humi_str[10] = "__"; // no reading yet
-
-
-char temps_log[256];
-char humis_log[256];
-
-
-char sendable_to_cloud_csv[1024]; // 45+ fields × ~10 chars avg = ~440 bytes + lot of margin
-char csv_cloud_bind_log[512];
-char csv_cloud_save_log[512];
 
 // time series averages
 uint8_t active_sensors = 0;
@@ -424,14 +444,16 @@ float sensor_7_elevation, sensor_8_elevation, sensor_9_elevation, sensor_10_elev
 // DATASET 5
 float sensor_7_h_index, sensor_8_h_index, sensor_9_h_index, sensor_10_h_index, sensor_11_h_index, sensor_12_h_index;
 float sensor_1_h_index, sensor_2_h_index, sensor_3_h_index, sensor_4_h_index, sensor_5_h_index, sensor_6_h_index;
-// DATASET 6
-char  sensor_1_transmissions[16]; char  sensor_2_transmissions[16];   char  sensor_3_transmissions[16];   char  sensor_4_transmissions[16]; 
-char  sensor_5_transmissions[16]; char  sensor_6_transmissions[16];   char  sensor_7_transmissions[16];   char   sensor_8_transmissions[16]; 
-char  sensor_9_transmissions[16]; char  sensor_10_transmissions[16];  char  sensor_11_transmissions[16];  char  sensor_12_transmissions[16]; 
+// DATASET 6 up to 10,000,000 transmissions cummulated for 5 years 
+char  sensor_1_transmissions[9]; char  sensor_2_transmissions[9];   char  sensor_3_transmissions[9];   char  sensor_4_transmissions[9]; 
+char  sensor_5_transmissions[9]; char  sensor_6_transmissions[9];   char  sensor_7_transmissions[9];   char   sensor_8_transmissions[9]; 
+char  sensor_9_transmissions[9]; char  sensor_10_transmissions[9];  char  sensor_11_transmissions[9];  char  sensor_12_transmissions[9]; 
 // DATASET 7
+/*
 char sensor_1_CPU_freq[12]; char sensor_2_CPU_freq[12]; char sensor_3_CPU_freq[12]; char sensor_4_CPU_freq[12];
 char sensor_5_CPU_freq[12]; char sensor_6_CPU_freq[12]; char sensor_7_CPU_freq[12]; char sensor_8_CPU_freq[12];
 char sensor_9_CPU_freq[12]; char sensor_10_CPU_freq[12]; char sensor_11_CPU_freq[12]; char sensor_12_CPU_freq[12];
+*/
 // DATASET 8
 uint64_t sensor_1_running_time_ms, sensor_2_running_time_ms, sensor_3_running_time_ms, sensor_4_running_time_ms;
 uint64_t sensor_5_running_time_ms, sensor_6_running_time_ms, sensor_7_running_time_ms, sensor_8_running_time_ms;
@@ -480,12 +502,6 @@ void ESPInfo() {
 
 
 bool sd_initialized = false;
-char save_log[512] = "No JSON Saved!";
-char json_save_log[512] = "Not Saved!";
-char csv_save_log[512] = "not Saved!";
-
-char json_serialization_log[512] = "JSON Serialization Not Done!";
-char csv_bind_log[512] = "CSV Serialization Not Done!";
 
 
 void extract_readings();
@@ -523,13 +539,6 @@ void flash(uint64_t time_now, uint8_t heartbeat,
            uint16_t ON_1, uint16_t OFF_1,
            uint16_t ON_2, uint16_t OFF_2);
 
-typedef struct dryerData{ // all stringified
-      char received_data_bundle[200] = ""; // Payload is limited to 250 bytes.
-   }  dryerData; 
-
-dryerData fetch;
-
-
 
 uint8_t side_scroll = 1; // default = 1
 
@@ -544,10 +553,7 @@ volatile uint64_t totalBytes = 0; /// = SD.totalBytes();
 volatile uint64_t usedBytes = 0; //  = SD.usedBytes();
 volatile uint64_t save_counter = 0; // uint8_t save_counter = 0;
 
-
-char sendable_to_sd_card[4000] = ""; // JSON ~3kiB
-char sendable_to_sd_card_csv[3000] = "";
-char storage_status_log[512] = "NO SD";
+uint64_t last_mem_report_ms = 0;
 
 void BuzzingTask(void * pvParams);
 
@@ -595,12 +601,8 @@ size_t csv_currentSize = 0; // base file ...  before rotating
 volatile bool display_needs_update = false;
 
 uint8_t hawa = 0;
-
 #include "time.h"
 
-const char* ntpServer = "pool.ntp.org";
-const long gmtOffset_sec = 0;     // Change for your timezone
-const int daylightOffset_sec = 3600; // Change for DST
 
 void setup() { delay(50); // for OTA to fully hand over
        Serial.begin(115200); Serial.print(devicename); Serial.println(" Booting..."); // while (!Serial) delay(100);   // wait for native usb
@@ -640,34 +642,7 @@ void setup() { delay(50); // for OTA to fully hand over
         //
 
         
-        delay(1000);
-
-            // Initialize Preferences and load counter
-        prefs.begin("SAVES", false);
-        save_counter = prefs.getUInt("SAVES", 0);  // Load saved value, default 0
-        prefs.end();
-        
-        pinMode(sensor_indicator, OUTPUT); digitalWrite(sensor_indicator, HIGH);
-        
-        // --- Initialize EPD on VSPI ---
-        strcpy(initializer, "Initializing E-Paper Display over VSPI...");
-        Serial.println(initializer);
-
-
-        EPD_SPI.begin(SCREEN_SCK, SCREEN_MISO, SCREEN_MOSI, SCREEN_CS); // CUSTOM SPI PINS
-        LCD.epd2.selectSPI(EPD_SPI, SPISettings(4000000, MSBFIRST, SPI_MODE0));
-        
-        LCD.init(115200, true, 50, false);  
-
-        strncpy(initializer, "Initialied display!", sizeof(initializer));  Serial.println(initializer);
-         special_call = true; // to bypass the timer
-         currentScreen = 0;
-         update_display();
-         // currentScreen = 2;
-         delay(1000);
-        
-          
-
+       
     /*
         Perform the read operation: Use a function that respects the timeout, such as readBytes(), readString(), or parseInt(). 
         If no data is received within the specified timeout period, these functions will return an appropriate indicator 
@@ -695,21 +670,22 @@ void setup() { delay(50); // for OTA to fully hand over
 
         if(clock_is_working){
             sawa.query_rtc();
+             hawa  = sawa.getCurrentHour();
              snprintf(clock_status_msg, sizeof(clock_status_msg),"RTC Clock is working. Time => %s, Date =>%s", sawa.SystemTime, sawa.SystemDate);
              LOG(clock_status_msg);
     
-        // 2. WiFi up — using your existing manager
-        WiFiMgrStatus wifi_status = wifi_obj.initialize_ESP_WiFi(devicename);
-        bool wifi_ready = (wifi_status == WIFI_MGR_SUCCESS);
+            // 2. WiFi up — using your existing manager
+            WiFiMgrStatus wifi_status = wifi_obj.initialize_ESP_WiFi(devicename);
+            bool wifi_ready = (wifi_status == WIFI_MGR_SUCCESS);
 
-        // 3. NTP sync while WiFi is still up
-        if (wifi_ready) { LOG("Checking for time over WiFi...");
-            bool ntp_ok = wifi_obj.sync_ntp(10800, 0, 10);  // UTC+3 Kampala, no DST
+            // 3. NTP sync while WiFi is still up
+            if (wifi_ready) { LOG("Checking for time over WiFi...");
+                bool ntp_ok = wifi_obj.sync_ntp(10800, 0, 10);  // UTC+3 Kampala, no DST
 
-            if (ntp_ok) { LOG("Using network time to set RTC time");
-                sawa.apply_ntp_time(wifi_obj.ntp_timeinfo);
+                if (ntp_ok) { LOG("Using network time to set RTC time");
+                    sawa.apply_ntp_time(wifi_obj.ntp_timeinfo);
+                }
             }
-        }
 
         else {
             LOG("CANNOT FIND WIFI FOR NETWORK TIME");
@@ -738,6 +714,32 @@ void setup() { delay(50); // for OTA to fully hand over
             esp_now_initialized ? "ESP-NOW Initialization Successful!"
                                 : "Failed to initialize packet handler!");
 
+       
+
+        delay(1000);
+
+            // Initialize Preferences and load counter
+        prefs.begin("SAVES", false);
+        save_counter = prefs.getUInt("SAVES", 0);  // Load saved value, default 0
+        prefs.end();
+        
+        pinMode(sensor_indicator, OUTPUT); digitalWrite(sensor_indicator, HIGH);
+        
+        // --- Initialize EPD on VSPI ---
+        strcpy(initializer, "Initializing E-Paper Display over VSPI...");
+        Serial.println(initializer);
+
+
+        EPD_SPI.begin(SCREEN_SCK, SCREEN_MISO, SCREEN_MOSI, SCREEN_CS); // CUSTOM SPI PINS
+        LCD.epd2.selectSPI(EPD_SPI, SPISettings(4000000, MSBFIRST, SPI_MODE0));
+        
+        LCD.init(115200, true, 50, false);  
+
+        strncpy(initializer, "Initialied display!", sizeof(initializer));  Serial.println(initializer);
+         special_call = true; // to bypass the timer
+         currentScreen = 0;
+         update_display();
+         // currentScreen = 2;
        
 
     /*
@@ -862,6 +864,9 @@ void setup() { delay(50); // for OTA to fully hand over
          buzzer.beep(2,50,50);  // END OF BOOT
          Serial.println("Done Booting!");
     
+   memMonitor.print_memory_report("AFTER_SETUP");
+   memMonitor.print_task_info();
+
         // Enable watchdog (timeout after 60 seconds)
     esp_task_wdt_init(60, true);
     esp_task_wdt_add(NULL);
@@ -2627,8 +2632,6 @@ bool otaTriggered = false;
 uint32_t loop_count = 0; // tracker for whenever loop or a RTOS task yeesibye
 
 bool currently_uploading = false;
-char activity_log[2048];
-char updates_log[128];
 bool is_night_time = false;
 bool is_at_peak_sunshine = false;
 bool screen_is_changing = false;
@@ -2670,14 +2673,13 @@ void loop() {
 
       // Priority 2: Normal mode - batch all operations
         else { // keep the uploader running until it is done
-                //handle_upload(); // has early exits  // hourly — fast no-op 59 out of 60 minutes
-
         // Priority 2: Check if it's time to upload (regardless of WiFi state)
             bool time_to_upload = false;
-            if (!clock_is_working) { 
+            if (!clock_is_working) { // LOG("RTC NOT WORKING, DEFAULTING TO INTERNAL TIMER");
                 time_to_upload = (now_now_ms - last_upload_time_ms) >= upload_interval_ms;
-            } else {
-                time_to_upload = sawa.is5MinuteMarker();  // Or () is5MinuteMarker // isHourlyMarker
+            } 
+            else { //LOG("USING RTC 30MIN MARKER TO SET UPLOAD TRIGGER");
+                time_to_upload = sawa.is30MinuteMarker();  // Or () is5MinuteMarker // isHourlyMarker
             }
 
 
@@ -2685,40 +2687,69 @@ void loop() {
             if (time_to_upload) { //  && !currently_uploading
                 LOG("TIME TO UPLOAD!");
                 currently_uploading = true;
-                accumulate_into_upload_buffer();
 
                 handle_upload();  // This function will handle WiFi connection/disconnection
-                currently_uploading = false;
+                currently_uploading = false; //has early exits 
+                time_to_upload = false;
                 // Don't return - continue with normal operations
+                // Update timer immediately to prevent re-entrance
+                last_upload_time_ms = now_now_ms; // if the this is what was used
+    
             } 
     
-    // Priority 4: Normal mode operations
-    flash(now_now_ms, blinker, 50, 75, 50, 1500);
-     
+        // Priority 4: Normal mode operations
+        flash(now_now_ms, blinker, 50, 75, 50, 1500);
+        
         if ((now_now_ms - last_read_time_ms) >= data_update_interval) { // 60 seconds if power is good for 24 hours:: 1,440 saved packets/day
             last_read_time_ms = now_now_ms;  // Update FIRST to prevent race conditions
+            
+             // reinitialize the clock if it stopped working
+            sawa.periodic_rtc_health_check();  // CLOCK Health check
+
+         // clock_is_working = sawa.isClockWorking();
+          if(!clock_is_working) snprintf(updates_log, sizeof(updates_log), "Clock not working, Updating nevertheless..."); /*return;*/  // an early exit here might not be okay, all readings will not be updated!
+          else  {
+                sawa.update();    
+                ten_min          = sawa.is10MinuteMarker();
+                hour_marked      = sawa.isHourlyMarker();
+                hawa  = sawa.getCurrentHour(); // in 24 hours...before formatting to 12HR CLOCK
+
+                // --- Read internal temperature ---
+                cabin_temperature = sawa.temp_reading; //real_time.getTemperature();
+          }
+             //most recent parameters
+
             update_dynamic_data(); // Sensor readings
 
-            log_all_activities();  // Update activity_log first
-
             save_stuff_to_sd_card(); // 4 files: 1 JSON, 2 CSV, 1 log
-             LOG(activity_log);
+             
        
         if(json_data_logged && csv_data_logged)  buzzer.beep(2, 100, 0);
 
-            if(sawa.is10MinuteMarker()){
+            if((now_now_ms - last_mem_report_ms) >= (20ULL * 60ULL * 1000ULL)){ //sawa.is10MinuteMarker()
+                last_mem_report_ms =  now_now_ms;
             // Monitor heap fragmentation
                 Serial.printf("Heap: %d bytes free, largest block: %d\n", 
                 ESP.getFreeHeap(), ESP.getMaxAllocHeap());
 
                 printHeapStats(); // for fragmentation %.
+
+                memMonitor.print_memory_report("RUNTIME");
+
+
+                log_all_activities();  // Updates activity_log
+                save_logs_to_sd_card();  // Saves with memory info
+
+                LOG(activity_log);
             }
 
 
         
     }
 
-    if ((now_now_ms - last_storage_check) >= 3600000ULL) { // Every hour
+
+
+    if ((now_now_ms - last_storage_check) >= 30ULL * 60ULL * 1000ULL) { // Every 30mins
         if (storage_initialized) {
             check_storage_files();
         }
@@ -2746,7 +2777,7 @@ void loop() {
 
         loop_count++;
         // delay(10); // make the loop less tight when not polling ota
-         vTaskDelay(10 / portTICK_PERIOD_MS); // ESP-NOW callbacks still work
+         vTaskDelay(5 / portTICK_PERIOD_MS); // ESP-NOW callbacks still work
 
          // Better: Let other tasks run without forced wait
           //  yield();  // Or delay(1) for slight breathing room
@@ -2818,9 +2849,10 @@ const char* get_power_mode_str(int mode) {
     }
 }
 
+/*
 // Main comprehensive logging function using RTC time from sawa
 void log_all_activities() {
-    Serial.println("activities log");
+    //Serial.println("logging all activities");
     // Get current uptime
     uint64_t now_us = esp_timer_get_time();
     uint64_t now_sec = now_us / 1000000ULL;
@@ -2832,41 +2864,41 @@ void log_all_activities() {
     // Build the complete log
     snprintf(activity_log, sizeof(activity_log),
         "\n========== SYSTEM SNAPSHOT [%s %s] ==========\n"
-        "【SYSTEM TIMING】\n"
+        "\n【SYSTEM TIMING】\n"
         "  RTC Date/Time: %s %s\n"
         "  Loop Count: %lu\n"
         "  Uptime: %s (%llu seconds)\n"
         "  Current μs: %llu\n"
         "  Last Sensor Read: %s ago\n"
-        "\n【CONNECTIVITY】\n"
+        "【CONNECTIVITY】\n"
         "  WiFi: %s | OTA: %s\n"
         "  Last OTA: %s\n"
-        "\n【POWER】\n"
+        "【POWER】\n"
         "  Mode: %s (%d) | Voltage: %.2fV\n"
-        "\n【ENVIRONMENT】\n"
+        "【ENVIRONMENT】\n"
         "  Cabin Temp: %.2f°C | Ambient Temp: %.2f°C | Humidity: %.2f%%\n"
         "  Temp Log: %s\n"
         "  Humidity Log: %s\n"
-        "\n【DATA STORAGE】\n"
+        "【DATA STORAGE】\n"
         "  JSON: %s | CSV: %s\n"
         "  JSON Save: %s\n"
         "  CSV Save: %s\n"
         "  JSON Serialization: %s\n"
         "  CSV Bind: %s\n"
         "  Cloud CSV Bind: %s\n"
-        "\n【STORAGE】\n"
+        "【STORAGE】\n"
         "  Status: %s\n"
-        "\n【UPLOADS】\n"
+        "【UPLOADS】\n"
         "  Report: %s\n"
         "  Log: %s\n"
-        "\n【INTERNALS】\n"
+        "【INTERNALS】\n"
         "  %s\n"
-        "\n【TABLES】\n"
+        "【TABLES】\n"
         "  %s\n"
-        "\n【CLOCK STATUS】\n"
+        "【CLOCK STATUS】\n"
         "  %s\n"
         "  RTC Working: %s | 10Min Marker: %s | Hour Marker: %s\n"
-        "\n【OTA HISTORY】\n"
+        "【OTA HISTORY】\n"
         "  %s\n"
         "============================================\n",
         
@@ -2927,6 +2959,145 @@ void log_all_activities() {
     
 }
 
+*/
+
+// Main comprehensive logging function using RTC time from sawa
+void log_all_activities() {
+    // Get current uptime
+    uint64_t now_us = esp_timer_get_time();
+    uint64_t now_sec = now_us / 1000000ULL;
+    
+    // Get RTC time and date from sawa
+    const char* rtc_time = (sawa.SystemTime[0] != '\0') ? sawa.SystemTime : "Time not set";
+    const char* rtc_date = (sawa.SystemDate[0] != '\0') ? sawa.SystemDate : "Date not set";
+    
+    // Get memory report
+    const char* memory_report = memMonitor.get_memory_report("RUNTIME");
+    const char* task_info = memMonitor.get_task_info();
+    
+    // Build the complete log with memory info included
+    snprintf(activity_log, sizeof(activity_log),
+        "\n========== SYSTEM SNAPSHOT [%s %s] ==========\n"
+        "\n【SYSTEM TIMING】\n"
+        "  RTC Date/Time: %s %s\n"
+        "  Loop Count: %lu\n"
+        "  Uptime: %s (%llu seconds)\n"
+        "  Current μs: %llu\n"
+        "  Last Sensor Read: %s ago\n"
+        "【CONNECTIVITY】\n"
+        "  WiFi: %s | OTA: %s\n"
+        "  Last OTA: %s\n"
+        "【POWER】\n"
+        "  Mode: %s (%d) | Voltage: %.2fV\n"
+        "【ENVIRONMENT】\n"
+        "  Cabin Temp: %.2f°C | Ambient Temp: %.2f°C | Humidity: %.2f%%\n"
+        "  Temp Log: %s\n"
+        "  Humidity Log: %s\n"
+        "【DATA STORAGE】\n"
+        "  JSON: %s | CSV: %s\n"
+        "  JSON Save: %s\n"
+        "  CSV Save: %s\n"
+        "  JSON Serialization: %s\n"
+        "  CSV Bind: %s\n"
+        "  Cloud CSV Bind: %s\n"
+        "【STORAGE】\n"
+        "  Status: %s\n"
+        "【UPLOADS】\n"
+        "  Report: %s\n"
+        "  Log: %s\n"
+        "【INTERNALS】\n"
+        "  %s\n"
+        "【TABLES】\n"
+        "  %s\n"
+        "【CLOCK STATUS】\n"
+        "  %s\n"
+        "  RTC Working: %s | 10Min Marker: %s | Hour Marker: %s\n"
+        "【OTA HISTORY】\n"
+        "  %s\n"
+        "%s"  // Memory report placeholder
+        "%s", // Task info placeholder
+        
+        // Header with RTC time/date
+        rtc_date, rtc_time,
+        rtc_date, rtc_time,
+        
+        // SYSTEM TIMING
+        loop_count,
+        get_uptime_str(now_us), now_sec,
+        now_us,
+        get_uptime_str((now_us - last_read_time_ms * 1000ULL)),
+        
+        // CONNECTIVITY
+        wifi_connected ? "ON" : "OFF",
+        otaModeActive ? "ACTIVE" : "IDLE",
+        (ota_log[0] != '\0') ? ota_log : "None",
+        
+        // POWER
+        get_power_mode_str(current_power), current_power, voltage,
+        
+        // ENVIRONMENT
+        cabin_temperature, average_temp, average_humi,
+        (temps_log[0] != '\0') ? temps_log : "OK",
+        (humis_log[0] != '\0') ? humis_log : "OK",
+        
+        // DATA STORAGE
+        json_data_logged ? "YES" : "NO",
+        csv_data_logged ? "YES" : "NO",
+        (json_save_log[0] != '\0') ? json_save_log : "Pending",
+        (csv_save_log[0] != '\0') ? csv_save_log : "Pending",
+        (json_serialization_log[0] != '\0') ? json_serialization_log : "Ready",
+        (csv_bind_log[0] != '\0') ? csv_bind_log : "Ready",
+        (csv_cloud_bind_log[0] != '\0') ? csv_cloud_bind_log : "Ready",
+        
+        // STORAGE
+        (storage_status_log[0] != '\0') ? storage_status_log : "OK",
+        
+        // UPLOADS
+        (upload_report[0] != '\0') ? upload_report : "None",
+        (upload_log[0] != '\0') ? upload_log : "Idle",
+        
+        // INTERNALS
+        (internals_log[0] != '\0') ? internals_log : "Normal",
+        
+        // TABLES
+        (table_log[0] != '\0') ? table_log : "Initialized",
+        
+        // CLOCK STATUS
+        (clock_status_msg[0] != '\0') ? clock_status_msg : "Clock nominal",
+        sawa.isClockWorking() ? "YES" : "NO",
+        sawa.is10MinuteMarker() ? "YES" : "NO",
+        sawa.isHourlyMarker() ? "YES" : "NO",
+        
+        // OTA HISTORY
+        (ota_log[0] != '\0') ? ota_log : "No OTA",
+        
+        // Memory report and task info
+        memory_report,
+        task_info
+    );
+}
+
+// Optional: Create a separate function to log only memory info to SD
+void log_memory_to_sd() {
+    if (!storage_initialized) return;
+    
+    File logFile = SD.open("/system_logs.txt", FILE_APPEND);
+    if (!logFile) return;
+    
+    char timestamp[64];
+    if (clock_is_working) {
+        snprintf(timestamp, sizeof(timestamp), "%s %s", sawa.SystemDate, sawa.SystemTime);
+    } else {
+        uint64_t s = now_now_ms / 1000ULL;
+        snprintf(timestamp, sizeof(timestamp), "Uptime %02llu:%02llu:%02llu",
+                 s/3600, (s%3600)/60, s%60);
+    }
+    
+    logFile.print(timestamp);
+    logFile.print(memMonitor.get_system_memory_report("PERIODIC"));
+    logFile.println();
+    logFile.close();
+}
 
 
 
@@ -2952,7 +3123,57 @@ void init_log_strings() {
 }
 
 
+void save_logs_to_sd_card() { // bool include_memory_info = false
+    // Check if storage is initialized
+    bool include_memory_info = true;
+    if (!storage_initialized) {
+        snprintf(storage_status_log, sizeof(storage_status_log),
+                 "[SYSTEM LOG] SD card not initialized - log not saved");
+        LOG(storage_status_log);
+        return;
+    }
+    
+    // Open system log file in append mode (creates if doesn't exist)
+    File logFile = SD.open("/system_logs.txt", FILE_APPEND);
+    if (!logFile) {
+        snprintf(storage_status_log, sizeof(storage_status_log),
+                 "[SYSTEM LOG] Failed to open system_logs.txt for writing");
+        LOG(storage_status_log);
+        return;
+    }
+    
+    // Write timestamp
+    char timestamp[64];
+    if (clock_is_working) {
+        snprintf(timestamp, sizeof(timestamp), "\n[%s %s]\n", sawa.SystemDate, sawa.SystemTime);
+    } else {
+        uint64_t s = now_now_ms / 1000ULL;
+        snprintf(timestamp, sizeof(timestamp), "\n[Uptime %02llu:%02llu:%02llu]\n",
+                 s/3600, (s%3600)/60, s%60);
+    }
+    logFile.print(timestamp);
+    
+    // Write the activity log
+    logFile.print(activity_log);
+    
+    // Optionally include memory report
+    if (include_memory_info) {
+        logFile.print(memMonitor.get_memory_report("LOG"));
+        logFile.print(memMonitor.get_task_info());
+    }
+    
+    logFile.println(); // Add extra newline for separation
+    logFile.flush();
+    logFile.close();
+    
+    // Update status
+    size_t written = strlen(activity_log);
+    snprintf(storage_status_log, sizeof(storage_status_log),
+             "[SYSTEM LOG] %d bytes written to system_logs.txt", written);
+    LOG(storage_status_log);
+}
 
+/*
 void save_logs_to_sd_card() {
     // Check if storage is initialized
     if (!storage_initialized) {
@@ -3006,6 +3227,8 @@ void save_logs_to_sd_card() {
         LOG(storage_status_log);
     }
 }
+
+*/
 
 // Optional: Periodic log saver with rotation
 void save_logs_to_sd_card_with_rotation(uint32_t max_file_size_bytes = 204800) { // 200KB default
@@ -3209,18 +3432,7 @@ void storage_status_log_msg(const char* operation, bool success, size_t bytes_wr
 
 
 void update_dynamic_data(){
-          //most recent parameters
-          clock_is_working = sawa.isClockWorking();
-          if(!clock_is_working) snprintf(updates_log, sizeof(updates_log), "Clock not working, Updating nevertheless..."); /*return;*/  // an early exit here might not be okay, all readings will not be updated!
-          else  {
-                sawa.update();    
-                ten_min          = sawa.is10MinuteMarker();
-                hour_marked      = sawa.isHourlyMarker();
-                hawa  = sawa.getCurrentHour(); // in 24 hours...before formatting to 12HR CLOCK
-
-                // --- Read internal temperature ---
-                cabin_temperature = sawa.temp_reading; //real_time.getTemperature();
-          }
+        
          
           MonitorBattery(); // get battery voltage
           MonitorCabinet(); // internal temp and adjust o=inner state only if rtc is working
@@ -3242,13 +3454,14 @@ void save_stuff_to_sd_card(){
           json_bound_successfully = bind_dynamic_data_into_json();
           if(storage_initialized) json_data_logged = save_json_to_sd_card(); delay(50);
 
-         upload_queue_saved = bind_uploadable_data_into_csv();
-         if(storage_initialized) csv_uploadable_data_logged = save_uploadable_csv_to_sd_card();
-
-         if(storage_initialized) save_logs_to_sd_card();
-      //save_logs_to_sd_card_with_rotation(204800); // 200KB max
+          upload_queue_saved = bind_uploadable_data_into_csv();
+          if(storage_initialized) csv_uploadable_data_logged = save_uploadable_csv_to_sd_card();
 
           accumulate_into_upload_buffer(); //  fall back to ensure uploads no matter what
+
+       //  if(storage_initialized) save_logs_to_sd_card();
+      //save_logs_to_sd_card_with_rotation(204800); // 200KB max
+
 
         
           
@@ -3717,7 +3930,7 @@ bool read_button(uint8_t pin, uint64_t time_now){
 
 #define ESPNOW_MAX_RETRIES 3
 
-bool switch_radio_to_espnow() {
+bool switch_radio_to_espnow(){
   Serial.println("Switching radio to ESP-NOW...");
 
     WiFi.disconnect(true);
@@ -3874,11 +4087,16 @@ float aggregate_sensor_temperatures() {
     }
 
     if(active_sensors == 0){
-        return NAN;
+        //return NAN;
+        return 0.0;
     }
 
     avg_temp = total_temp / active_sensors;
-    average_humi    = total_humi / active_sensors;
+    avg_temp      = isnan(total_temp)?0.0:total_temp;
+    avg_temp   /= active_sensors;
+
+    average_humi  = isnan(total_humi)?0.0:total_humi;
+    average_humi /= active_sensors;
 
     temperature_range = highest_temperature - lowest_temperature;
     humidity_range    = highest_humidity - lowest_humidity;
@@ -4388,20 +4606,20 @@ bool bind_uploadable_data_into_csv() {
     int len = snprintf(
         sendable_to_cloud_csv, sizeof(sendable_to_cloud_csv),
         "%s,%s,"            // Date, Time
-        "%.2f,%.2f,%.2f,"   // s1
-        "%.2f,%.2f,%.2f,"   // s2
-        "%.2f,%.2f,%.2f,"   // s3
-        "%.2f,%.2f,%.2f,"   // s4
-        "%.2f,%.2f,%.2f,"   // s5
-        "%.2f,%.2f,%.2f,"   // s6
-        "%.2f,%.2f,%.2f,"   // s7
-        "%.2f,%.2f,%.2f,"   // s8
-        "%.2f,%.2f,%.2f,"   // s9
-        "%.2f,%.2f,%.2f,"   // s10
-        "%.2f,%.2f,%.2f,"   // s11
-        "%.2f,%.2f,%.2f,"   // s12
-        "%.2f,%.2f,%llu,%.2f\n",  // solar, wind, uptime, voltage
-        sawa.SystemDate, sawa.ShortTime,
+        "%.2f,%.1f,%.2f,"   // s1
+        "%.2f,%.1f,%.2f,"   // s2
+        "%.2f,%.1f,%.2f,"   // s3
+        "%.2f,%.1f,%.2f,"   // s4
+        "%.2f,%.1f,%.2f,"   // s5
+        "%.2f,%.1f,%.2f,"   // s6
+        "%.2f,%.1f,%.2f,"   // s7
+        "%.2f,%.1f,%.2f,"   // s8
+        "%.2f,%.1f,%.2f,"   // s9
+        "%.2f,%.1f,%.2f,"   // s10
+        "%.2f,%.1f,%.2f,"   // s11
+        "%.2f,%.1f,%.2f,"   // s12
+        "%.1f,%.2f,%lu,%.1f\n",  // solar, wind, uptime, voltage
+        sawa.ShortDate, sawa.ShortTime,
         s1_temp,  s1_h,  s1_p,
         s2_temp,  s2_h,  s2_p,
         s3_temp,  s3_h,  s3_p,
@@ -4415,7 +4633,7 @@ bool bind_uploadable_data_into_csv() {
         s11_temp, s11_h, s11_p,
         s12_temp, s12_h, s12_p,
         safe_solar, safe_wind,
-        (unsigned long long)(now_now_ms / 1000ULL),
+        (unsigned long)(now_now_ms),
         (float)safe_voltage
     );
 
@@ -4734,22 +4952,26 @@ bool accumulate_into_upload_buffer() {
     // Check if we have room for this row
     if (remaining < row_size + 1) {
         snprintf(accumulator_log, sizeof(accumulator_log),
-                 "[ACC] Buffer full! %u bytes, need %u - row dropped",
+                 "[ACCUM] Buffer full! %u bytes, need %u - row dropped",
                  (unsigned int)current_fill, (unsigned int)row_size);
         LOG(accumulator_log);
         return false;
     }
     
     // Append the row to buffer
-    strncat(upload_accumulator_buffer, sendable_to_sd_card_csv, remaining);
+    strncat(upload_accumulator_buffer, sendable_to_cloud_csv, remaining);
     accumulated_entries++;
+
+    float fill_capacity = (float)strlen(upload_accumulator_buffer);
+    fill_capacity = fill_capacity/((float)(UPLOAD_BUFFER_SIZE));
+    fill_capacity *= 100.0;
     
     snprintf(accumulator_log, sizeof(accumulator_log),
-             "[ACC] Row %u bytes | Entry %u | Buffer %u/%u B",
+             "[ACC] Row %u bytes | Entry %u | Buffer %u/%u B,  %.1f percent filled",
              (unsigned int)row_size, 
              accumulated_entries,
              (unsigned int)strlen(upload_accumulator_buffer),
-             UPLOAD_BUFFER_SIZE);
+             UPLOAD_BUFFER_SIZE, fill_capacity);
     LOG(accumulator_log);
     
     // Signal ready when we have a full batch OR buffer is getting full
@@ -4765,7 +4987,7 @@ bool accumulate_into_upload_buffer() {
     return true;
 }
 
-void handle_upload() { LOG ("UPLOADER FUNCTION CALLED...");
+void handle_upload() { LOG ("UPLOADER FUNCTION CALLED");
     // ── 1. Time gate is already checked before calling ──
     // But double-check to prevent race conditions
     /*
@@ -4781,8 +5003,6 @@ void handle_upload() { LOG ("UPLOADER FUNCTION CALLED...");
     }
     */
     
-    // Update timer immediately to prevent re-entrance
-    last_upload_time_ms = now_now_ms;
     
     LOG("Determining source of upload...");
     // ── 2. Determine upload source ───────────────────────────────────
@@ -4822,7 +5042,7 @@ void handle_upload() { LOG ("UPLOADER FUNCTION CALLED...");
 
     // Nothing to upload
     if (!payload || payload_len == 0) {
-        LOG("[Upload] Nothing queued — skipping upload");
+        LOG("[Upload] Nothing queued from either SD or buffer — skipping upload");
         if (payload) free(payload);
         return;
     }
@@ -5643,8 +5863,13 @@ char IP_Addr[50] = "NULL";
 #define WIFI_RECONNECT_DELAY_MS 500
 char wifi_connection_log[128] = "...";
 
-bool switch_radio_to_wifi() {
+
+bool switch_radio_to_wifi(){
   
+    // Clean shutdown of PacketHandler
+    packetHandler.shutdown();  // to prevent heap fragmentation
+
+
   // WiFi initialization with timeout
   //snprintf(wifi_log, sizeof(wifi_log), "%s", " Initializing WiFi...");
  // Serial.println(wifi_log);
@@ -5667,10 +5892,10 @@ bool switch_radio_to_wifi() {
   bool wifiSuccess = false;
  
     while (now_now_ms - startTime < WIFI_SWITCH_TIMEOUT_MS) {
-    if (wifi_obj.initialize_ESP_WiFi(devicename) == WIFI_MGR_SUCCESS) {
-        wifiSuccess = true;
-        break;
-    }
+        if (wifi_obj.initialize_ESP_WiFi(devicename) == WIFI_MGR_SUCCESS) {
+            wifiSuccess = true;
+            break;
+        }
     
     Serial.printf("⏳ WiFi connection failed, retrying... (%lu ms elapsed)\n", 
                  now_now_ms - startTime);
@@ -5705,7 +5930,7 @@ bool switch_radio_to_wifi() {
   
   // Initialize OTA if WiFi is successful
   if (wifiSuccess) {
-    Serial.println("🔌 Initializing OTA updates...");
+    Serial.println("🔌 Initialize OTA updates as well, just in case");
     initializeOTA();
     
     // Verify OTA is ready
@@ -5716,6 +5941,9 @@ bool switch_radio_to_wifi() {
   
   return false;
 }
+
+
+
 
 // Add dynamic sleep based on conditions
 void optimize_power_consumption() {
@@ -5827,7 +6055,7 @@ void safety(){
 }
 
 
-char SleepPrompt[200];
+char SleepPrompt[128];
 
 void sleep_dynamically() {
     // Add activity-based optimization
@@ -6288,7 +6516,7 @@ bool shouldRotateScreen(uint64_t screen_time_ms = 0) {
           
     if ((screen_time_ms - last_refresh_time_ms) >= screen_refresh_interval) {
         last_refresh_time_ms = screen_time_ms;
-          if(currentScreen > 5) currentScreen = 1;
+          if(currentScreen > 8) currentScreen = 1;
           else currentScreen++;
         return true;
     }
@@ -8869,7 +9097,7 @@ void homepage() {
        LCD.setCursor(50, 110);      LCD.print(average_temp_str);
     
         LCD.setFont(&FreeMono9pt7b); LCD.setTextColor(GxEPD_RED); //FreeMono9pt7b
-        LCD.setCursor(60, 128); LCD.print(active_sensors);
+       // LCD.setCursor(60, 128); LCD.print(active_sensors); LCD.print(" sensors active inside");
       
 
 
@@ -8893,16 +9121,16 @@ void homepage() {
         
       // ---- outer temp ----
       uint16_t fanColor = (LCD.epd2.hasColor ? GxEPD_RED : GxEPD_BLACK);
-      drawInfoBox(LEFT_X, BOTTOM_ROW_Y, "Outdoor Temperature", fanColor, fanColor);
+      drawInfoBox(LEFT_X-4, BOTTOM_ROW_Y, "Out Temperature", fanColor, fanColor);
 
      //   LCD.setTextColor((LCD.epd2.hasColor ? GxEPD_RED : GxEPD_BLACK));
          LCD.setFont(&FreeSansBold24pt7b);       LCD.setTextColor(fanColor);
          LCD.setCursor(60, (215)); LCD.printf("%.1f", sensor_12_temp); 
          LCD.setFont();  // FreeMono9pt7b
-         LCD.setCursor(50, (232)); LCD.print("Celcius Degrees");
+         LCD.setCursor(70, (232)); LCD.print("Celcius Degrees");
 
       // ---- outer humi ----
-      drawInfoBox(RIGHT_X, BOTTOM_ROW_Y, "Outdoor R. Humidity", fanColor, fanColor);
+      drawInfoBox(RIGHT_X-4, BOTTOM_ROW_Y, "Out R. Humidity", fanColor, fanColor);
 
       LCD.setTextColor(fanColor);
       LCD.setCursor(RIGHT_X + 60, BOTTOM_ROW_Y + 45);
@@ -8912,7 +9140,7 @@ void homepage() {
          LCD.setCursor(20+(60+box_width), (215));    LCD.printf("%.1f", sensor_12_humidity);
 
          LCD.setFont(); LCD.setTextColor((LCD.epd2.hasColor ? GxEPD_RED : GxEPD_BLACK)); //FreeMono9pt7b
-         LCD.setCursor(90+(box_width), (232));  LCD.print("Percent");
+         LCD.setCursor(100+(box_width), (232));  LCD.print("Percent");
         
         /*
 
@@ -9562,236 +9790,19 @@ void extract_readings(){
 
 
 
-/*const char * sensor_2_ID = JSON_data["S_ID"] | "unknown";
-    
-    const char * sensor_3_ID = JSON_data["S_ID"] | "unknown"; const char * sensor_4_ID = JSON_data["S_ID"] | "unknown";
-    
-    const char * sensor_5_ID = JSON_data["S_ID"] | "unknown"; const char * sensor_6_ID = JSON_data["S_ID"] | "unknown";
-    
-    const char * sensor_7_ID = JSON_data["S_ID"] | "unknown"; const char * sensor_8_ID = JSON_data["S_ID"] | "unknown";
-    
-    const char * sensor_9_ID = JSON_data["S_ID"] | "unknown";  const char * sensor_10_ID = JSON_data["S_ID"] | "unknown";
-   
-    const char * sensor_11_ID = JSON_data["S_ID"] | "unknown"; const char * sensor_12_ID = JSON_data["S_ID"] | "unknown";
-  */
 
-/*
-//deserialize to assign char[] and floats accordingly
-void extract_readings(){
-  if(!packet_received) { LOG("No packet received!"); return; }  // this never runs, but just in case 
-      
-       DeserializationError err = deserializeJson(JSON_data, dataPack);
+// At the bottom of your main sketch
+extern char __data_start[];
+extern char __data_end[];
+extern char __bss_start[];
+extern char __bss_end[];
 
-        if (err) {
-            Serial.print("JSON Deserialization Error: ");
-            Serial.println(err.c_str());
-            return;
-        }
-       // LOG(dataPack); // SEE WHAT HAS BEEN RECEIVED!
-
-          
-    const char * sensor_ID = JSON_data["S_ID"] | "unknown"; 
-
-        if(strcmp(sensor_ID, "T_1") == 0){
-            sensor_1_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
-            sensor_1_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
-            sensor_1_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
-            sensor_1_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
-            sensor_1_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
-            sensor_1_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
-            sensor_1_packet_size = JSON_data["PKT"] | 0;
-        
-            strncpy(sensor_1_transmissions,  JSON_data["Sends"], sizeof(sensor_1_transmissions)); // up to 11 bytes: e.g., "1234567890"
-            strncpy(sensor_1_CPU_freq,  JSON_data["CPU"], sizeof(sensor_1_CPU_freq)); // 11 bytes: "80MHz CPU"
-            
-            temperature_readings[0] = sensor_1_temp; humidity_readings[0] = sensor_1_humidity;  // arrays or indexes
-            strncpy(sensor_1_last_seen, ShortTime, sizeof(sensor_1_last_seen));      sensor_1_last_seen[sizeof(sensor_1_last_seen) - 1] = '\0'; 
-      }
-
-      else if(strcmp(sensor_ID, "T_2") == 0){
-                  sensor_2_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
-                  sensor_2_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
-                  sensor_2_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
-                  sensor_2_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
-                  sensor_2_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
-                  sensor_2_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
-                  sensor_2_packet_size = JSON_data["PKT"] | 0;
-              
-                  strncpy(sensor_2_transmissions,  JSON_data["Sends"], sizeof(sensor_2_transmissions)); // up to 11 bytes: e.g., "1234567890"
-                  strncpy(sensor_2_CPU_freq,  JSON_data["CPU"], sizeof(sensor_2_CPU_freq)); // 11 bytes: "80MHz CPU"
-                  
-                  temperature_readings[0] = sensor_2_temp; humidity_readings[0] = sensor_2_humidity;  // arrays or indexes
-                  strncpy(sensor_2_last_seen, ShortTime, sizeof(sensor_2_last_seen));      sensor_2_last_seen[sizeof(sensor_2_last_seen) - 1] = '\0'; 
-      }
-
-      else if(strcmp(sensor_ID, "T_3") == 0){
-                  sensor_3_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
-                  sensor_3_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
-                  sensor_3_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
-                  sensor_3_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
-                  sensor_3_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
-                  sensor_3_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
-                  sensor_3_packet_size = JSON_data["PKT"] | 0;
-              
-                  strncpy(sensor_3_transmissions,  JSON_data["Sends"], sizeof(sensor_3_transmissions)); // up to 11 bytes: e.g., "1234567890"
-                  strncpy(sensor_3_CPU_freq,  JSON_data["CPU"], sizeof(sensor_3_CPU_freq)); // 11 bytes: "80MHz CPU"
-                  
-                  temperature_readings[2] = sensor_3_temp; humidity_readings[2] = sensor_3_humidity;  // arrays or indexes
-                  strncpy(sensor_3_last_seen, ShortTime, sizeof(sensor_3_last_seen));      sensor_3_last_seen[sizeof(sensor_3_last_seen) - 1] = '\0'; 
-      }
-
-      else if(strcmp(sensor_ID, "T_4") == 0){
-                  sensor_4_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
-                  sensor_4_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
-                  sensor_4_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
-                  sensor_4_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
-                  sensor_4_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
-                  sensor_4_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
-                  sensor_4_packet_size = JSON_data["PKT"] | 0;
-              
-                  strncpy(sensor_4_transmissions,  JSON_data["Sends"], sizeof(sensor_4_transmissions)); // up to 11 bytes: e.g., "1234567890"
-                  strncpy(sensor_4_CPU_freq,  JSON_data["CPU"], sizeof(sensor_4_CPU_freq)); // 11 bytes: "80MHz CPU"
-                  
-                  temperature_readings[3] = sensor_4_temp; humidity_readings[3] = sensor_4_humidity;  // arrays or indexes
-                  strncpy(sensor_4_last_seen, ShortTime, sizeof(sensor_4_last_seen));      sensor_4_last_seen[sizeof(sensor_4_last_seen) - 1] = '\0'; 
-      }
-
-      else if(strcmp(sensor_ID, "T_5") == 0){
-                  sensor_5_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
-                  sensor_5_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
-                  sensor_5_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
-                  sensor_5_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
-                  sensor_5_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
-                  sensor_5_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
-                  sensor_5_packet_size = JSON_data["PKT"] | 0;
-              
-                  strncpy(sensor_5_transmissions,  JSON_data["Sends"], sizeof(sensor_5_transmissions)); // up to 11 bytes: e.g., "1234567890"
-                  strncpy(sensor_5_CPU_freq,  JSON_data["CPU"], sizeof(sensor_5_CPU_freq)); // 11 bytes: "80MHz CPU"
-                  
-                  temperature_readings[4] = sensor_5_temp; humidity_readings[4] = sensor_5_humidity;  // arrays or indexes
-                  strncpy(sensor_5_last_seen, ShortTime, sizeof(sensor_5_last_seen));      sensor_5_last_seen[sizeof(sensor_5_last_seen) - 1] = '\0'; 
-      }
-
-      else if(strcmp(sensor_ID, "T_6") == 0){
-                  sensor_6_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
-                  sensor_6_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
-                  sensor_6_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
-                  sensor_6_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
-                  sensor_6_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
-                  sensor_6_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
-                  sensor_6_packet_size = JSON_data["PKT"] | 0;
-              
-                  strncpy(sensor_6_transmissions,  JSON_data["Sends"], sizeof(sensor_6_transmissions)); // up to 11 bytes: e.g., "1234567890"
-                  strncpy(sensor_6_CPU_freq,  JSON_data["CPU"], sizeof(sensor_6_CPU_freq)); // 11 bytes: "80MHz CPU"
-                  
-                  temperature_readings[5] = sensor_6_temp; humidity_readings[5] = sensor_6_humidity;  // arrays or indexes
-                  strncpy(sensor_6_last_seen, ShortTime, sizeof(sensor_6_last_seen));      sensor_6_last_seen[sizeof(sensor_6_last_seen) - 1] = '\0'; 
-      }
-
-      else if(strcmp(sensor_ID, "T_7") == 0){
-                  sensor_7_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
-                  sensor_7_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
-                  sensor_7_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
-                  sensor_7_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
-                  sensor_7_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
-                  sensor_7_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
-                  sensor_7_packet_size = JSON_data["PKT"] | 0;
-              
-                  strncpy(sensor_7_transmissions,  JSON_data["Sends"], sizeof(sensor_7_transmissions)); // up to 11 bytes: e.g., "1234567890"
-                  strncpy(sensor_7_CPU_freq,  JSON_data["CPU"], sizeof(sensor_7_CPU_freq)); // 11 bytes: "80MHz CPU"
-                  
-                  temperature_readings[6] = sensor_7_temp; humidity_readings[6] = sensor_7_humidity;  // arrays or indexes
-                  strncpy(sensor_7_last_seen, ShortTime, sizeof(sensor_7_last_seen));      sensor_7_last_seen[sizeof(sensor_7_last_seen) - 1] = '\0'; 
-      }
-
-      else if(strcmp(sensor_ID, "T_8") == 0){
-                  sensor_8_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
-                  sensor_8_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
-                  sensor_8_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
-                  sensor_8_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
-                  sensor_8_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
-                  sensor_8_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
-                  sensor_8_packet_size = JSON_data["PKT"] | 0;
-              
-                  strncpy(sensor_8_transmissions,  JSON_data["Sends"], sizeof(sensor_8_transmissions)); // up to 11 bytes: e.g., "1234567890"
-                  strncpy(sensor_8_CPU_freq,  JSON_data["CPU"], sizeof(sensor_8_CPU_freq)); // 11 bytes: "80MHz CPU"
-                  
-                  temperature_readings[7] = sensor_8_temp; humidity_readings[7] = sensor_8_humidity;  // arrays or indexes
-                  strncpy(sensor_8_last_seen, ShortTime, sizeof(sensor_8_last_seen));      sensor_8_last_seen[sizeof(sensor_8_last_seen) - 1] = '\0'; 
-      }
-
-      else if(strcmp(sensor_ID, "T_9") == 0){
-                  sensor_9_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
-                  sensor_9_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
-                  sensor_9_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
-                  sensor_9_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
-                  sensor_9_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
-                  sensor_9_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
-                  sensor_9_packet_size = JSON_data["PKT"] | 0;
-              
-                  strncpy(sensor_9_transmissions,  JSON_data["Sends"], sizeof(sensor_9_transmissions)); // up to 11 bytes: e.g., "1234567890"
-                  strncpy(sensor_9_CPU_freq,  JSON_data["CPU"], sizeof(sensor_9_CPU_freq)); // 11 bytes: "80MHz CPU"
-                  
-                  temperature_readings[8] = sensor_9_temp; humidity_readings[8] = sensor_9_humidity;  // arrays or indexes
-                  strncpy(sensor_9_last_seen, ShortTime, sizeof(sensor_9_last_seen));      sensor_9_last_seen[sizeof(sensor_9_last_seen) - 1] = '\0'; 
-      }
-
-      else if(strcmp(sensor_ID, "T_10") == 0){
-                  sensor_10_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
-                  sensor_10_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
-                  sensor_10_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
-                  sensor_10_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
-                  sensor_10_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
-                  sensor_10_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
-                  sensor_10_packet_size = JSON_data["PKT"] | 0;
-              
-                  strncpy(sensor_10_transmissions,  JSON_data["Sends"], sizeof(sensor_10_transmissions)); // up to 11 bytes: e.g., "1234567890"
-                  strncpy(sensor_10_CPU_freq,  JSON_data["CPU"], sizeof(sensor_10_CPU_freq)); // 11 bytes: "80MHz CPU"
-                  
-                  temperature_readings[9] = sensor_10_temp; humidity_readings[9] = sensor_10_humidity;  // arrays or indexes
-                  strncpy(sensor_10_last_seen, ShortTime, sizeof(sensor_10_last_seen));      sensor_10_last_seen[sizeof(sensor_10_last_seen) - 1] = '\0'; 
-      }
-
-      else if(strcmp(sensor_ID, "T_11") == 0){
-                  sensor_11_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
-                  sensor_11_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
-                  sensor_11_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
-                  sensor_11_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
-                  sensor_11_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
-                  sensor_11_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
-                  sensor_11_packet_size = JSON_data["PKT"] | 0;
-              
-                  strncpy(sensor_11_transmissions,  JSON_data["Sends"], sizeof(sensor_11_transmissions)); // up to 11 bytes: e.g., "1234567890"
-                  strncpy(sensor_11_CPU_freq,  JSON_data["CPU"], sizeof(sensor_11_CPU_freq)); // 11 bytes: "80MHz CPU"
-                  
-                  temperature_readings[10] = sensor_11_temp; humidity_readings[10] = sensor_11_humidity;  // arrays or indexes
-                  strncpy(sensor_11_last_seen, ShortTime, sizeof(sensor_11_last_seen));      sensor_11_last_seen[sizeof(sensor_11_last_seen) - 1] = '\0'; 
-      }
-
-      else if(strcmp(sensor_ID, "T_12") == 0){
-                  sensor_12_temp = JSON_data["Temp"] | NAN; // float e.g. 26.6
-                  sensor_12_humidity = JSON_data["Humi"] | NAN; // up to 6 bytes: e.g., 65.9
-                  sensor_12_pressure = JSON_data["Pre"] | NAN; // up to 7 bytes: e.g., 101.325
-                  sensor_12_elevation = JSON_data["Elv"] | NAN; // up to 7 bytes: e.g., 1200.5
-                  sensor_12_h_index = JSON_data["Heat_ind"] | NAN; // // up to 9 bytes: e.g., 27.94374
-                  sensor_12_running_time_ms = JSON_data["UpTime"] | 0; // up to 11 bytes: e.g., 86400 
-                  sensor_12_packet_size = JSON_data["PKT"] | 0;
-              
-                  strncpy(sensor_12_transmissions,  JSON_data["Sends"], sizeof(sensor_12_transmissions)); // up to 11 bytes: e.g., "1234567890"
-                  strncpy(sensor_12_CPU_freq,  JSON_data["CPU"], sizeof(sensor_12_CPU_freq)); // 11 bytes: "80MHz CPU"
-                  
-                  temperature_readings[11] = sensor_12_temp; humidity_readings[11] = sensor_12_humidity;  // arrays or indexes
-                  strncpy(sensor_12_last_seen, ShortTime, sizeof(sensor_12_last_seen));      sensor_12_last_seen[sizeof(sensor_12_last_seen) - 1] = '\0'; 
-      }
-
-        else {
-               Serial.printf("Unknown sensor: %s\n", sensor_ID);
-             }
-
+void print_memory_sections() {
+    Serial.printf("Data section: %d bytes\n", __data_end - __data_start);
+    Serial.printf("BSS section:  %d bytes\n", __bss_end - __bss_start);
+    Serial.printf("Total static: %d bytes\n", 
+                  (__data_end - __data_start) + (__bss_end - __bss_start));
 }
-
-*/
-
 
 
 
